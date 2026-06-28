@@ -2411,6 +2411,33 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_gptq2_32(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % 32 == 0);
+
+    const uint8_t * x = (const uint8_t *) vx;
+    const int64_t nb = k / 32;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t * block = x + i * 12;
+        ggml_fp16_t scale_fp16;
+        ggml_fp16_t zero_bias_fp16;
+
+        memcpy(&scale_fp16, block + 8, sizeof(scale_fp16));
+        memcpy(&zero_bias_fp16, block + 10, sizeof(zero_bias_fp16));
+
+        const float scale = GGML_FP16_TO_FP32(scale_fp16);
+        const float zero_bias = GGML_FP16_TO_FP32(zero_bias_fp16);
+
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t packed = block[j];
+            *y++ = scale * ((packed >> 0) & 0x3) - zero_bias;
+            *y++ = scale * ((packed >> 2) & 0x3) - zero_bias;
+            *y++ = scale * ((packed >> 4) & 0x3) - zero_bias;
+            *y++ = scale * ((packed >> 6) & 0x3) - zero_bias;
+        }
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5444,6 +5471,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 #endif
                 for (; i < nb; ++i) {
                     if (!validate_float(f[i], i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_GPTQ2_32:
+            {
+                const uint8_t * row = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    ggml_fp16_t scale_fp16;
+                    ggml_fp16_t zero_bias_fp16;
+                    memcpy(&scale_fp16, row + i*12 + 8, sizeof(scale_fp16));
+                    memcpy(&zero_bias_fp16, row + i*12 + 10, sizeof(zero_bias_fp16));
+                    if (!validate_fp16(scale_fp16, i*2 + 0) || !validate_fp16(zero_bias_fp16, i*2 + 1)) {
                         return false;
                     }
                 }

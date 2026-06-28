@@ -154,6 +154,7 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        self._gptq2_32_tensors: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -309,8 +310,33 @@ class ModelBase:
 
         tensors_to_remove: list[str] = []
         new_tensors: dict[str, Callable[[], Tensor]] = {}
+        quant_config = self.hparams.get("quantization_config")
+        if not isinstance(quant_config, dict):
+            quant_config = {}
+            self.hparams["quantization_config"] = quant_config
 
-        if (quant_config := self.hparams.get("quantization_config")) and isinstance(quant_config, dict):
+        if not quant_config.get("quant_method") and any(name.endswith(".qweight") for name in self.model_tensors.keys()):
+            qweight_name = next(name for name in self.model_tensors.keys() if name.endswith(".qweight"))
+            base_name = qweight_name.removesuffix(".qweight")
+            qweight = self.model_tensors[qweight_name]()
+            qzeros = self.model_tensors[base_name + ".qzeros"]()
+            scales = self.model_tensors[base_name + ".scales"]()
+
+            pack_dtype_bits = qweight.dtype.itemsize * 8
+            bits = next(
+                b for b in (2, 4, 8)
+                if qzeros.shape[1] * (pack_dtype_bits // b) == scales.shape[1]
+            )
+            k = qweight.shape[0] * (pack_dtype_bits // bits)
+            quant_config.update({
+                "quant_method": "gptq",
+                "bits": bits,
+                "group_size": k // scales.shape[0],
+                "checkpoint_format": quant_config.get("checkpoint_format", "gptq_v2"),
+                "quantizer": quant_config.get("quantizer", "efficientqat"),
+            })
+
+        if quant_config:
             quant_method = quant_config.get("quant_method")
 
             def dequant_bitnet(weight: Tensor, scale: Tensor) -> Tensor:
@@ -347,42 +373,85 @@ class ModelBase:
                 assert bits in (2, 3, 4, 8)
                 assert qweight.dtype == qzeros.dtype
                 maxq = (2 ** bits) - 1
-                weight = None
-                zeros = None
                 pack_dtype_bits = qweight.dtype.itemsize * 8
+                k = qweight.shape[0] * (pack_dtype_bits // bits)
+                m = qweight.shape[1]
+                group_size = quant_config["group_size"]
+                scales_t = LazyTorchTensor.to_eager(scales).float().cpu()
 
                 if bits in [2, 4, 8]:
-                    pack_factor = pack_dtype_bits // bits
-                    wf = torch.tensor(list(range(0, pack_dtype_bits, bits)), dtype=torch.int32).unsqueeze(0)
-                    if self.lazy:
-                        wf = LazyTorchTensor.from_eager(wf)
-
-                    zeros = torch.bitwise_right_shift(
-                        qzeros.unsqueeze(2).expand(-1, -1, pack_factor),
-                        wf.unsqueeze(0)
-                    ).to(torch.int16 if bits == 8 else torch.int8)
-                    zeros = torch.bitwise_and(zeros, maxq).reshape(scales.shape)
-
-                    weight = torch.bitwise_and(
-                        torch.bitwise_right_shift(
-                            qweight.unsqueeze(1).expand(-1, pack_factor, -1),
-                            wf.unsqueeze(-1)
-                        ).to(torch.int16 if bits == 8 else torch.int8),
-                        maxq
-                    )
+                    shifts = list(range(0, pack_dtype_bits, bits))
+                    weight = torch.stack(
+                        [torch.bitwise_and(torch.bitwise_right_shift(qweight, shift), maxq) for shift in shifts],
+                        dim=1,
+                    ).reshape(k, m)
+                    zeros = torch.stack(
+                        [torch.bitwise_and(torch.bitwise_right_shift(qzeros, shift), maxq) for shift in shifts],
+                        dim=-1,
+                    ).reshape(k // group_size, m)
                 elif bits == 3:
                     raise NotImplementedError("3-bit gptq dequantization is not yet implemented")
 
-                assert weight is not None
-                assert zeros is not None
+                scales_t = scales_t.T.contiguous()
+                zeros = zeros.float()
+                scales_t = scales_t.clamp_(1e-4, 1e4)
+                zeros = zeros.round().clamp_(0, maxq)
 
-                weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+                return (scales_t[:, g_idx].float() * (weight.T - zeros.T[:, g_idx]).float())
 
-                # gptq_v2 doesn't need to offset zeros
-                if quant_config.get("checkpoint_format", "gptq") == "gptq":
-                    zeros += 1
+            def pack_gptq2_32(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
+                bits = quant_config["bits"]
+                assert bits == 2
+                assert qweight.dtype == qzeros.dtype
 
-                return (scales[g_idx].float() * (weight - zeros[g_idx]).float()).T
+                g_idx = LazyTorchTensor.to_eager(g_idx).to(torch.int64).cpu()
+                qweight = LazyTorchTensor.to_eager(qweight).cpu()
+                qzeros = LazyTorchTensor.to_eager(qzeros).cpu()
+                scales = LazyTorchTensor.to_eager(scales).float().cpu()
+
+                maxq = (2 ** bits) - 1
+                pack_dtype_bits = qweight.dtype.itemsize * 8
+                pack_factor = pack_dtype_bits // bits
+                k = qweight.shape[0] * pack_factor
+                m = qweight.shape[1]
+                group_size = quant_config["group_size"]
+                shifts = list(range(0, pack_dtype_bits, bits))
+
+                weight = torch.stack(
+                    [torch.bitwise_and(torch.bitwise_right_shift(qweight, shift), maxq) for shift in shifts],
+                    dim=1,
+                ).reshape(k, m).T.contiguous()
+                zeros = torch.stack(
+                    [torch.bitwise_and(torch.bitwise_right_shift(qzeros, shift), maxq) for shift in shifts],
+                    dim=-1,
+                ).reshape(k // group_size, m).T.contiguous().float()
+                scales = scales.float().T.contiguous()
+
+                scales = scales.clamp_(1e-4, 1e4)
+                zeros = zeros.round().clamp_(0, maxq)
+
+                assert group_size == 32
+                assert k % group_size == 0
+
+                expected_g_idx = torch.arange(k, dtype=torch.int64) // group_size
+                assert torch.equal(g_idx, expected_g_idx)
+
+                n_groups = k // group_size
+                assert scales.shape == (m, n_groups)
+                assert zeros.shape == (m, n_groups)
+
+                codes = weight.reshape(m, n_groups, group_size).numpy().astype(np.uint8, copy=False)
+                packed_codes = (
+                    codes[:, :, 0::4]
+                    | (codes[:, :, 1::4] << np.uint8(2))
+                    | (codes[:, :, 2::4] << np.uint8(4))
+                    | (codes[:, :, 3::4] << np.uint8(6))
+                )
+                scale_bytes = scales.numpy().astype(np.float16).view(np.uint8).reshape(m, n_groups, 2)
+                zero_bias_bytes = (scales * zeros).numpy().astype(np.float16).view(np.uint8).reshape(m, n_groups, 2)
+                raw = np.concatenate((packed_codes, scale_bytes, zero_bias_bytes), axis=2).reshape(m, n_groups * 12)
+
+                return torch.from_numpy(raw)
 
             def dequant_packed(w: Tensor, scale: Tensor, shape_tensor: Tensor, zero_point: Tensor | None, num_bits: int, group_size: int):
                 assert w.dtype == torch.int32
@@ -460,11 +529,19 @@ class ModelBase:
                         qweight = self.model_tensors[base_name + ".qweight"]
                         qzeros = self.model_tensors[base_name + ".qzeros"]
                         scales = self.model_tensors[base_name + ".scales"]
-                        new_tensors[base_name + ".weight"] = (
-                            lambda g=g_idx, z=qzeros, w=qweight, s=scales: dequant_gptq(
-                                g(), w(), z(), s()
+                        if self.ftype == gguf.LlamaFileType.MOSTLY_GPTQ2_32:
+                            new_tensors[base_name + ".weight"] = (
+                                lambda g=g_idx, z=qzeros, w=qweight, s=scales: pack_gptq2_32(
+                                    g(), w(), z(), s()
+                                )
                             )
-                        )
+                            self._gptq2_32_tensors.add(base_name + ".weight")
+                        else:
+                            new_tensors[base_name + ".weight"] = (
+                                lambda g=g_idx, z=qzeros, w=qweight, s=scales: dequant_gptq(
+                                    g(), w(), z(), s()
+                                )
+                            )
                         tensors_to_remove += [
                             base_name + n
                             for n in (
@@ -474,6 +551,11 @@ class ModelBase:
                                 ".scales",
                             )
                         ]
+                if self.ftype == gguf.LlamaFileType.MOSTLY_GPTQ2_32:
+                    tensors_to_remove += [
+                        name for name in self.model_tensors.keys()
+                        if name.endswith((".g_idx", ".qzeros", ".qweight", ".scales"))
+                    ]
             elif quant_method == "compressed-tensors":
                 quant_format = quant_config["format"]
                 groups = quant_config["config_groups"]
@@ -806,6 +888,13 @@ class ModelBase:
                 quant_format = quant_config.get("format", quant_format)
                 quant_groups = quant_config.get("config_groups", quant_groups) or {}
                 quant_layers = quant_config.get("quantized_layers", quant_layers) or {}
+                self.hparams.setdefault("quantization_config", {}).update({
+                    "quant_algo": quant_algo,
+                    "quant_method": quant_method,
+                    "format": quant_format,
+                    "config_groups": quant_groups,
+                    "quantized_layers": quant_layers,
+                })
 
         # Some models use per-tensor quant_algo (e.g. "MIXED_PRECISION" with
         # per-layer NVFP4/FP8) instead of a single global "NVFP4" value.
@@ -868,7 +957,7 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if name not in self._gptq2_32_tensors and data_torch.dtype not in (torch.float16, torch.float32):
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -954,6 +1043,15 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.BF16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_GPTQ2_32:
+                        if name in self._gptq2_32_tensors:
+                            data_qtype = gguf.GGMLQuantizationType.GPTQ2_32
+                        elif old_dtype == torch.bfloat16:
+                            data_qtype = gguf.GGMLQuantizationType.BF16
+                        elif old_dtype == torch.float16:
+                            data_qtype = gguf.GGMLQuantizationType.F16
+                        else:
+                            data_qtype = gguf.GGMLQuantizationType.F32
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
@@ -1334,13 +1432,29 @@ class TextModel(ModelBase):
 
         return seems_special
 
+    def _load_auto_tokenizer(self, *, trust_remote_code: bool = False):
+        from transformers import AutoTokenizer
+
+        kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+        tokenizer_config_path = self.dir_model / "tokenizer_config.json"
+        if tokenizer_config_path.is_file():
+            try:
+                with tokenizer_config_path.open("r", encoding="utf-8") as f:
+                    tokenizer_config = json.load(f)
+                extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+                if isinstance(extra_special_tokens, list):
+                    kwargs["extra_special_tokens"] = {token: token for token in extra_special_tokens}
+            except Exception:
+                pass
+
+        return AutoTokenizer.from_pretrained(self.dir_model, **kwargs)
+
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        tokenizer = self._load_auto_tokenizer()
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
         assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
 

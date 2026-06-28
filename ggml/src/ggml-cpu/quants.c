@@ -427,6 +427,39 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+void ggml_vec_dot_gptq2_32_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % 32 == 0);
+    assert(nrc == 1);
+    assert(n == (int) bx);
+    assert(n == (int) by);
+    UNUSED(nrc);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+
+    const uint8_t * GGML_RESTRICT x = vx;
+    const float   * GGML_RESTRICT y = vy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const uint8_t * block = x + ib * 12;
+        const float scale = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + 8));
+        const float zero_bias = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + 10));
+
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t packed = block[j];
+
+            sumf += (scale * ((packed >> 0) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 0];
+            sumf += (scale * ((packed >> 2) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 1];
+            sumf += (scale * ((packed >> 4) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 2];
+            sumf += (scale * ((packed >> 6) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 3];
+        }
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
