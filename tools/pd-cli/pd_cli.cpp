@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -30,6 +31,7 @@ struct pd_args {
     bool import_ro = false;
     bool roundtrip_check = false;
     bool native_compare = false;
+    bool native_first_token = false;
 };
 
 struct pd_handoff {
@@ -137,6 +139,10 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
             out.native_compare = true;
             continue;
         }
+        if (arg == "--pd-native-first-token") {
+            out.native_first_token = true;
+            continue;
+        }
         forwarded->push_back(argv[i]);
     }
     if (out.import_dir.empty()) {
@@ -158,6 +164,49 @@ std::optional<size_t> first_mismatch_offset(
         return shared;
     }
     return std::nullopt;
+}
+
+
+struct token_logit {
+    llama_token token = -1;
+    float logit = 0.0f;
+};
+
+struct native_compare_result {
+    std::vector<float> prompt_logits;
+    std::vector<float> resume_logits;
+    std::vector<uint8_t> prompt_seq_blob;
+};
+
+std::vector<token_logit> top_k_logits(const float * logits, int32_t n_vocab, int32_t k) {
+    std::vector<token_logit> out;
+    out.reserve(n_vocab);
+    for (llama_token token = 0; token < n_vocab; ++token) {
+        out.push_back({token, logits[token]});
+    }
+    if (k < n_vocab) {
+        std::partial_sort(
+            out.begin(),
+            out.begin() + k,
+            out.end(),
+            [](const token_logit & a, const token_logit & b) {
+                return a.logit > b.logit;
+            });
+        out.resize(k);
+    } else {
+        std::sort(
+            out.begin(),
+            out.end(),
+            [](const token_logit & a, const token_logit & b) {
+                return a.logit > b.logit;
+            });
+    }
+    return out;
+}
+
+float fp16_bits_to_float(uint16_t bits) {
+    ggml_fp16_t fp16 = bits;
+    return ggml_fp16_to_fp32(fp16);
 }
 
 std::vector<llama_token> load_prompt_tokens(const std::string & path) {
@@ -391,10 +440,280 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
     return blob;
 }
 
+
+std::string describe_top_k(
+        llama_context * ctx,
+        const std::vector<token_logit> & top,
+        bool special) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < top.size(); ++i) {
+        if (i != 0) {
+            oss << " ";
+        }
+        oss << "[" << i
+            << ":tok=" << top[i].token
+            << ",logit=" << top[i].logit
+            << ",piece=" << common_token_to_piece(ctx, top[i].token, special)
+            << "]";
+    }
+    return oss.str();
+}
+
+native_compare_result run_native_compare(
+        const pd_handoff & handoff,
+        llama_model * model,
+        const common_params & params) {
+    native_compare_result out;
+    llama_context_params ctx_params = common_context_params_to_llama(params);
+    std::unique_ptr<llama_context, decltype(&llama_free)> native_ctx(
+        llama_init_from_model(model, ctx_params),
+        llama_free);
+    if (!native_ctx) {
+        throw std::runtime_error("failed to create native comparison context");
+    }
+
+    const int32_t batch_cap = std::max<int32_t>(1, llama_n_batch(native_ctx.get()));
+    for (int32_t start = 0; start < handoff.prompt_len; start += batch_cap) {
+        const int32_t chunk = std::min(batch_cap, handoff.prompt_len - start);
+        if (llama_decode(
+                native_ctx.get(),
+                llama_batch_get_one(
+                    const_cast<llama_token *>(handoff.prompt_tokens.data() + start),
+                    chunk)) != 0) {
+            throw std::runtime_error("native comparison prompt decode failed");
+        }
+    }
+
+    {
+        const float * logits = llama_get_logits_ith(native_ctx.get(), -1);
+        if (logits == nullptr) {
+            throw std::runtime_error("native comparison prompt logits are unavailable");
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        out.prompt_logits.assign(logits, logits + n_vocab);
+    }
+
+    {
+        const size_t seq_size = llama_state_seq_get_size(native_ctx.get(), 0);
+        out.prompt_seq_blob.resize(seq_size);
+        const size_t nread =
+            llama_state_seq_get_data(native_ctx.get(), out.prompt_seq_blob.data(), seq_size, 0);
+        if (nread != seq_size) {
+            throw std::runtime_error("native comparison prompt seq save failed");
+        }
+    }
+
+    llama_token first = handoff.first_token;
+    if (llama_decode(native_ctx.get(), llama_batch_get_one(&first, 1)) != 0) {
+        throw std::runtime_error("native comparison first-token decode failed");
+    }
+
+    const float * logits = llama_get_logits_ith(native_ctx.get(), -1);
+    if (logits == nullptr) {
+        throw std::runtime_error("native comparison logits are unavailable");
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    out.resume_logits.assign(logits, logits + n_vocab);
+    return out;
+}
+
+void log_prompt_seq_blob_comparison(
+        const std::vector<uint8_t> & imported_blob,
+        const std::vector<uint8_t> & native_blob,
+        const pd_handoff & handoff,
+        bool v_trans) {
+    if (imported_blob.size() != native_blob.size()) {
+        LOG_INF(
+            "PD native compare prompt-KV blob size mismatch: imported=%zu native=%zu\n",
+            imported_blob.size(),
+            native_blob.size());
+        return;
+    }
+
+    if (const auto mismatch = first_mismatch_offset(imported_blob, native_blob); !mismatch.has_value()) {
+        LOG_INF("PD native compare prompt-KV blob matches native prefill exactly\n");
+        return;
+    }
+
+    const auto mismatch = first_mismatch_offset(imported_blob, native_blob);
+    LOG_INF(
+        "PD native compare prompt-KV first mismatch at byte offset %zu: imported=0x%02x native=0x%02x\n",
+        *mismatch,
+        imported_blob[*mismatch],
+        native_blob[*mismatch]);
+
+    const size_t meta_prefix =
+        sizeof(uint32_t) +
+        sizeof(llama_seq_id) +
+        sizeof(uint32_t) +
+        sizeof(uint32_t) +
+        static_cast<size_t>(handoff.prompt_len) *
+            (sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id)) +
+        sizeof(uint32_t) * 2;
+    size_t offset = meta_prefix;
+    const uint32_t n_embd_gqa = static_cast<uint32_t>(handoff.num_kv_heads * handoff.head_dim);
+    const size_t row_size = static_cast<size_t>(n_embd_gqa) * sizeof(uint16_t);
+    const size_t rows = static_cast<size_t>(handoff.prompt_len);
+    const size_t sample_values = std::min<size_t>(8, n_embd_gqa);
+
+    auto log_row_sample = [&](const char * kind, int32_t layer, size_t block_offset) {
+        if (rows == 0 || sample_values == 0) {
+            return;
+        }
+        std::ostringstream oss;
+        oss << "PD native compare " << kind << " layer=" << layer << " row0 imported/native:";
+        for (size_t elem = 0; elem < sample_values; ++elem) {
+            uint16_t imported_bits = 0;
+            uint16_t native_bits = 0;
+            std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+            std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+            oss << " [" << elem
+                << ":i=" << fp16_bits_to_float(imported_bits)
+                << ",n=" << fp16_bits_to_float(native_bits)
+                << "]";
+        }
+        LOG_INF("%s\n", oss.str().c_str());
+    };
+
+    auto log_maxdiff_sample = [&](const char * kind, int32_t layer, size_t block_offset, size_t elem_index) {
+        const size_t start_elem = elem_index > 3 ? elem_index - 3 : 0;
+        const size_t end_elem = std::min(elem_index + 4, rows * static_cast<size_t>(n_embd_gqa));
+        std::ostringstream oss;
+        oss << "PD native compare " << kind << " layer=" << layer
+            << " around maxdiff elem=" << elem_index << ":";
+        for (size_t elem = start_elem; elem < end_elem; ++elem) {
+            uint16_t imported_bits = 0;
+            uint16_t native_bits = 0;
+            std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+            std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+            oss << " [" << elem
+                << ":i=" << fp16_bits_to_float(imported_bits)
+                << ",n=" << fp16_bits_to_float(native_bits)
+                << "]";
+        }
+        LOG_INF("%s\n", oss.str().c_str());
+    };
+
+    auto compare_layer_block = [&](const char * kind, int32_t layer, size_t block_offset, size_t data_size) {
+        float max_abs_diff = 0.0f;
+        size_t max_idx = 0;
+        for (size_t i = 0; i < data_size; i += sizeof(uint16_t)) {
+            uint16_t imported_bits = 0;
+            uint16_t native_bits = 0;
+            std::memcpy(&imported_bits, imported_blob.data() + block_offset + i, sizeof(uint16_t));
+            std::memcpy(&native_bits, native_blob.data() + block_offset + i, sizeof(uint16_t));
+            const float diff = std::fabs(
+                fp16_bits_to_float(imported_bits) - fp16_bits_to_float(native_bits));
+            if (diff > max_abs_diff) {
+                max_abs_diff = diff;
+                max_idx = i / sizeof(uint16_t);
+            }
+        }
+        LOG_INF(
+            "PD native compare %s layer=%d max_abs_diff=%f elem_index=%zu\n",
+            kind,
+            layer,
+            max_abs_diff,
+            max_idx);
+        if (layer == 0) {
+            log_row_sample(kind, layer, block_offset);
+        }
+        if (max_abs_diff > 8.0f || layer == 0) {
+            log_maxdiff_sample(kind, layer, block_offset, max_idx);
+        }
+    };
+
+    for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
+        offset += sizeof(int32_t) + sizeof(uint64_t);
+        compare_layer_block("K", layer, offset, rows * row_size);
+        offset += rows * row_size;
+    }
+
+    for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
+        if (!v_trans) {
+            offset += sizeof(int32_t) + sizeof(uint64_t);
+            compare_layer_block("V", layer, offset, rows * row_size);
+            offset += rows * row_size;
+        } else {
+            offset += sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint32_t);
+            compare_layer_block("V", layer, offset, rows * row_size);
+            offset += rows * row_size;
+        }
+    }
+}
+
+void log_native_comparison(
+        llama_context * imported_ctx,
+        llama_model * model,
+        const common_params & params,
+        const pd_handoff & handoff,
+        const std::vector<uint8_t> & imported_prompt_seq_blob,
+        bool v_trans) {
+    const float * imported_logits = llama_get_logits_ith(imported_ctx, -1);
+    if (imported_logits == nullptr) {
+        throw std::runtime_error("imported logits are unavailable for comparison");
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const native_compare_result native = run_native_compare(handoff, model, params);
+
+    float max_abs_diff = 0.0f;
+    double mean_abs_diff = 0.0;
+    llama_token max_diff_token = -1;
+    for (llama_token token = 0; token < n_vocab; ++token) {
+        const float diff = std::fabs(imported_logits[token] - native.resume_logits[token]);
+        mean_abs_diff += diff;
+        if (diff > max_abs_diff) {
+            max_abs_diff = diff;
+            max_diff_token = token;
+        }
+    }
+    mean_abs_diff /= static_cast<double>(n_vocab);
+
+    const auto imported_top = top_k_logits(imported_logits, n_vocab, 5);
+    const auto native_top = top_k_logits(native.resume_logits.data(), n_vocab, 5);
+    const auto native_prompt_top = top_k_logits(native.prompt_logits.data(), n_vocab, 5);
+
+    LOG_INF(
+        "PD native compare prompt-only top1=%d handoff_first_token=%d\n",
+        native_prompt_top.front().token,
+        handoff.first_token);
+    LOG_INF(
+        "PD native compare native prompt top5: %s\n",
+        describe_top_k(imported_ctx, native_prompt_top, false).c_str());
+
+    LOG_INF(
+        "PD native compare: imported_top1=%d native_top1=%d max_abs_diff=%f mean_abs_diff=%f max_diff_token=%d\n",
+        imported_top.front().token,
+        native_top.front().token,
+        max_abs_diff,
+        mean_abs_diff,
+        max_diff_token);
+    LOG_INF(
+        "PD native compare imported top5: %s\n",
+        describe_top_k(imported_ctx, imported_top, false).c_str());
+    LOG_INF(
+        "PD native compare native   top5: %s\n",
+        describe_top_k(imported_ctx, native_top, false).c_str());
+
+    log_prompt_seq_blob_comparison(
+        imported_prompt_seq_blob,
+        native.prompt_seq_blob,
+        handoff,
+        v_trans);
+}
+
 void print_usage(int argc, char ** argv) {
     (void) argc;
     LOG("\nexample usage:\n");
     LOG("  %s --pd-import handoff_dir -m model.gguf -n 128 -c 2048 -t 4 -ngl 0\n", argv[0]);
+    LOG("  diagnostics: add --pd-roundtrip-check to compare imported KV against llama.cpp sequence serialization\n");
+    LOG("  diagnostics: add --pd-native-compare to compare imported KV resume logits against native GGUF prefill\n");
+    LOG("  quality fallback: add --pd-native-first-token to select the first continuation token with GGUF prompt prefill\n");
     LOG("\n");
 }
 
@@ -429,11 +748,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("pd-cli does not accept a prompt; prompt tokens come from --pd-import\n");
         return 1;
     }
-    if (pd.native_compare) {
-        LOG_ERR("--pd-native-compare is not implemented in this llama.cpp port yet\n");
-        return 1;
-    }
-
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -453,6 +767,28 @@ int main(int argc, char ** argv) {
     } catch (const std::exception & err) {
         LOG_ERR("failed to load PD handoff: %s\n", err.what());
         return 1;
+    }
+
+    if (pd.native_first_token) {
+        const llama_token handoff_first_token = handoff.first_token;
+        try {
+            const native_compare_result native =
+                run_native_compare(handoff, model, params);
+            const auto native_prompt_top = top_k_logits(
+                native.prompt_logits.data(), llama_vocab_n_tokens(llama_model_get_vocab(model)), 1);
+            if (native_prompt_top.empty()) {
+                throw std::runtime_error("native prompt logits are empty");
+            }
+            handoff.first_token = native_prompt_top.front().token;
+            LOG_INF(
+                "PD native first-token override: handoff=%d native_prompt_top1=%d logit=%f\n",
+                handoff_first_token,
+                handoff.first_token,
+                native_prompt_top.front().logit);
+        } catch (const std::exception & err) {
+            LOG_ERR("PD native first-token selection failed: %s\n", err.what());
+            return 1;
+        }
     }
 
     for (llama_token token : handoff.prompt_tokens) {
@@ -544,6 +880,15 @@ int main(int argc, char ** argv) {
     if (llama_decode(ctx, llama_batch_get_one(&cur, 1)) != 0) {
         LOG_ERR("llama_decode failed after importing PD state\n");
         return 1;
+    }
+
+    if (pd.native_compare) {
+        try {
+            log_native_comparison(ctx, model, params, handoff, seq_blob, v_trans);
+        } catch (const std::exception & err) {
+            LOG_ERR("PD native comparison failed: %s\n", err.what());
+            return 1;
+        }
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
