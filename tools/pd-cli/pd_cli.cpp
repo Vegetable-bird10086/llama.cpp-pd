@@ -8,6 +8,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <chrono>
 #include <clocale>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,45 @@ struct pd_args {
     bool native_first_token = false;
 };
 
+using steady_clock = std::chrono::steady_clock;
+
+static double elapsed_ms(
+        steady_clock::time_point start,
+        steady_clock::time_point end = steady_clock::now()) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+struct process_memory_snapshot {
+    uint64_t rss_bytes = 0;
+    uint64_t hwm_bytes = 0;
+};
+
+static uint64_t read_proc_status_bytes(const char * field) {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind(field, 0) != 0) {
+            continue;
+        }
+        std::istringstream value(line.substr(std::strlen(field)));
+        uint64_t kib = 0;
+        value >> kib;
+        return kib * 1024;
+    }
+    return 0;
+}
+
+static process_memory_snapshot process_memory() {
+    return {
+        read_proc_status_bytes("VmRSS:"),
+        read_proc_status_bytes("VmHWM:"),
+    };
+}
+
+static double bytes_to_mib(uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
 struct pd_handoff {
     json manifest;
     std::vector<llama_token> prompt_tokens;
@@ -43,29 +83,66 @@ struct pd_handoff {
     int32_t num_layers = 0;
     int32_t num_kv_heads = 0;
     int32_t head_dim = 0;
+    double metadata_read_ms = 0.0;
+    double kv_read_ms = 0.0;
+};
+
+class blob_writer {
+public:
+    explicit blob_writer(size_t size) : data_(size) {}
+
+    template <typename T>
+    void write_pod(const T & value) {
+        write_bytes(&value, sizeof(T));
+    }
+
+    void write_bytes(const void * data, size_t size) {
+        if (size > data_.size() - offset_) {
+            throw std::runtime_error("sequence state blob size calculation overflow");
+        }
+        std::memcpy(data_.data() + offset_, data, size);
+        offset_ += size;
+    }
+
+    std::vector<uint8_t> finish() {
+        if (offset_ != data_.size()) {
+            throw std::runtime_error("sequence state blob size calculation mismatch");
+        }
+        return std::move(data_);
+    }
+
+private:
+    std::vector<uint8_t> data_;
+    size_t offset_ = 0;
 };
 
 template <typename T>
-void append_pod(std::vector<uint8_t> & out, const T & value) {
-    const size_t old_size = out.size();
-    out.resize(old_size + sizeof(T));
-    std::memcpy(out.data() + old_size, &value, sizeof(T));
-}
-
-void append_bytes(std::vector<uint8_t> & out, const void * data, size_t size) {
-    const size_t old_size = out.size();
-    out.resize(old_size + size);
-    std::memcpy(out.data() + old_size, data, size);
-}
-
-std::vector<uint8_t> read_binary_file(const std::string & path) {
-    std::ifstream input(path, std::ios::binary);
+std::vector<T> read_binary_vector(const std::string & path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input.is_open()) {
         throw std::runtime_error("unable to read file: " + path);
     }
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>());
+    const std::streampos end = input.tellg();
+    if (end < 0) {
+        throw std::runtime_error("unable to determine file size: " + path);
+    }
+    const size_t size_bytes = static_cast<size_t>(end);
+    if (size_bytes % sizeof(T) != 0) {
+        throw std::runtime_error("binary file element alignment mismatch: " + path);
+    }
+    input.seekg(0, std::ios::beg);
+    std::vector<T> out(size_bytes / sizeof(T));
+    if (size_bytes != 0) {
+        input.read(reinterpret_cast<char *>(out.data()), size_bytes);
+        if (!input || static_cast<size_t>(input.gcount()) != size_bytes) {
+            throw std::runtime_error("short read from file: " + path);
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> read_binary_file(const std::string & path) {
+    return read_binary_vector<uint8_t>(path);
 }
 
 json read_json_file(const std::string & path) {
@@ -242,16 +319,15 @@ llama_token load_first_token(const json & manifest, const std::string & import_d
 
 pd_handoff load_pd_handoff(const std::string & import_dir) {
     pd_handoff out;
+    const auto metadata_read_start = steady_clock::now();
     out.manifest = read_json_file(import_dir + "/manifest.json");
     out.prompt_tokens = load_prompt_tokens(import_dir + "/prompt_tokens.bin");
     out.first_token = load_first_token(out.manifest, import_dir);
+    out.metadata_read_ms = elapsed_ms(metadata_read_start);
 
-    const std::vector<uint8_t> kv_bytes = read_binary_file(import_dir + "/kv.bin");
-    if (kv_bytes.size() % sizeof(uint16_t) != 0) {
-        throw std::runtime_error("kv.bin size is not aligned to fp16");
-    }
-    out.kv_fp16.resize(kv_bytes.size() / sizeof(uint16_t));
-    std::memcpy(out.kv_fp16.data(), kv_bytes.data(), kv_bytes.size());
+    const auto kv_read_start = steady_clock::now();
+    out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
+    out.kv_read_ms = elapsed_ms(kv_read_start);
 
     out.prompt_len = out.manifest.at("prompt_length").get<int32_t>();
     out.num_layers = out.manifest.at("num_layers").get<int32_t>();
@@ -359,44 +435,52 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
     const uint16_t * k_base = handoff.kv_fp16.data();
     const uint16_t * v_base = handoff.kv_fp16.data() + per_kind_values;
 
-    std::vector<uint8_t> blob;
-    blob.reserve(
-        sizeof(uint32_t) +
-        sizeof(llama_seq_id) +
-        sizeof(uint32_t) +
-        sizeof(uint32_t) +
-        cell_count * (sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id)) +
-        sizeof(uint32_t) * 2 +
-        n_layer * (sizeof(int32_t) + sizeof(uint64_t) + cell_count * k_row_size) +
-        n_layer * (sizeof(int32_t) + sizeof(uint32_t) * 2 + cell_count * v_row_size));
+    const size_t state_header_size =
+        sizeof(uint32_t) + sizeof(llama_seq_id) +
+        sizeof(uint32_t) + sizeof(uint32_t);
+    const size_t cell_metadata_size =
+        static_cast<size_t>(cell_count) *
+        (sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id));
+    const size_t kv_header_size = sizeof(uint32_t) * 2;
+    const size_t k_layer_size =
+        sizeof(int32_t) + sizeof(uint64_t) +
+        static_cast<size_t>(cell_count) * k_row_size;
+    const size_t v_layer_header_size =
+        sizeof(int32_t) +
+        (v_trans ? sizeof(uint32_t) * 2 : sizeof(uint64_t));
+    const size_t v_layer_size =
+        v_layer_header_size + static_cast<size_t>(cell_count) * v_row_size;
+    const size_t blob_size =
+        state_header_size + cell_metadata_size + kv_header_size +
+        static_cast<size_t>(n_layer) * (k_layer_size + v_layer_size);
+    blob_writer writer(blob_size);
 
-    append_pod(blob, k_state_seq_magic);
-    append_pod(blob, k_seq_id);
-    append_pod(blob, k_n_stream);
-    append_pod(blob, cell_count);
+    writer.write_pod(k_state_seq_magic);
+    writer.write_pod(k_seq_id);
+    writer.write_pod(k_n_stream);
+    writer.write_pod(cell_count);
     for (uint32_t pos = 0; pos < cell_count; ++pos) {
         const llama_pos llama_position = static_cast<llama_pos>(pos);
         const uint32_t n_seq_id = 1;
-        append_pod(blob, llama_position);
-        append_pod(blob, n_seq_id);
-        append_pod(blob, k_seq_id);
+        writer.write_pod(llama_position);
+        writer.write_pod(n_seq_id);
+        writer.write_pod(k_seq_id);
     }
 
     const uint32_t v_trans_u32 = v_trans ? 1u : 0u;
-    append_pod(blob, v_trans_u32);
-    append_pod(blob, n_layer);
+    writer.write_pod(v_trans_u32);
+    writer.write_pod(n_layer);
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
         const int32_t type = GGML_TYPE_F16;
-        append_pod(blob, type);
-        append_pod(blob, k_row_size);
+        writer.write_pod(type);
+        writer.write_pod(k_row_size);
         for (int32_t pos = 0; pos < handoff.prompt_len; ++pos) {
             for (int32_t head = 0; head < handoff.num_kv_heads; ++head) {
                 const size_t src = (((static_cast<size_t>(layer) * handoff.num_kv_heads + head) *
                                     handoff.prompt_len + pos) *
                                     handoff.head_dim);
-                append_bytes(
-                    blob,
+                writer.write_bytes(
                     k_base + src,
                     static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
             }
@@ -405,24 +489,23 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
         const int32_t type = GGML_TYPE_F16;
-        append_pod(blob, type);
+        writer.write_pod(type);
         if (!v_trans) {
-            append_pod(blob, v_row_size);
+            writer.write_pod(v_row_size);
             for (int32_t pos = 0; pos < handoff.prompt_len; ++pos) {
                 for (int32_t head = 0; head < handoff.num_kv_heads; ++head) {
                     const size_t src = (((static_cast<size_t>(layer) * handoff.num_kv_heads + head) *
                                         handoff.prompt_len + pos) *
                                         handoff.head_dim);
-                    append_bytes(
-                        blob,
+                    writer.write_bytes(
                         v_base + src,
                         static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
                 }
             }
         } else {
             const uint32_t v_size_el = sizeof(uint16_t);
-            append_pod(blob, v_size_el);
-            append_pod(blob, n_embd_v_gqa);
+            writer.write_pod(v_size_el);
+            writer.write_pod(n_embd_v_gqa);
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 const int32_t head = static_cast<int32_t>(j / handoff.head_dim);
                 const int32_t dim = static_cast<int32_t>(j % handoff.head_dim);
@@ -431,13 +514,13 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
                         (((static_cast<size_t>(layer) * handoff.num_kv_heads + head) *
                           handoff.prompt_len + pos) *
                          handoff.head_dim) + dim;
-                    append_bytes(blob, v_base + src, sizeof(uint16_t));
+                    writer.write_bytes(v_base + src, sizeof(uint16_t));
                 }
             }
         }
     }
 
-    return blob;
+    return writer.finish();
 }
 
 
@@ -720,6 +803,7 @@ void print_usage(int argc, char ** argv) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    const auto process_start = steady_clock::now();
     std::setlocale(LC_NUMERIC, "C");
 
     pd_args pd;
@@ -759,6 +843,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("failed to initialize model/context/sampler\n");
         return 1;
     }
+
+    const process_memory_snapshot memory_after_model_load = process_memory();
 
     pd_handoff handoff;
     try {
@@ -801,10 +887,14 @@ int main(int argc, char ** argv) {
     // builds the legacy transposed layout. Later auto_fa resolution only
     // affects graph selection, not the already-allocated KV tensor layout.
     const bool v_trans = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    const auto kv_layout_start = steady_clock::now();
     const std::vector<uint8_t> seq_blob = build_seq_state_blob(handoff, v_trans);
-    llama_memory_clear(llama_get_memory(ctx), true);
+    const double kv_layout_ms = elapsed_ms(kv_layout_start);
+
+    const auto kv_import_start = steady_clock::now();
     const size_t nset =
         llama_state_seq_set_data(ctx, seq_blob.data(), seq_blob.size(), 0);
+    const double kv_import_ms = elapsed_ms(kv_import_start);
     if (nset != seq_blob.size()) {
         LOG_ERR(
             "failed to import PD KV state: written=%zu expected=%zu\n",
@@ -813,12 +903,30 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const auto kv_validation_start = steady_clock::now();
     try {
         validate_imported_kv_state(handoff, ctx);
     } catch (const std::exception & err) {
         LOG_ERR("PD handoff imported but KV validation failed: %s\n", err.what());
         return 1;
     }
+    const double kv_validation_ms = elapsed_ms(kv_validation_start);
+    const double handoff_total_ms =
+        handoff.metadata_read_ms + handoff.kv_read_ms +
+        kv_layout_ms + kv_import_ms + kv_validation_ms;
+    LOG_INF(
+        "PD handoff timing: metadata_read_ms=%.3f kv_read_ms=%.3f "
+        "kv_layout_ms=%.3f kv_import_ms=%.3f validation_ms=%.3f "
+        "total_ms=%.3f kv_bytes=%zu seq_blob_bytes=%zu\n",
+        handoff.metadata_read_ms,
+        handoff.kv_read_ms,
+        kv_layout_ms,
+        kv_import_ms,
+        kv_validation_ms,
+        handoff_total_ms,
+        handoff.kv_fp16.size() * sizeof(uint16_t),
+        seq_blob.size());
+    const process_memory_snapshot memory_after_import = process_memory();
 
     if (pd.roundtrip_check) {
         const size_t roundtrip_size = llama_state_seq_get_size(ctx, 0);
@@ -866,6 +974,8 @@ int main(int argc, char ** argv) {
     int n_remain = params.n_predict;
     const bool infinite = n_remain < 0;
     llama_token cur = handoff.first_token;
+    int32_t generated_tokens = 0;
+    const auto decode_start = steady_clock::now();
 
     if (!infinite) {
         if (n_remain == 0) {
@@ -875,6 +985,7 @@ int main(int argc, char ** argv) {
     }
 
     common_sampler_accept(smpl, cur, true);
+    ++generated_tokens;
     LOG("%s", common_token_to_piece(ctx, cur, params.special).c_str());
 
     if (llama_decode(ctx, llama_batch_get_one(&cur, 1)) != 0) {
@@ -895,6 +1006,7 @@ int main(int argc, char ** argv) {
     while (infinite || n_remain > 0) {
         const llama_token next = common_sampler_sample(smpl, ctx, -1);
         common_sampler_accept(smpl, next, true);
+        ++generated_tokens;
         LOG("%s", common_token_to_piece(ctx, next, params.special).c_str());
 
         if (llama_vocab_is_eog(vocab, next)) {
@@ -916,6 +1028,22 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n");
+    const double decode_ms = elapsed_ms(decode_start);
+    const process_memory_snapshot memory_after_decode = process_memory();
+    LOG_INF(
+        "PD decode runtime summary: generated_tokens=%d handoff_ms=%.3f "
+        "decode_ms=%.3f process_total_ms=%.3f\n",
+        generated_tokens,
+        handoff_total_ms,
+        decode_ms,
+        elapsed_ms(process_start));
+    LOG_INF(
+        "PD decode memory MiB: after_model_load_rss=%.2f after_import_rss=%.2f "
+        "after_decode_rss=%.2f hwm=%.2f\n",
+        bytes_to_mib(memory_after_model_load.rss_bytes),
+        bytes_to_mib(memory_after_import.rss_bytes),
+        bytes_to_mib(memory_after_decode.rss_bytes),
+        bytes_to_mib(memory_after_decode.hwm_bytes));
     common_perf_print(ctx, smpl);
     return 0;
 }
