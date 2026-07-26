@@ -2,6 +2,7 @@
 #include "common.h"
 #include "json.hpp"
 #include "llama.h"
+#include "llama-qnn-u16.h"
 #include "log.h"
 #include "sampling.h"
 
@@ -9,11 +10,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <clocale>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -21,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::ordered_json;
@@ -29,11 +34,193 @@ namespace {
 
 struct pd_args {
     std::string import_dir;
+    std::string ppl_tokens_path;
+    std::string ppl_output_path;
+    int32_t ppl_max_tokens = 0;
     bool import_ro = false;
     bool roundtrip_check = false;
     bool native_compare = false;
     bool native_first_token = false;
 };
+
+struct pd_capture_state {
+    std::filesystem::path output_dir;
+    std::unordered_set<std::string> requested;
+    std::unordered_set<std::string> captured;
+    std::string error;
+    bool active = false;
+    bool completed = false;
+};
+
+static const char * const pd_default_capture_nodes[] = {
+    "qnn_u16_input",
+    "qnn_attn_norm-0",
+    "qnn_q_projection-0",
+    "qnn_k_projection-0",
+    "qnn_v_projection-0",
+    "qnn_q_head_norm-0",
+    "qnn_q_head_rope-0",
+    "qnn_q_head_rotate-0",
+    "qnn_k_head_norm-0",
+    "qnn_k_head_rope-0",
+    "qnn_k_head_rotate-0",
+    "qnn_k_head_u8-0",
+    "qnn_v_head_u8-0",
+    "qnn_attention_score-0",
+    "qnn_attention_scaled-0",
+    "qnn_attention_min-0",
+    "qnn_attention_mask_value-0",
+    "qnn_attention_masked-0",
+    "qnn_attention_softmax-0",
+    "qnn_attention_value-0",
+    "qnn_attention_concat-0",
+    "qnn_attention_output-0",
+    "qnn_ffn_input-0",
+    "qnn_ffn_norm-0",
+    "qnn_ffn_gate-0",
+    "qnn_ffn_up-0",
+    "qnn_ffn_sigmoid-0",
+    "qnn_ffn_silu-0",
+    "qnn_ffn_product-0",
+    "qnn_ffn_down-0",
+    "qnn_layer_output-0",
+    "qnn_attn_norm-1",
+    "qnn_q_projection-1",
+    "qnn_k_projection-1",
+    "qnn_v_projection-1",
+    "qnn_q_head_norm-1",
+    "qnn_q_head_rope-1",
+    "qnn_q_head_rotate-1",
+    "qnn_k_head_norm-1",
+    "qnn_k_head_rope-1",
+    "qnn_k_head_rotate-1",
+    "qnn_k_head_u8-1",
+    "qnn_v_head_u8-1",
+    "qnn_attention_score-1",
+    "qnn_attention_scaled-1",
+    "qnn_attention_min-1",
+    "qnn_attention_mask_value-1",
+    "qnn_attention_masked-1",
+    "qnn_attention_softmax-1",
+    "qnn_attention_value-1",
+    "qnn_attention_concat-1",
+    "qnn_attention_output-1",
+    "qnn_ffn_input-1",
+    "qnn_ffn_norm-1",
+    "qnn_ffn_gate-1",
+    "qnn_ffn_up-1",
+    "qnn_ffn_sigmoid-1",
+    "qnn_ffn_silu-1",
+    "qnn_ffn_product-1",
+    "qnn_ffn_down-1",
+    "qnn_layer_output-1",
+};
+
+static void configure_pd_capture(pd_capture_state & state, const char * output_dir) {
+    state.output_dir = output_dir;
+    std::filesystem::create_directories(state.output_dir);
+    state.requested.insert(
+        std::begin(pd_default_capture_nodes),
+        std::end(pd_default_capture_nodes));
+}
+
+static bool write_pd_capture(
+        ggml_tensor * tensor,
+        const std::string & name,
+        pd_capture_state & state) {
+    if (tensor->data == nullptr) {
+        state.error = "target tensor has no host-accessible data: " + name;
+        return false;
+    }
+    const char * suffix = nullptr;
+    switch (tensor->type) {
+        case GGML_TYPE_U16: suffix = ".u16.bin"; break;
+        case GGML_TYPE_I8:  suffix = ".u8.bin";  break;
+        default:
+            state.error = "unsupported target tensor type: " + name +
+                " type=" + ggml_type_name(tensor->type);
+            return false;
+    }
+    if (!ggml_is_contiguous(tensor)) {
+        state.error = "target tensor is not contiguous: " + name;
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    const std::filesystem::path binary_path = state.output_dir / (name + suffix);
+    std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+    if (!binary.is_open()) {
+        state.error = "unable to write " + binary_path.string();
+        return false;
+    }
+    binary.write(reinterpret_cast<const char *>(tensor->data), static_cast<std::streamsize>(nbytes));
+    binary.close();
+    if (!binary) {
+        state.error = "short write for " + binary_path.string();
+        return false;
+    }
+
+    const std::filesystem::path metadata_path = state.output_dir / (name + ".json");
+    std::ofstream metadata(metadata_path, std::ios::trunc);
+    if (!metadata.is_open()) {
+        state.error = "unable to write " + metadata_path.string();
+        return false;
+    }
+    metadata << "{\n"
+             << "  \"tensor_name\": \"" << name << "\",\n"
+             << "  \"ggml_type\": \"" << ggml_type_name(tensor->type) << "\",\n"
+             << "  \"nbytes\": " << nbytes << ",\n"
+             << "  \"ne\": ["
+             << tensor->ne[0] << ", " << tensor->ne[1] << ", "
+             << tensor->ne[2] << ", " << tensor->ne[3] << "],\n"
+             << "  \"nb\": ["
+             << tensor->nb[0] << ", " << tensor->nb[1] << ", "
+             << tensor->nb[2] << ", " << tensor->nb[3] << "]\n"
+             << "}\n";
+    return true;
+}
+
+static bool pd_capture_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & state = *static_cast<pd_capture_state *>(user_data);
+    if (!state.active || !state.error.empty()) {
+        return false;
+    }
+    const char * raw_name = ggml_get_name(tensor);
+    const std::string name = raw_name == nullptr ? "" : raw_name;
+    if (state.requested.count(name) == 0 || state.captured.count(name) != 0) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    if (write_pd_capture(tensor, name, state)) {
+        state.captured.insert(name);
+    }
+    return true;
+}
+
+static void finish_pd_capture(pd_capture_state & state, llama_token token) {
+    state.completed = true;
+    std::ofstream summary(state.output_dir / "capture.json", std::ios::trunc);
+    summary << "{\n"
+            << "  \"decode_input_token\": " << token << ",\n"
+            << "  \"requested_nodes\": " << state.requested.size() << ",\n"
+            << "  \"captured_nodes\": " << state.captured.size() << ",\n"
+            << "  \"error\": \"" << state.error << "\",\n"
+            << "  \"missing_nodes\": [";
+    bool first = true;
+    for (const std::string & name : state.requested) {
+        if (state.captured.count(name) != 0) {
+            continue;
+        }
+        summary << (first ? "\n" : ",\n") << "    \"" << name << "\"";
+        first = false;
+    }
+    if (!first) {
+        summary << '\n';
+    }
+    summary << "  ]\n}\n";
+}
 
 using steady_clock = std::chrono::steady_clock;
 
@@ -78,7 +265,9 @@ struct pd_handoff {
     json manifest;
     std::vector<llama_token> prompt_tokens;
     llama_token first_token = -1;
+    bool first_token_is_prompt_tail = false;
     std::vector<uint16_t> kv_fp16;
+    std::vector<uint8_t> kv_qnn_u8;
     int32_t prompt_len = 0;
     int32_t num_layers = 0;
     int32_t num_kv_heads = 0;
@@ -208,6 +397,30 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
             out.import_ro = true;
             continue;
         }
+        if (arg == "--pd-ppl-tokens") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-ppl-tokens requires a raw uint64 token file");
+            }
+            out.ppl_tokens_path = argv[++i];
+            continue;
+        }
+        if (arg == "--pd-ppl-output") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-ppl-output requires a path");
+            }
+            out.ppl_output_path = argv[++i];
+            continue;
+        }
+        if (arg == "--pd-ppl-max-tokens") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-ppl-max-tokens requires a count");
+            }
+            out.ppl_max_tokens = std::stoi(argv[++i]);
+            if (out.ppl_max_tokens < 0) {
+                throw std::runtime_error("--pd-ppl-max-tokens cannot be negative");
+            }
+            continue;
+        }
         if (arg == "--pd-roundtrip-check") {
             out.roundtrip_check = true;
             continue;
@@ -304,6 +517,22 @@ std::vector<llama_token> load_prompt_tokens(const std::string & path) {
     return tokens;
 }
 
+double token_nll(const float * logits, int32_t n_vocab, llama_token target) {
+    if (logits == nullptr || target < 0 || target >= n_vocab) {
+        throw std::runtime_error("invalid logits or target token for PPL");
+    }
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        max_logit = std::max(max_logit, logits[token]);
+    }
+    double exp_sum = 0.0;
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        exp_sum += std::exp(static_cast<double>(logits[token] - max_logit));
+    }
+    return std::log(exp_sum) -
+        static_cast<double>(logits[target] - max_logit);
+}
+
 llama_token load_first_token(const json & manifest, const std::string & import_dir) {
     if (manifest.contains("first_token_id")) {
         return static_cast<llama_token>(manifest.at("first_token_id").get<int64_t>());
@@ -323,10 +552,16 @@ pd_handoff load_pd_handoff(const std::string & import_dir) {
     out.manifest = read_json_file(import_dir + "/manifest.json");
     out.prompt_tokens = load_prompt_tokens(import_dir + "/prompt_tokens.bin");
     out.first_token = load_first_token(out.manifest, import_dir);
+    out.first_token_is_prompt_tail =
+        out.manifest.value("first_token_is_prompt_tail", false);
     out.metadata_read_ms = elapsed_ms(metadata_read_start);
 
     const auto kv_read_start = steady_clock::now();
     out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
+    const std::string qnn_u8_kv_file = out.manifest.value("qnn_u8_kv_file", "");
+    if (!qnn_u8_kv_file.empty()) {
+        out.kv_qnn_u8 = read_binary_vector<uint8_t>(import_dir + "/" + qnn_u8_kv_file);
+    }
     out.kv_read_ms = elapsed_ms(kv_read_start);
 
     out.prompt_len = out.manifest.at("prompt_length").get<int32_t>();
@@ -350,6 +585,12 @@ pd_handoff load_pd_handoff(const std::string & import_dir) {
     if (out.kv_fp16.size() != expected_values) {
         std::ostringstream oss;
         oss << "kv.bin element count mismatch: got=" << out.kv_fp16.size()
+            << " expected=" << expected_values;
+        throw std::runtime_error(oss.str());
+    }
+    if (!out.kv_qnn_u8.empty() && out.kv_qnn_u8.size() != expected_values) {
+        std::ostringstream oss;
+        oss << "QNN U8 kv file element count mismatch: got=" << out.kv_qnn_u8.size()
             << " expected=" << expected_values;
         throw std::runtime_error(oss.str());
     }
@@ -396,9 +637,11 @@ void validate_pd_handoff(
         throw std::runtime_error(oss.str());
     }
 
-    if (handoff.prompt_len > llama_n_ctx(ctx)) {
+    const int32_t required_ctx = handoff.prompt_len +
+        (handoff.first_token_is_prompt_tail ? 1 : 0);
+    if (required_ctx > static_cast<int32_t>(llama_n_ctx(ctx))) {
         std::ostringstream oss;
-        oss << "PD prompt length exceeds decode context: prompt_len=" << handoff.prompt_len
+        oss << "PD prompt length exceeds decode context: required=" << required_ctx
             << " n_ctx=" << llama_n_ctx(ctx);
         throw std::runtime_error(oss.str());
     }
@@ -414,7 +657,10 @@ void validate_imported_kv_state(const pd_handoff & handoff, llama_context * ctx)
     }
 }
 
-std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_trans) {
+std::vector<uint8_t> build_seq_state_blob(
+        const pd_handoff & handoff,
+        bool v_trans,
+        bool qnn_u8_layout) {
     static constexpr uint32_t k_state_seq_magic = 0xaf143cd8U;
     static constexpr llama_seq_id k_seq_id = 0;
     static constexpr uint32_t k_n_stream = 1;
@@ -424,8 +670,15 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
     const uint32_t n_embd_k_gqa =
         static_cast<uint32_t>(handoff.num_kv_heads * handoff.head_dim);
     const uint32_t n_embd_v_gqa = n_embd_k_gqa;
+    if (qnn_u8_layout && v_trans) {
+        throw std::runtime_error("QNN U8 KV requires non-transposed V layout");
+    }
+    if (qnn_u8_layout && handoff.kv_qnn_u8.empty()) {
+        throw std::runtime_error("QNN U8 KV handoff is missing kv_qnn_u8.bin");
+    }
+    const size_t kv_element_size = qnn_u8_layout ? sizeof(uint8_t) : sizeof(uint16_t);
     const uint64_t k_row_size =
-        static_cast<uint64_t>(n_embd_k_gqa) * sizeof(uint16_t);
+        static_cast<uint64_t>(n_embd_k_gqa) * kv_element_size;
     const uint64_t v_row_size = k_row_size;
     const size_t per_kind_values =
         static_cast<size_t>(handoff.num_layers) *
@@ -434,6 +687,9 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
         handoff.head_dim;
     const uint16_t * k_base = handoff.kv_fp16.data();
     const uint16_t * v_base = handoff.kv_fp16.data() + per_kind_values;
+    const uint8_t * k_u8_base = handoff.kv_qnn_u8.data();
+    const uint8_t * v_u8_base = handoff.kv_qnn_u8.data() +
+        (qnn_u8_layout ? per_kind_values : 0);
 
     const size_t state_header_size =
         sizeof(uint32_t) + sizeof(llama_seq_id) +
@@ -472,7 +728,7 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
     writer.write_pod(n_layer);
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
-        const int32_t type = GGML_TYPE_F16;
+        const int32_t type = qnn_u8_layout ? GGML_TYPE_I8 : GGML_TYPE_F16;
         writer.write_pod(type);
         writer.write_pod(k_row_size);
         for (int32_t pos = 0; pos < handoff.prompt_len; ++pos) {
@@ -480,15 +736,21 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
                 const size_t src = (((static_cast<size_t>(layer) * handoff.num_kv_heads + head) *
                                     handoff.prompt_len + pos) *
                                     handoff.head_dim);
-                writer.write_bytes(
-                    k_base + src,
-                    static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
+                if (qnn_u8_layout) {
+                    writer.write_bytes(
+                        k_u8_base + src,
+                        static_cast<size_t>(handoff.head_dim));
+                } else {
+                    writer.write_bytes(
+                        k_base + src,
+                        static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
+                }
             }
         }
     }
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
-        const int32_t type = GGML_TYPE_F16;
+        const int32_t type = qnn_u8_layout ? GGML_TYPE_I8 : GGML_TYPE_F16;
         writer.write_pod(type);
         if (!v_trans) {
             writer.write_pod(v_row_size);
@@ -497,9 +759,15 @@ std::vector<uint8_t> build_seq_state_blob(const pd_handoff & handoff, bool v_tra
                     const size_t src = (((static_cast<size_t>(layer) * handoff.num_kv_heads + head) *
                                         handoff.prompt_len + pos) *
                                         handoff.head_dim);
-                    writer.write_bytes(
-                        v_base + src,
-                        static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
+                    if (qnn_u8_layout) {
+                        writer.write_bytes(
+                            v_u8_base + src,
+                            static_cast<size_t>(handoff.head_dim));
+                    } else {
+                        writer.write_bytes(
+                            v_base + src,
+                            static_cast<size_t>(handoff.head_dim) * sizeof(uint16_t));
+                    }
                 }
             }
         } else {
@@ -797,6 +1065,7 @@ void print_usage(int argc, char ** argv) {
     LOG("  diagnostics: add --pd-roundtrip-check to compare imported KV against llama.cpp sequence serialization\n");
     LOG("  diagnostics: add --pd-native-compare to compare imported KV resume logits against native GGUF prefill\n");
     LOG("  quality fallback: add --pd-native-first-token to select the first continuation token with GGUF prompt prefill\n");
+    LOG("  PPL: add --pd-ppl-tokens continuation.u64 --pd-ppl-output result.txt for teacher-forced scoring\n");
     LOG("\n");
 }
 
@@ -832,6 +1101,23 @@ int main(int argc, char ** argv) {
         LOG_ERR("pd-cli does not accept a prompt; prompt tokens come from --pd-import\n");
         return 1;
     }
+
+    pd_capture_state pd_capture;
+    if (const char * dump_dir = std::getenv("LLAMA_QNN_PD_DUMP_DIR");
+            dump_dir != nullptr && dump_dir[0] != '\0') {
+        try {
+            configure_pd_capture(pd_capture, dump_dir);
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to configure PD intermediate capture: %s\n", err.what());
+            return 1;
+        }
+        params.cb_eval = pd_capture_callback;
+        params.cb_eval_user_data = &pd_capture;
+        LOG_INF(
+            "PD intermediate capture armed: dir=%s nodes=%zu\n",
+            dump_dir,
+            pd_capture.requested.size());
+    }
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -856,10 +1142,27 @@ int main(int argc, char ** argv) {
     }
 
     if (pd.native_first_token) {
+        if (handoff.first_token_is_prompt_tail) {
+            LOG_ERR("--pd-native-first-token is incompatible with a prompt-tail bridge handoff\n");
+            return 1;
+        }
         const llama_token handoff_first_token = handoff.first_token;
+        const bool capture_native_prompt =
+            !pd_capture.output_dir.empty() && !pd_capture.completed;
         try {
+            pd_capture.active = capture_native_prompt;
             const native_compare_result native =
                 run_native_compare(handoff, model, params);
+            pd_capture.active = false;
+            if (capture_native_prompt) {
+                finish_pd_capture(pd_capture, handoff.prompt_tokens.back());
+                LOG_INF(
+                    "PD native prompt capture finished: tokens=%d captured=%zu requested=%zu error=%s\n",
+                    handoff.prompt_len,
+                    pd_capture.captured.size(),
+                    pd_capture.requested.size(),
+                    pd_capture.error.empty() ? "none" : pd_capture.error.c_str());
+            }
             const auto native_prompt_top = top_k_logits(
                 native.prompt_logits.data(), llama_vocab_n_tokens(llama_model_get_vocab(model)), 1);
             if (native_prompt_top.empty()) {
@@ -872,6 +1175,7 @@ int main(int argc, char ** argv) {
                 handoff.first_token,
                 native_prompt_top.front().logit);
         } catch (const std::exception & err) {
+            pd_capture.active = false;
             LOG_ERR("PD native first-token selection failed: %s\n", err.what());
             return 1;
         }
@@ -886,9 +1190,13 @@ int main(int argc, char ** argv) {
     // AUTO and ENABLED both build a non-transposed V cache, while DISABLED
     // builds the legacy transposed layout. Later auto_fa resolution only
     // affects graph selection, not the already-allocated KV tensor layout.
-    const bool v_trans = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
+    const bool v_trans = qnn_u8_layout
+        ? false
+        : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED;
     const auto kv_layout_start = steady_clock::now();
-    const std::vector<uint8_t> seq_blob = build_seq_state_blob(handoff, v_trans);
+    const std::vector<uint8_t> seq_blob =
+        build_seq_state_blob(handoff, v_trans, qnn_u8_layout);
     const double kv_layout_ms = elapsed_ms(kv_layout_start);
 
     const auto kv_import_start = steady_clock::now();
@@ -959,9 +1267,10 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INF(
-        "PD handoff imported: prompt_len=%d first_token=%d layers=%d kv_heads=%d head_dim=%d\n",
+        "PD handoff imported: prompt_len=%d first_token=%d bridge_prompt_tail=%d layers=%d kv_heads=%d head_dim=%d\n",
         handoff.prompt_len,
         handoff.first_token,
+        handoff.first_token_is_prompt_tail,
         handoff.num_layers,
         handoff.num_kv_heads,
         handoff.head_dim);
@@ -973,24 +1282,117 @@ int main(int argc, char ** argv) {
 
     int n_remain = params.n_predict;
     const bool infinite = n_remain < 0;
-    llama_token cur = handoff.first_token;
+
     int32_t generated_tokens = 0;
     const auto decode_start = steady_clock::now();
-
-    if (!infinite) {
-        if (n_remain == 0) {
-            return 0;
+    const auto decode_one = [&](llama_token token) {
+        const bool capture_this_decode =
+            !pd_capture.output_dir.empty() && !pd_capture.completed;
+        pd_capture.active = capture_this_decode;
+        const int result = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        pd_capture.active = false;
+        if (capture_this_decode) {
+            finish_pd_capture(pd_capture, token);
+            LOG_INF(
+                "PD intermediate capture finished: token=%d captured=%zu requested=%zu error=%s\n",
+                token,
+                pd_capture.captured.size(),
+                pd_capture.requested.size(),
+                pd_capture.error.empty() ? "none" : pd_capture.error.c_str());
         }
-        --n_remain;
+        return result;
+    };
+
+    if (!pd.ppl_tokens_path.empty()) {
+        if (handoff.first_token_is_prompt_tail) {
+            LOG_ERR("PD PPL requires a logits-producing prefill handoff\n");
+            return 1;
+        }
+        std::vector<llama_token> continuation;
+        try {
+            continuation = load_prompt_tokens(pd.ppl_tokens_path);
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to load PD PPL tokens: %s\n", err.what());
+            return 1;
+        }
+        if (continuation.size() < 2) {
+            LOG_ERR("PD PPL requires at least two continuation tokens\n");
+            return 1;
+        }
+        if (pd.ppl_max_tokens > 0 &&
+            continuation.size() > static_cast<size_t>(pd.ppl_max_tokens) + 1) {
+            continuation.resize(static_cast<size_t>(pd.ppl_max_tokens) + 1);
+        }
+        if (static_cast<int64_t>(handoff.prompt_len) +
+                static_cast<int64_t>(continuation.size()) >
+            llama_n_ctx(ctx)) {
+            LOG_ERR(
+                "PD PPL sequence exceeds context: prompt=%d continuation=%zu context=%u\n",
+                handoff.prompt_len,
+                continuation.size(),
+                llama_n_ctx(ctx));
+            return 1;
+        }
+
+        const int32_t n_vocab =
+            llama_vocab_n_tokens(llama_model_get_vocab(model));
+        double total_nll = 0.0;
+        int64_t scored_tokens = 0;
+        const auto ppl_start = steady_clock::now();
+        for (size_t index = 0; index + 1 < continuation.size(); ++index) {
+            if (decode_one(continuation[index]) != 0) {
+                LOG_ERR("llama_decode failed during PD PPL at continuation index %zu\n", index);
+                return 1;
+            }
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            try {
+                total_nll += token_nll(
+                    logits, n_vocab, continuation[index + 1]);
+            } catch (const std::exception & err) {
+                LOG_ERR("PD PPL scoring failed: %s\n", err.what());
+                return 1;
+            }
+            ++scored_tokens;
+        }
+        const double ppl = std::exp(total_nll / static_cast<double>(scored_tokens));
+        const double ppl_ms = elapsed_ms(ppl_start);
+        LOG_INF(
+            "PD WikiPPL: ppl=%.9f nll=%.9f scored_tokens=%" PRId64
+            " prompt_tokens=%d continuation_tokens=%zu eval_ms=%.3f tokens_per_second=%.3f\n",
+            ppl,
+            total_nll,
+            scored_tokens,
+            handoff.prompt_len,
+            continuation.size(),
+            ppl_ms,
+            1000.0 * static_cast<double>(scored_tokens) / ppl_ms);
+        if (!pd.ppl_output_path.empty()) {
+            std::ofstream output(pd.ppl_output_path, std::ios::trunc);
+            if (!output.is_open()) {
+                LOG_ERR("failed to open PD PPL output: %s\n", pd.ppl_output_path.c_str());
+                return 1;
+            }
+            output << "wiki_ppl=" << ppl << "\n"
+                   << "total_nll=" << total_nll << "\n"
+                   << "scored_tokens=" << scored_tokens << "\n"
+                   << "prompt_tokens=" << handoff.prompt_len << "\n"
+                   << "continuation_tokens=" << continuation.size() << "\n"
+                   << "eval_ms=" << ppl_ms << "\n";
+        }
+        common_perf_print(ctx, smpl);
+        return 0;
     }
 
-    common_sampler_accept(smpl, cur, true);
-    ++generated_tokens;
-    LOG("%s", common_token_to_piece(ctx, cur, params.special).c_str());
+    if (!infinite && n_remain == 0) {
+        return 0;
+    }
 
-    if (llama_decode(ctx, llama_batch_get_one(&cur, 1)) != 0) {
-        LOG_ERR("llama_decode failed after importing PD state\n");
-        return 1;
+    if (handoff.first_token_is_prompt_tail) {
+        common_sampler_accept(smpl, handoff.first_token, false);
+        if (decode_one(handoff.first_token) != 0) {
+            LOG_ERR("llama_decode failed for PD prompt-tail bridge token\n");
+            return 1;
+        }
     }
 
     if (pd.native_compare) {
@@ -1003,28 +1405,26 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    llama_token cur = handoff.first_token_is_prompt_tail
+        ? common_sampler_sample(smpl, ctx, -1)
+        : handoff.first_token;
     while (infinite || n_remain > 0) {
-        const llama_token next = common_sampler_sample(smpl, ctx, -1);
-        common_sampler_accept(smpl, next, true);
+        common_sampler_accept(smpl, cur, true);
         ++generated_tokens;
-        LOG("%s", common_token_to_piece(ctx, next, params.special).c_str());
+        LOG("%s", common_token_to_piece(ctx, cur, params.special).c_str());
 
-        if (llama_vocab_is_eog(vocab, next)) {
+        if (llama_vocab_is_eog(vocab, cur)) {
+            break;
+        }
+        if (!infinite && --n_remain == 0) {
             break;
         }
 
-        cur = next;
-        if (!infinite) {
-            --n_remain;
-            if (n_remain == 0) {
-                break;
-            }
-        }
-
-        if (llama_decode(ctx, llama_batch_get_one(&cur, 1)) != 0) {
+        if (decode_one(cur) != 0) {
             LOG_ERR("llama_decode failed while continuing decode\n");
             return 1;
         }
+        cur = common_sampler_sample(smpl, ctx, -1);
     }
 
     LOG("\n");

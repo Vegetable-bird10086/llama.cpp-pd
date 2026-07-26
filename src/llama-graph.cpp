@@ -2374,6 +2374,7 @@ ggml_tensor * llm_graph_context::build_attn(
         } else {
             cur = build_lora_mm(wo, cur, wo_s);
         }
+        cb(cur, "attn_out", il);
     }
 
     if (wo_b) {

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <float.h>
+#include <math.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
@@ -21,6 +22,30 @@
 #define GROUP_MAX_EPS_IQ1_S 1e-12f
 
 #define UNUSED GGML_UNUSED
+
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef __int128 ggml_int128_t;
+__extension__ typedef unsigned __int128 ggml_uint128_t;
+#endif
+
+static int ggml_gptq2_32_qnn_compat_enabled(void) {
+    static int enabled = -1;
+
+    int cached = __atomic_load_n(&enabled, __ATOMIC_ACQUIRE);
+    if (cached >= 0) {
+        return cached;
+    }
+
+    const char * const value = getenv("GGML_GPTQ2_QNN_COMPAT");
+    const int configured = value != NULL && value[0] != 0 && strcmp(value, "0") != 0;
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(
+            &enabled, &expected, configured, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+
+    return configured;
+}
 
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
@@ -427,8 +452,18 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
-void ggml_vec_dot_gptq2_32_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    assert(n % 32 == 0);
+static void ggml_vec_dot_gptq2_f32(
+        int n,
+        float * GGML_RESTRICT s,
+        size_t bs,
+        const void * GGML_RESTRICT vx,
+        size_t bx,
+        const void * GGML_RESTRICT vy,
+        size_t by,
+        int nrc,
+        int group_size) {
+    assert(group_size > 0 && group_size % 4 == 0);
+    assert(n % group_size == 0);
     assert(nrc == 1);
     assert(n == (int) bx);
     assert(n == (int) by);
@@ -439,25 +474,2924 @@ void ggml_vec_dot_gptq2_32_f32(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     const uint8_t * GGML_RESTRICT x = vx;
     const float   * GGML_RESTRICT y = vy;
-    const int nb = n / 32;
+    const int code_bytes = group_size / 4;
+    const int block_bytes = code_bytes + 4;
+    const int nb = n / group_size;
     float sumf = 0.0f;
+    const int qnn_compat_enabled = ggml_gptq2_32_qnn_compat_enabled();
 
     for (int ib = 0; ib < nb; ++ib) {
-        const uint8_t * block = x + ib * 12;
-        const float scale = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + 8));
-        const float zero_bias = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + 10));
+        const uint8_t * block = x + ib * block_bytes;
+        const float raw_scale = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + code_bytes));
+        const float zero_bias = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *)(block + code_bytes + 2));
 
-        for (int j = 0; j < 8; ++j) {
+        if (qnn_compat_enabled) {
+            const float scale = fmaxf(raw_scale, 1.0e-4f);
+            int zero_point = (int) lroundf(zero_bias / scale);
+            zero_point = zero_point < 0 ? 0 : (zero_point > 3 ? 3 : zero_point);
+
+            for (int j = 0; j < code_bytes; ++j) {
+                const uint8_t packed = block[j];
+
+                sumf += scale * (((packed >> 0) & 0x3) - zero_point) * y[ib * group_size + 4*j + 0];
+                sumf += scale * (((packed >> 2) & 0x3) - zero_point) * y[ib * group_size + 4*j + 1];
+                sumf += scale * (((packed >> 4) & 0x3) - zero_point) * y[ib * group_size + 4*j + 2];
+                sumf += scale * (((packed >> 6) & 0x3) - zero_point) * y[ib * group_size + 4*j + 3];
+            }
+            continue;
+        }
+
+        const float scale = raw_scale;
+
+        for (int j = 0; j < code_bytes; ++j) {
             const uint8_t packed = block[j];
 
-            sumf += (scale * ((packed >> 0) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 0];
-            sumf += (scale * ((packed >> 2) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 1];
-            sumf += (scale * ((packed >> 4) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 2];
-            sumf += (scale * ((packed >> 6) & 0x3) - zero_bias) * y[ib * 32 + 4*j + 3];
+            sumf += (scale * ((packed >> 0) & 0x3) - zero_bias) * y[ib * group_size + 4*j + 0];
+            sumf += (scale * ((packed >> 2) & 0x3) - zero_bias) * y[ib * group_size + 4*j + 1];
+            sumf += (scale * ((packed >> 4) & 0x3) - zero_bias) * y[ib * group_size + 4*j + 2];
+            sumf += (scale * ((packed >> 6) & 0x3) - zero_bias) * y[ib * group_size + 4*j + 3];
         }
     }
 
     *s = sumf;
+}
+
+void ggml_vec_dot_gptq2_32_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_gptq2_f32(n, s, bs, vx, bx, vy, by, nrc, 32);
+}
+
+void ggml_vec_dot_gptq2_64_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_gptq2_f32(n, s, bs, vx, bx, vy, by, nrc, 64);
+}
+
+void ggml_vec_dot_gptq2_128_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_gptq2_f32(n, s, bs, vx, bx, vy, by, nrc, 128);
+}
+
+static inline int64_t ggml_gptq2_32_round_shift_away_from_zero(
+        int64_t value,
+        int shift) {
+    const int64_t half = INT64_C(1) << (shift - 1);
+    return value >= 0 ? (value + half) >> shift : -(((-value) + half) >> shift);
+}
+
+static inline int64_t ggml_u16_floor_shift(int64_t value, int shift) {
+    GGML_ASSERT(shift > 0 && shift < 63);
+    if (value >= 0) {
+        return value >> shift;
+    }
+    const uint64_t magnitude = (uint64_t) (-(value + 1)) + 1;
+    return -(int64_t) ((magnitude + ((UINT64_C(1) << shift) - 1)) >> shift);
+}
+
+static inline int64_t ggml_u16_htp_round_shift(int64_t value, int shift) {
+    GGML_ASSERT(shift > 0 && shift < 63);
+    return ggml_u16_floor_shift(value + (INT64_C(1) << (shift - 1)), shift);
+}
+
+static inline int64_t ggml_u16_floor_shift_with_q7_bias(
+        int64_t value, int shift, int32_t bias_q7) {
+    GGML_ASSERT(shift > 0 && shift < 63);
+    GGML_ASSERT(bias_q7 >= -256 && bias_q7 <= 256);
+    if (bias_q7 == 0) {
+        return ggml_u16_floor_shift(value, shift);
+    }
+    const ggml_int128_t denominator = (ggml_int128_t) 1 << (shift + 7);
+    const ggml_int128_t adjusted = ((ggml_int128_t) value << 7) +
+        ((ggml_int128_t) bias_q7 << shift);
+    return adjusted >= 0
+        ? (int64_t) (adjusted / denominator)
+        : -(int64_t) ((-adjusted + denominator - 1) / denominator);
+}
+
+static inline int64_t ggml_gptq2_32_dot_u16_scalar(
+        const uint16_t * GGML_RESTRICT activations,
+        int32_t activation_zero_point,
+        const uint8_t * GGML_RESTRICT packed_codes,
+        int32_t weight_zero_point) {
+    int64_t dot = 0;
+    for (int index = 0; index < 32; ++index) {
+        const int32_t activation = (int32_t) activations[index] - activation_zero_point;
+        const int32_t code = (packed_codes[index >> 2] >> ((index & 3) * 2)) & 0x3;
+        dot += (int64_t) activation * (code - weight_zero_point);
+    }
+    return dot;
+}
+
+static inline int32_t ggml_gptq2_32_weight_sum_scalar(
+        const uint8_t * GGML_RESTRICT packed_codes,
+        int32_t weight_zero_point) {
+    int32_t sum = -32 * weight_zero_point;
+    for (int index = 0; index < 8; ++index) {
+        const uint8_t packed = packed_codes[index];
+        sum += ((packed >> 0) & 0x3) +
+            ((packed >> 2) & 0x3) +
+            ((packed >> 4) & 0x3) +
+            ((packed >> 6) & 0x3);
+    }
+    return sum;
+}
+
+static inline int64_t ggml_qnn_a16s8_reduce_accumulator(
+        int64_t centered_dot,
+        int64_t expanded_weight_sum,
+        int32_t activation_zero_point) {
+    const int64_t zero_point_correction =
+        (int64_t) activation_zero_point * expanded_weight_sum;
+    const int64_t raw_dot = centered_dot + zero_point_correction;
+    return (
+        ggml_u16_floor_shift(raw_dot, 8) -
+        ggml_u16_htp_round_shift(zero_point_correction, 8)) << 8;
+}
+
+#if defined(__ARM_NEON)
+static inline int32_t ggml_gptq2_32_hsum_s32(int32x4_t value) {
+#if defined(__aarch64__)
+    return vaddvq_s32(value);
+#else
+    const int64x2_t pairwise = vpaddlq_s32(value);
+    return (int32_t) (vgetq_lane_s64(pairwise, 0) + vgetq_lane_s64(pairwise, 1));
+#endif
+}
+
+static inline int64_t ggml_gptq2_32_dot_u16_neon(
+        const uint16_t * GGML_RESTRICT activations,
+        int32_t activation_zero_point,
+        const uint8_t * GGML_RESTRICT packed_codes,
+        int32_t weight_zero_point) {
+    // vld4q maps activation indices [0, 4, ..., 28] through [3, 7, ..., 31]
+    // to the four INT2 positions within each packed source byte.  The code
+    // stream is widened from INT2 to QNN INT4 semantics only in registers.
+    const uint16x8x4_t activation_lanes = vld4q_u16(activations);
+    const uint8x8_t packed = vld1_u8(packed_codes);
+    const uint8x8_t mask = vdup_n_u8(0x3);
+    const uint8x8_t code_lanes[4] = {
+        vand_u8(packed, mask),
+        vand_u8(vshr_n_u8(packed, 2), mask),
+        vand_u8(vshr_n_u8(packed, 4), mask),
+        vand_u8(vshr_n_u8(packed, 6), mask),
+    };
+#if defined(__aarch64__)
+    uint16x8_t activation_min = activation_lanes.val[0];
+    uint16x8_t activation_max = activation_lanes.val[0];
+    for (int lane = 1; lane < 4; ++lane) {
+        activation_min = vminq_u16(activation_min, activation_lanes.val[lane]);
+        activation_max = vmaxq_u16(activation_max, activation_lanes.val[lane]);
+    }
+    const uint16_t lower = activation_zero_point > 32768
+        ? (uint16_t) (activation_zero_point - 32768)
+        : 0;
+    const uint16_t upper = activation_zero_point < 32768
+        ? (uint16_t) (activation_zero_point + 32767)
+        : UINT16_MAX;
+    if (vminvq_u16(activation_min) >= lower &&
+        vmaxvq_u16(activation_max) <= upper) {
+        const uint16x8_t activation_zero_u16 =
+            vdupq_n_u16((uint16_t) activation_zero_point);
+        const int16x8_t weight_zero_i16 =
+            vdupq_n_s16((int16_t) weight_zero_point);
+        int32x4_t accumulator_lo = vdupq_n_s32(0);
+        int32x4_t accumulator_hi = vdupq_n_s32(0);
+        for (int lane = 0; lane < 4; ++lane) {
+            const int16x8_t activation_i16 = vreinterpretq_s16_u16(
+                vsubq_u16(activation_lanes.val[lane], activation_zero_u16));
+            const int16x8_t weight_i16 = vsubq_s16(
+                vmovl_s8(vreinterpret_s8_u8(code_lanes[lane])),
+                weight_zero_i16);
+            accumulator_lo = vmlal_s16(
+                accumulator_lo,
+                vget_low_s16(activation_i16),
+                vget_low_s16(weight_i16));
+            accumulator_hi = vmlal_s16(
+                accumulator_hi,
+                vget_high_s16(activation_i16),
+                vget_high_s16(weight_i16));
+        }
+        return
+            (int64_t) ggml_gptq2_32_hsum_s32(accumulator_lo) +
+            ggml_gptq2_32_hsum_s32(accumulator_hi);
+    }
+#endif
+    const int32x4_t activation_zero = vdupq_n_s32(activation_zero_point);
+    const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+    int32x4_t accumulator_lo = vdupq_n_s32(0);
+    int32x4_t accumulator_hi = vdupq_n_s32(0);
+    for (int lane = 0; lane < 4; ++lane) {
+        const int32x4_t activation_lo = vreinterpretq_s32_u32(
+            vmovl_u16(vget_low_u16(activation_lanes.val[lane])));
+        const int32x4_t activation_hi = vreinterpretq_s32_u32(
+            vmovl_u16(vget_high_u16(activation_lanes.val[lane])));
+        const int8x8_t code_as_int4 = vreinterpret_s8_u8(code_lanes[lane]);
+        const int16x8_t weight_i16 = vmovl_s8(code_as_int4);
+        const int32x4_t weight_lo = vmovl_s16(vget_low_s16(weight_i16));
+        const int32x4_t weight_hi = vmovl_s16(vget_high_s16(weight_i16));
+        accumulator_lo = vmlaq_s32(
+            accumulator_lo,
+            vsubq_s32(activation_lo, activation_zero),
+            vsubq_s32(weight_lo, weight_zero));
+        accumulator_hi = vmlaq_s32(
+            accumulator_hi,
+            vsubq_s32(activation_hi, activation_zero),
+            vsubq_s32(weight_hi, weight_zero));
+    }
+    return
+        (int64_t) ggml_gptq2_32_hsum_s32(accumulator_lo) +
+        ggml_gptq2_32_hsum_s32(accumulator_hi);
+}
+
+static __attribute__((noinline)) void ggml_gptq2_32_dot_u16_neon_4rows_wide(
+        const uint16_t * GGML_RESTRICT activations,
+        int32_t activation_zero_point,
+        const uint8_t * packed_codes0,
+        const uint8_t * packed_codes1,
+        const uint8_t * packed_codes2,
+        const uint8_t * packed_codes3,
+        int32_t weight_zero_point0,
+        int32_t weight_zero_point1,
+        int32_t weight_zero_point2,
+        int32_t weight_zero_point3,
+        int64_t * dot0,
+        int64_t * dot1,
+        int64_t * dot2,
+        int64_t * dot3) {
+    *dot0 = ggml_gptq2_32_dot_u16_neon(
+        activations, activation_zero_point, packed_codes0, weight_zero_point0);
+    *dot1 = ggml_gptq2_32_dot_u16_neon(
+        activations, activation_zero_point, packed_codes1, weight_zero_point1);
+    *dot2 = ggml_gptq2_32_dot_u16_neon(
+        activations, activation_zero_point, packed_codes2, weight_zero_point2);
+    *dot3 = ggml_gptq2_32_dot_u16_neon(
+        activations, activation_zero_point, packed_codes3, weight_zero_point3);
+}
+
+static inline void ggml_gptq2_32_dot_u16_neon_4rows(
+        const uint16_t * GGML_RESTRICT activations,
+        int32_t activation_zero_point,
+        const uint8_t * packed_codes0,
+        const uint8_t * packed_codes1,
+        const uint8_t * packed_codes2,
+        const uint8_t * packed_codes3,
+        int32_t weight_zero_point0,
+        int32_t weight_zero_point1,
+        int32_t weight_zero_point2,
+        int32_t weight_zero_point3,
+        int64_t * dot0,
+        int64_t * dot1,
+        int64_t * dot2,
+        int64_t * dot3) {
+    const uint16x8x4_t activation_lanes = vld4q_u16(activations);
+#if defined(__aarch64__)
+    const uint16x8_t activation_min = vminq_u16(
+        vminq_u16(activation_lanes.val[0], activation_lanes.val[1]),
+        vminq_u16(activation_lanes.val[2], activation_lanes.val[3]));
+    const uint16x8_t activation_max = vmaxq_u16(
+        vmaxq_u16(activation_lanes.val[0], activation_lanes.val[1]),
+        vmaxq_u16(activation_lanes.val[2], activation_lanes.val[3]));
+    const uint16_t lower = activation_zero_point > 32768
+        ? (uint16_t) (activation_zero_point - 32768)
+        : 0;
+    const uint16_t upper = activation_zero_point < 32768
+        ? (uint16_t) (activation_zero_point + 32767)
+        : UINT16_MAX;
+    if (vminvq_u16(activation_min) >= lower &&
+        vmaxvq_u16(activation_max) <= upper) {
+        const uint16x8_t activation_zero_u16 =
+            vdupq_n_u16((uint16_t) activation_zero_point);
+        const uint8x8_t mask = vdup_n_u8(0x3);
+        const uint8x8_t packed0 = vld1_u8(packed_codes0);
+        const uint8x8_t packed1 = vld1_u8(packed_codes1);
+        const uint8x8_t packed2 = vld1_u8(packed_codes2);
+        const uint8x8_t packed3 = vld1_u8(packed_codes3);
+        const int16x8_t weight_zero0 = vdupq_n_s16((int16_t) weight_zero_point0);
+        const int16x8_t weight_zero1 = vdupq_n_s16((int16_t) weight_zero_point1);
+        const int16x8_t weight_zero2 = vdupq_n_s16((int16_t) weight_zero_point2);
+        const int16x8_t weight_zero3 = vdupq_n_s16((int16_t) weight_zero_point3);
+        int32x4_t accumulator0_lo = vdupq_n_s32(0);
+        int32x4_t accumulator0_hi = vdupq_n_s32(0);
+        int32x4_t accumulator1_lo = vdupq_n_s32(0);
+        int32x4_t accumulator1_hi = vdupq_n_s32(0);
+        int32x4_t accumulator2_lo = vdupq_n_s32(0);
+        int32x4_t accumulator2_hi = vdupq_n_s32(0);
+        int32x4_t accumulator3_lo = vdupq_n_s32(0);
+        int32x4_t accumulator3_hi = vdupq_n_s32(0);
+#define GGML_GPTQ2_ACCUMULATE_4ROWS(ACTIVATION, CODES0, CODES1, CODES2, CODES3) do { \
+            const int16x8_t activation_i16 = vreinterpretq_s16_u16( \
+                vsubq_u16((ACTIVATION), activation_zero_u16)); \
+            const int16x8_t weight0 = vsubq_s16( \
+                vmovl_s8(vreinterpret_s8_u8((CODES0))), weight_zero0); \
+            const int16x8_t weight1 = vsubq_s16( \
+                vmovl_s8(vreinterpret_s8_u8((CODES1))), weight_zero1); \
+            const int16x8_t weight2 = vsubq_s16( \
+                vmovl_s8(vreinterpret_s8_u8((CODES2))), weight_zero2); \
+            const int16x8_t weight3 = vsubq_s16( \
+                vmovl_s8(vreinterpret_s8_u8((CODES3))), weight_zero3); \
+            accumulator0_lo = vmlal_s16(accumulator0_lo, \
+                vget_low_s16(activation_i16), vget_low_s16(weight0)); \
+            accumulator0_hi = vmlal_s16(accumulator0_hi, \
+                vget_high_s16(activation_i16), vget_high_s16(weight0)); \
+            accumulator1_lo = vmlal_s16(accumulator1_lo, \
+                vget_low_s16(activation_i16), vget_low_s16(weight1)); \
+            accumulator1_hi = vmlal_s16(accumulator1_hi, \
+                vget_high_s16(activation_i16), vget_high_s16(weight1)); \
+            accumulator2_lo = vmlal_s16(accumulator2_lo, \
+                vget_low_s16(activation_i16), vget_low_s16(weight2)); \
+            accumulator2_hi = vmlal_s16(accumulator2_hi, \
+                vget_high_s16(activation_i16), vget_high_s16(weight2)); \
+            accumulator3_lo = vmlal_s16(accumulator3_lo, \
+                vget_low_s16(activation_i16), vget_low_s16(weight3)); \
+            accumulator3_hi = vmlal_s16(accumulator3_hi, \
+                vget_high_s16(activation_i16), vget_high_s16(weight3)); \
+        } while (0)
+        GGML_GPTQ2_ACCUMULATE_4ROWS(
+            activation_lanes.val[0],
+            vand_u8(packed0, mask), vand_u8(packed1, mask),
+            vand_u8(packed2, mask), vand_u8(packed3, mask));
+        GGML_GPTQ2_ACCUMULATE_4ROWS(
+            activation_lanes.val[1],
+            vand_u8(vshr_n_u8(packed0, 2), mask),
+            vand_u8(vshr_n_u8(packed1, 2), mask),
+            vand_u8(vshr_n_u8(packed2, 2), mask),
+            vand_u8(vshr_n_u8(packed3, 2), mask));
+        GGML_GPTQ2_ACCUMULATE_4ROWS(
+            activation_lanes.val[2],
+            vand_u8(vshr_n_u8(packed0, 4), mask),
+            vand_u8(vshr_n_u8(packed1, 4), mask),
+            vand_u8(vshr_n_u8(packed2, 4), mask),
+            vand_u8(vshr_n_u8(packed3, 4), mask));
+        GGML_GPTQ2_ACCUMULATE_4ROWS(
+            activation_lanes.val[3],
+            vand_u8(vshr_n_u8(packed0, 6), mask),
+            vand_u8(vshr_n_u8(packed1, 6), mask),
+            vand_u8(vshr_n_u8(packed2, 6), mask),
+            vand_u8(vshr_n_u8(packed3, 6), mask));
+#undef GGML_GPTQ2_ACCUMULATE_4ROWS
+        *dot0 = (int64_t) ggml_gptq2_32_hsum_s32(accumulator0_lo) +
+            ggml_gptq2_32_hsum_s32(accumulator0_hi);
+        *dot1 = (int64_t) ggml_gptq2_32_hsum_s32(accumulator1_lo) +
+            ggml_gptq2_32_hsum_s32(accumulator1_hi);
+        *dot2 = (int64_t) ggml_gptq2_32_hsum_s32(accumulator2_lo) +
+            ggml_gptq2_32_hsum_s32(accumulator2_hi);
+        *dot3 = (int64_t) ggml_gptq2_32_hsum_s32(accumulator3_lo) +
+            ggml_gptq2_32_hsum_s32(accumulator3_hi);
+        return;
+    }
+#endif
+    ggml_gptq2_32_dot_u16_neon_4rows_wide(
+        activations, activation_zero_point,
+        packed_codes0, packed_codes1, packed_codes2, packed_codes3,
+        weight_zero_point0, weight_zero_point1,
+        weight_zero_point2, weight_zero_point3,
+        dot0, dot1, dot2, dot3);
+}
+#endif
+
+static void ggml_vec_dot_gptq2_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        float activation_scale,
+        int32_t activation_zero_point,
+        float output_scale,
+        int32_t output_zero_point,
+        int group_size) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(activation_scale > 0.0f);
+    GGML_ASSERT(output_scale > 0.0f);
+
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int code_bytes = group_size / 4;
+    const int block_bytes = code_bytes + 4;
+    const int groups = n / group_size;
+    const int requant_shift = 20;
+    int64_t scaled_accumulator = 0;
+
+    for (int group_index = 0; group_index < groups; ++group_index) {
+        const uint8_t * block = weights + group_index * block_bytes;
+        const float raw_scale = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) (block + code_bytes));
+        const float zero_bias = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) (block + code_bytes + 2));
+        const float weight_scale = fmaxf(raw_scale, 1.0e-4f);
+        int32_t weight_zero_point = (int32_t) lroundf(zero_bias / weight_scale);
+        weight_zero_point = MAX(0, MIN(3, weight_zero_point));
+        const double ratio = (double) activation_scale * (double) weight_scale / (double) output_scale;
+        const int64_t multiplier = (int64_t) llround(ldexp(ratio, requant_shift));
+        int64_t group_dot = 0;
+        for (int chunk = 0; chunk < group_size / 32; ++chunk) {
+            const uint16_t * chunk_activations =
+                activations + group_index * group_size + chunk * 32;
+            const uint8_t * chunk_codes = block + chunk * 8;
+#if defined(__ARM_NEON)
+            group_dot += ggml_gptq2_32_dot_u16_neon(
+                chunk_activations, activation_zero_point, chunk_codes, weight_zero_point);
+#else
+            group_dot += ggml_gptq2_32_dot_u16_scalar(
+                chunk_activations, activation_zero_point, chunk_codes, weight_zero_point);
+#endif
+        }
+        scaled_accumulator += group_dot * multiplier;
+    }
+
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        scaled_accumulator,
+        requant_shift) + output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_dot_gptq2_32_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        float activation_scale,
+        int32_t activation_zero_point,
+        float output_scale,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn(
+        n, output, packed_weights, activations, activation_scale,
+        activation_zero_point, output_scale, output_zero_point, 32);
+}
+
+void ggml_vec_dot_gptq2_64_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        float activation_scale,
+        int32_t activation_zero_point,
+        float output_scale,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn(
+        n, output, packed_weights, activations, activation_scale,
+        activation_zero_point, output_scale, output_zero_point, 64);
+}
+
+void ggml_vec_dot_gptq2_128_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        float activation_scale,
+        int32_t activation_zero_point,
+        float output_scale,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn(
+        n, output, packed_weights, activations, activation_scale,
+        activation_zero_point, output_scale, output_zero_point, 128);
+}
+
+#define GGML_U16_Q20_SHIFT 20
+#define GGML_U16_MIN_WEIGHT_SCALE_Q20 105
+
+static inline int64_t ggml_gptq2_32_fp16_to_q20(ggml_fp16_t value) {
+    uint16_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    const int sign = (bits >> 15) & 1;
+    const int exponent = (bits >> 10) & 0x1f;
+    const uint64_t mantissa = bits & 0x03ff;
+    uint64_t magnitude;
+    if (exponent == 0) {
+        magnitude = (mantissa + 8) >> 4;
+    } else if (exponent == 31) {
+        magnitude = INT64_MAX;
+    } else {
+        const uint64_t significand = 1024 + mantissa;
+        const int shift = exponent - 5;
+        if (shift >= 0) {
+            magnitude = significand > ((uint64_t) INT64_MAX >> shift) ? INT64_MAX : significand << shift;
+        } else {
+            const int right_shift = -shift;
+            magnitude = (significand + ((uint64_t) 1 << (right_shift - 1))) >> right_shift;
+        }
+    }
+    if (!sign) return (int64_t) magnitude;
+    return magnitude >= (uint64_t) INT64_MAX ? INT64_MIN : -(int64_t) magnitude;
+}
+
+static inline int32_t ggml_gptq2_source_zero_point_q20(
+        int64_t source_scale_q20,
+        int64_t zero_bias_q20) {
+    GGML_ASSERT(source_scale_q20 > 0);
+    if (zero_bias_q20 <= 0) {
+        return 0;
+    }
+    const int64_t rounded_numerator = zero_bias_q20 + source_scale_q20 / 2;
+    if (rounded_numerator < source_scale_q20) {
+        return 0;
+    }
+    if (rounded_numerator < 2 * source_scale_q20) {
+        return 1;
+    }
+    if (rounded_numerator < 3 * source_scale_q20) {
+        return 2;
+    }
+    return 3;
+}
+
+static void ggml_vec_dot_gptq2_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        int64_t activation_to_output_q20,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(activation_to_output_q20 > 0);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int code_bytes = group_size / 4;
+    const int block_bytes = code_bytes + 4;
+    int64_t scaled_accumulator = 0;
+    for (int group_index = 0; group_index < n / group_size; ++group_index) {
+        const uint8_t * block = weights + group_index * block_bytes;
+        ggml_fp16_t raw_scale_fp16;
+        ggml_fp16_t zero_bias_fp16;
+        memcpy(&raw_scale_fp16, block + code_bytes, sizeof(raw_scale_fp16));
+        memcpy(&zero_bias_fp16, block + code_bytes + 2, sizeof(zero_bias_fp16));
+        int64_t weight_scale_q20 = ggml_gptq2_32_fp16_to_q20(raw_scale_fp16);
+        weight_scale_q20 = MAX(weight_scale_q20, GGML_U16_MIN_WEIGHT_SCALE_Q20);
+        const int64_t zero_bias_q20 = ggml_gptq2_32_fp16_to_q20(zero_bias_fp16);
+        const int32_t weight_zero_point =
+            ggml_gptq2_source_zero_point_q20(weight_scale_q20, zero_bias_q20);
+        const int64_t multiplier = ggml_gptq2_32_round_shift_away_from_zero(
+            activation_to_output_q20 * weight_scale_q20, GGML_U16_Q20_SHIFT);
+        int64_t group_dot = 0;
+        for (int chunk = 0; chunk < group_size / 32; ++chunk) {
+            const uint16_t * chunk_activations =
+                activations + group_index * group_size + chunk * 32;
+            const uint8_t * chunk_codes = block + chunk * 8;
+#if defined(__ARM_NEON)
+            group_dot += ggml_gptq2_32_dot_u16_neon(
+                chunk_activations, activation_zero_point, chunk_codes, weight_zero_point);
+#else
+            group_dot += ggml_gptq2_32_dot_u16_scalar(
+                chunk_activations, activation_zero_point, chunk_codes, weight_zero_point);
+#endif
+        }
+        scaled_accumulator += group_dot * multiplier;
+    }
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        scaled_accumulator, GGML_U16_Q20_SHIFT) + output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_dot_gptq2_32_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        int64_t activation_to_output_q20,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_fixed(
+        n, output, packed_weights, activations, activation_to_output_q20,
+        activation_zero_point, output_zero_point, 32);
+}
+
+void ggml_vec_dot_gptq2_64_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        int64_t activation_to_output_q20,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_fixed(
+        n, output, packed_weights, activations, activation_to_output_q20,
+        activation_zero_point, output_zero_point, 64);
+}
+
+void ggml_vec_dot_gptq2_128_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        int64_t activation_to_output_q20,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_fixed(
+        n, output, packed_weights, activations, activation_to_output_q20,
+        activation_zero_point, output_zero_point, 128);
+}
+
+static void ggml_vec_dot_gptq2_u16_qnn_blockwise_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(block_scale_codes != NULL && channel_scale_to_output_q31 > 0);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int code_bytes = group_size / 4;
+    const int source_block_bytes = code_bytes + 4;
+    const int chunks_per_source_group = group_size / 32;
+    const int qnn_blocks = n / 32;
+    int64_t scaled_accumulator = 0;
+    int fractional_bits = 31;
+    int intermediate_shift = 0;
+    if (fractional_constant > 0) {
+        const int multiplier_exponent =
+            63 - __builtin_clzll((unsigned long long) channel_scale_to_output_q31);
+        fractional_bits = MAX(1, MIN(20, fractional_constant - multiplier_exponent));
+        intermediate_shift = 31 - fractional_bits;
+    }
+
+    for (int qnn_block = 0; qnn_block < qnn_blocks; ++qnn_block) {
+        const int source_group = qnn_block / chunks_per_source_group;
+        const int chunk = qnn_block % chunks_per_source_group;
+        const uint8_t * block = weights + source_group * source_block_bytes;
+        ggml_fp16_t raw_scale_fp16;
+        ggml_fp16_t zero_bias_fp16;
+        memcpy(&raw_scale_fp16, block + code_bytes, sizeof(raw_scale_fp16));
+        memcpy(&zero_bias_fp16, block + code_bytes + 2, sizeof(zero_bias_fp16));
+        int64_t source_scale_q20 = ggml_gptq2_32_fp16_to_q20(raw_scale_fp16);
+        source_scale_q20 = MAX(source_scale_q20, GGML_U16_MIN_WEIGHT_SCALE_Q20);
+        const int64_t zero_bias_q20 = ggml_gptq2_32_fp16_to_q20(zero_bias_fp16);
+        const int32_t weight_zero_point =
+            ggml_gptq2_source_zero_point_q20(source_scale_q20, zero_bias_q20);
+        const uint8_t * chunk_codes = block + chunk * 8;
+        const uint16_t * chunk_activations = activations + qnn_block * 32;
+#if defined(__ARM_NEON)
+        const int64_t dot = ggml_gptq2_32_dot_u16_neon(
+            chunk_activations, activation_zero_point, chunk_codes,
+            weight_zero_point);
+#else
+        const int64_t dot = ggml_gptq2_32_dot_u16_scalar(
+            chunk_activations, activation_zero_point, chunk_codes,
+            (int32_t) weight_zero_point);
+#endif
+        const int64_t multiplier =
+            channel_scale_to_output_q31 * block_scale_codes[qnn_block];
+        GGML_ASSERT(multiplier >= 0 &&
+            (dot == 0 || llabs(dot) <= INT64_MAX / MAX(INT64_C(1), multiplier)));
+        const int64_t block_accumulator = dot * multiplier;
+        scaled_accumulator += fractional_constant > 0
+            ? ggml_u16_floor_shift(block_accumulator, intermediate_shift)
+            : block_accumulator;
+    }
+    GGML_ASSERT(output_bias_q7 == 0 || !final_round_to_nearest);
+    const int64_t shifted = final_round_to_nearest
+        ? ggml_u16_htp_round_shift(scaled_accumulator, fractional_bits)
+        : ggml_u16_floor_shift_with_q7_bias(
+            scaled_accumulator, fractional_bits, output_bias_q7);
+    const int64_t quantized = shifted + output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_fixed(
+        n, output, packed_weights, activations, block_scale_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 32, 0, 0, 0);
+}
+
+void ggml_vec_dot_gptq2_64_u16_qnn_blockwise_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_fixed(
+        n, output, packed_weights, activations, block_scale_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 64, 0, 0, 0);
+}
+
+void ggml_vec_dot_gptq2_128_u16_qnn_blockwise_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_fixed(
+        n, output, packed_weights, activations, block_scale_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 128, 0, 0, 0);
+}
+
+void ggml_gptq2_prepare_qnn_block_codes(
+        int n,
+        uint8_t * prepared_block_codes,
+        const void * GGML_RESTRICT packed_weights,
+        const uint8_t * block_scale_codes,
+        int group_size) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(prepared_block_codes != NULL);
+    GGML_ASSERT(packed_weights != NULL);
+    GGML_ASSERT(block_scale_codes != NULL);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int source_code_bytes = group_size / 4;
+    const int source_block_bytes = source_code_bytes + 4;
+    const int qnn_blocks_per_source_group = group_size / 32;
+    for (int source_group = 0; source_group < n / group_size; ++source_group) {
+        const uint8_t * block = weights + source_group * source_block_bytes;
+        ggml_fp16_t raw_scale_fp16;
+        ggml_fp16_t zero_bias_fp16;
+        memcpy(&raw_scale_fp16, block + source_code_bytes, sizeof(raw_scale_fp16));
+        memcpy(
+            &zero_bias_fp16,
+            block + source_code_bytes + sizeof(raw_scale_fp16),
+            sizeof(zero_bias_fp16));
+        int64_t source_scale_q20 = ggml_gptq2_32_fp16_to_q20(raw_scale_fp16);
+        source_scale_q20 = MAX(source_scale_q20, GGML_U16_MIN_WEIGHT_SCALE_Q20);
+        const int64_t zero_bias_q20 =
+            ggml_gptq2_32_fp16_to_q20(zero_bias_fp16);
+        const int32_t weight_zero_point =
+            ggml_gptq2_source_zero_point_q20(source_scale_q20, zero_bias_q20);
+        for (int chunk = 0; chunk < qnn_blocks_per_source_group; ++chunk) {
+            const int block_index =
+                source_group * qnn_blocks_per_source_group + chunk;
+            prepared_block_codes[block_index] =
+                (block_scale_codes[block_index] & 0x1f) |
+                (uint8_t) (weight_zero_point << 5);
+        }
+    }
+}
+
+static void ggml_vec_dot_gptq2_u16_qnn_blockwise_prepared(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(prepared_block_codes != NULL && channel_scale_to_output_q31 > 0);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int source_code_bytes = group_size / 4;
+    const int source_block_bytes = source_code_bytes + 4;
+    const int qnn_blocks_per_source_group = group_size / 32;
+    int64_t scaled_accumulator = 0;
+    int fractional_bits = 31;
+    int intermediate_shift = 0;
+    if (fractional_constant > 0) {
+        const int multiplier_exponent =
+            63 - __builtin_clzll((unsigned long long) channel_scale_to_output_q31);
+        fractional_bits = MAX(1, MIN(20, fractional_constant - multiplier_exponent));
+        intermediate_shift = 31 - fractional_bits;
+    }
+
+    for (int block_index = 0; block_index < n / 32; ++block_index) {
+        const uint8_t prepared = prepared_block_codes[block_index];
+        const int32_t weight_zero_point = (prepared >> 5) & 0x3;
+        const int source_group = block_index / qnn_blocks_per_source_group;
+        const int chunk = block_index % qnn_blocks_per_source_group;
+#if defined(__ARM_NEON)
+        const int64_t dot = ggml_gptq2_32_dot_u16_neon(
+            activations + block_index * 32,
+            activation_zero_point,
+            weights + source_group * source_block_bytes + chunk * 8,
+            weight_zero_point);
+#else
+        const int64_t dot = ggml_gptq2_32_dot_u16_scalar(
+            activations + block_index * 32,
+            activation_zero_point,
+            weights + source_group * source_block_bytes + chunk * 8,
+            weight_zero_point);
+#endif
+        const int64_t multiplier =
+            channel_scale_to_output_q31 * (prepared & 0x1f);
+        GGML_ASSERT(multiplier >= 0 &&
+            (dot == 0 || llabs(dot) <= INT64_MAX / MAX(INT64_C(1), multiplier)));
+        const int64_t block_accumulator = dot * multiplier;
+        scaled_accumulator += fractional_constant > 0
+            ? ggml_u16_floor_shift(block_accumulator, intermediate_shift)
+            : block_accumulator;
+    }
+
+    GGML_ASSERT(output_bias_q7 == 0 || !final_round_to_nearest);
+    const int64_t shifted = final_round_to_nearest
+        ? ggml_u16_htp_round_shift(scaled_accumulator, fractional_bits)
+        : ggml_u16_floor_shift_with_q7_bias(
+            scaled_accumulator, fractional_bits, output_bias_q7);
+    const int64_t quantized = shifted + output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static void ggml_vec_dot_gptq2_u16_qnn_blockwise_affine_prepared(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(prepared_block_codes != NULL && channel_scale_to_output_q31 > 0);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int source_code_bytes = group_size / 4;
+    const int source_block_bytes = source_code_bytes + 4;
+    const int qnn_blocks_per_source_group = group_size / 32;
+    int64_t centered_dot = 0;
+    int64_t expanded_weight_sum = 0;
+
+    for (int block_index = 0; block_index < n / 32; ++block_index) {
+        const uint8_t prepared = prepared_block_codes[block_index];
+        const int32_t weight_zero_point = (prepared >> 5) & 0x3;
+        const int32_t block_scale_code = prepared & 0x1f;
+        const int source_group = block_index / qnn_blocks_per_source_group;
+        const int chunk = block_index % qnn_blocks_per_source_group;
+        const uint8_t * packed_codes =
+            weights + source_group * source_block_bytes + chunk * 8;
+#if defined(__ARM_NEON)
+        const int64_t block_dot = ggml_gptq2_32_dot_u16_neon(
+            activations + block_index * 32,
+            activation_zero_point,
+            packed_codes,
+            weight_zero_point);
+#else
+        const int64_t block_dot = ggml_gptq2_32_dot_u16_scalar(
+            activations + block_index * 32,
+            activation_zero_point,
+            packed_codes,
+            weight_zero_point);
+#endif
+        centered_dot += block_dot * block_scale_code;
+        expanded_weight_sum +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                packed_codes, weight_zero_point) *
+            block_scale_code;
+    }
+
+    const int64_t reduced_dot = ggml_qnn_a16s8_reduce_accumulator(
+        centered_dot, expanded_weight_sum, activation_zero_point);
+    const int64_t quantized =
+        ggml_u16_htp_round_shift(
+            reduced_dot * channel_scale_to_output_q31, 31) +
+        output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static void ggml_vec_dot_gptq2_u16_qnn_blockwise_affine_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size) {
+    GGML_ASSERT(group_size >= 32 && group_size % 32 == 0);
+    GGML_ASSERT(n > 0 && n % group_size == 0);
+    GGML_ASSERT(block_scale_codes != NULL && channel_scale_to_output_q31 > 0);
+    const uint8_t * GGML_RESTRICT weights = packed_weights;
+    const int source_code_bytes = group_size / 4;
+    const int source_block_bytes = source_code_bytes + 4;
+    const int qnn_blocks_per_source_group = group_size / 32;
+    int64_t centered_dot = 0;
+    int64_t expanded_weight_sum = 0;
+
+    for (int block_index = 0; block_index < n / 32; ++block_index) {
+        const int source_group = block_index / qnn_blocks_per_source_group;
+        const int chunk = block_index % qnn_blocks_per_source_group;
+        const uint8_t * block = weights + source_group * source_block_bytes;
+        ggml_fp16_t raw_scale_fp16;
+        ggml_fp16_t zero_bias_fp16;
+        memcpy(&raw_scale_fp16, block + source_code_bytes, sizeof(raw_scale_fp16));
+        memcpy(
+            &zero_bias_fp16,
+            block + source_code_bytes + sizeof(raw_scale_fp16),
+            sizeof(zero_bias_fp16));
+        int64_t source_scale_q20 = ggml_gptq2_32_fp16_to_q20(raw_scale_fp16);
+        source_scale_q20 = MAX(source_scale_q20, GGML_U16_MIN_WEIGHT_SCALE_Q20);
+        const int64_t zero_bias_q20 =
+            ggml_gptq2_32_fp16_to_q20(zero_bias_fp16);
+        const int32_t weight_zero_point =
+            ggml_gptq2_source_zero_point_q20(source_scale_q20, zero_bias_q20);
+        const int32_t block_scale_code = block_scale_codes[block_index];
+        const uint8_t * packed_codes = block + chunk * 8;
+#if defined(__ARM_NEON)
+        const int64_t block_dot = ggml_gptq2_32_dot_u16_neon(
+            activations + block_index * 32,
+            activation_zero_point,
+            packed_codes,
+            weight_zero_point);
+#else
+        const int64_t block_dot = ggml_gptq2_32_dot_u16_scalar(
+            activations + block_index * 32,
+            activation_zero_point,
+            packed_codes,
+            weight_zero_point);
+#endif
+        centered_dot += block_dot * block_scale_code;
+        expanded_weight_sum +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                packed_codes, weight_zero_point) *
+            block_scale_code;
+    }
+
+    const int64_t reduced_dot = ggml_qnn_a16s8_reduce_accumulator(
+        centered_dot, expanded_weight_sum, activation_zero_point);
+    const int64_t quantized =
+        ggml_u16_htp_round_shift(
+            reduced_dot * channel_scale_to_output_q31, 31) +
+        output_zero_point;
+    *output = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_prepared(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_prepared(
+        n, output, packed_weights, activations, prepared_block_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 32, 0, 0, 0);
+}
+
+void ggml_vec_dot_gptq2_64_u16_qnn_blockwise_prepared(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_prepared(
+        n, output, packed_weights, activations, prepared_block_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 64, 0, 0, 0);
+}
+
+void ggml_vec_dot_gptq2_128_u16_qnn_blockwise_prepared(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    ggml_vec_dot_gptq2_u16_qnn_blockwise_prepared(
+        n, output, packed_weights, activations, prepared_block_codes,
+        channel_scale_to_output_q31, activation_zero_point, output_zero_point, 128, 0, 0, 0);
+}
+
+void ggml_vec_dot_gptq2_u16_qnn_blockwise_requant(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size,
+        int metadata_prepared,
+        int fractional_constant) {
+    GGML_ASSERT(fractional_constant > 0);
+    if (metadata_prepared) {
+        ggml_vec_dot_gptq2_u16_qnn_blockwise_prepared(
+            n, output, packed_weights, activations, block_scale_codes,
+            channel_scale_to_output_q31, activation_zero_point, output_zero_point,
+            group_size, fractional_constant, 0, 0);
+    } else {
+        ggml_vec_dot_gptq2_u16_qnn_blockwise_fixed(
+            n, output, packed_weights, activations, block_scale_codes,
+            channel_scale_to_output_q31, activation_zero_point, output_zero_point,
+            group_size, fractional_constant, 0, 0);
+    }
+}
+
+void ggml_vec_dot_gptq2_u16_qnn_blockwise_affine(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const void * GGML_RESTRICT packed_weights,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT block_scale_codes,
+        int64_t channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int group_size,
+        int metadata_prepared,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7) {
+    GGML_ASSERT(fractional_constant >= 0);
+    (void) fractional_constant;
+    (void) final_round_to_nearest;
+    (void) output_bias_q7;
+    if (metadata_prepared) {
+        ggml_vec_dot_gptq2_u16_qnn_blockwise_affine_prepared(
+            n, output, packed_weights, activations, block_scale_codes,
+            channel_scale_to_output_q31, activation_zero_point, output_zero_point,
+            group_size);
+    } else {
+        ggml_vec_dot_gptq2_u16_qnn_blockwise_affine_fixed(
+            n, output, packed_weights, activations, block_scale_codes,
+            channel_scale_to_output_q31, activation_zero_point, output_zero_point,
+            group_size);
+    }
+}
+
+void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_4rows(
+        int n,
+        uint16_t * GGML_RESTRICT outputs,
+        const void * GGML_RESTRICT packed_weights,
+        size_t weight_row_stride,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        size_t prepared_row_stride,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7) {
+    GGML_ASSERT(n > 0 && n % 32 == 0);
+    GGML_ASSERT(outputs != NULL && packed_weights != NULL);
+    GGML_ASSERT(activations != NULL && prepared_block_codes != NULL);
+    GGML_ASSERT(channel_scale_to_output_q31 != NULL);
+
+    const uint8_t * const weights = packed_weights;
+    const int blocks = n / 32;
+    (void) fractional_constant;
+    (void) final_round_to_nearest;
+    (void) output_bias_q7;
+    int64_t centered_dots[4] = { 0, 0, 0, 0 };
+    int64_t expanded_weight_sums[4] = { 0, 0, 0, 0 };
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t prepared0 = prepared_block_codes[block];
+        const uint8_t prepared1 = prepared_block_codes[prepared_row_stride + block];
+        const uint8_t prepared2 = prepared_block_codes[2 * prepared_row_stride + block];
+        const uint8_t prepared3 = prepared_block_codes[3 * prepared_row_stride + block];
+        const uint8_t * codes0 = weights + block * 12;
+        const uint8_t * codes1 = weights + weight_row_stride + block * 12;
+        const uint8_t * codes2 = weights + 2 * weight_row_stride + block * 12;
+        const uint8_t * codes3 = weights + 3 * weight_row_stride + block * 12;
+        int64_t dot0;
+        int64_t dot1;
+        int64_t dot2;
+        int64_t dot3;
+#if defined(__ARM_NEON)
+        ggml_gptq2_32_dot_u16_neon_4rows(
+            activations + block * 32, activation_zero_point,
+            codes0, codes1, codes2, codes3,
+            (prepared0 >> 5) & 0x3, (prepared1 >> 5) & 0x3,
+            (prepared2 >> 5) & 0x3, (prepared3 >> 5) & 0x3,
+            &dot0, &dot1, &dot2, &dot3);
+#else
+        dot0 = ggml_gptq2_32_dot_u16_scalar(
+            activations + block * 32, activation_zero_point,
+            codes0, (prepared0 >> 5) & 0x3);
+        dot1 = ggml_gptq2_32_dot_u16_scalar(
+            activations + block * 32, activation_zero_point,
+            codes1, (prepared1 >> 5) & 0x3);
+        dot2 = ggml_gptq2_32_dot_u16_scalar(
+            activations + block * 32, activation_zero_point,
+            codes2, (prepared2 >> 5) & 0x3);
+        dot3 = ggml_gptq2_32_dot_u16_scalar(
+            activations + block * 32, activation_zero_point,
+            codes3, (prepared3 >> 5) & 0x3);
+#endif
+        const int32_t block_scale0 = prepared0 & 0x1f;
+        const int32_t block_scale1 = prepared1 & 0x1f;
+        const int32_t block_scale2 = prepared2 & 0x1f;
+        const int32_t block_scale3 = prepared3 & 0x1f;
+        centered_dots[0] += dot0 * block_scale0;
+        centered_dots[1] += dot1 * block_scale1;
+        centered_dots[2] += dot2 * block_scale2;
+        centered_dots[3] += dot3 * block_scale3;
+        expanded_weight_sums[0] +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                codes0, (prepared0 >> 5) & 0x3) * block_scale0;
+        expanded_weight_sums[1] +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                codes1, (prepared1 >> 5) & 0x3) * block_scale1;
+        expanded_weight_sums[2] +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                codes2, (prepared2 >> 5) & 0x3) * block_scale2;
+        expanded_weight_sums[3] +=
+            (int64_t) ggml_gptq2_32_weight_sum_scalar(
+                codes3, (prepared3 >> 5) & 0x3) * block_scale3;
+    }
+
+    for (int row = 0; row < 4; ++row) {
+        const int64_t reduced_dot = ggml_qnn_a16s8_reduce_accumulator(
+            centered_dots[row],
+            expanded_weight_sums[row],
+            activation_zero_point);
+        const int64_t shifted = ggml_u16_htp_round_shift(
+            reduced_dot * channel_scale_to_output_q31[row], 31);
+        outputs[row] = (uint16_t) MAX(
+            0, MIN(UINT16_MAX, shifted + output_zero_point));
+    }
+}
+
+void ggml_vec_add_affine_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        float lhs_scale,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        float rhs_scale,
+        int32_t rhs_zero_point,
+        float output_scale,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    GGML_ASSERT(lhs_scale > 0.0f);
+    GGML_ASSERT(rhs_scale > 0.0f);
+    GGML_ASSERT(output_scale > 0.0f);
+
+    const int requant_shift = 20;
+    const int64_t lhs_multiplier = (int64_t) llround(ldexp(
+        (double) lhs_scale / (double) output_scale, requant_shift));
+    const int64_t rhs_multiplier = (int64_t) llround(ldexp(
+        (double) rhs_scale / (double) output_scale, requant_shift));
+    ggml_vec_add_affine_u16_qnn_fixed(
+        n, output, lhs, lhs_multiplier, lhs_zero_point,
+        rhs, rhs_multiplier, rhs_zero_point, output_zero_point);
+}
+
+void ggml_vec_add_affine_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int64_t lhs_multiplier,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int64_t rhs_multiplier,
+        int32_t rhs_zero_point,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    const int requant_shift = GGML_U16_Q20_SHIFT;
+    int index = 0;
+
+#if defined(__ARM_NEON)
+    if (lhs_multiplier >= INT32_MIN && lhs_multiplier <= INT32_MAX &&
+        rhs_multiplier >= INT32_MIN && rhs_multiplier <= INT32_MAX) {
+        const int32x4_t lhs_zero = vdupq_n_s32(lhs_zero_point);
+        const int32x4_t rhs_zero = vdupq_n_s32(rhs_zero_point);
+        const int32x2_t lhs_mul = vdup_n_s32((int32_t) lhs_multiplier);
+        const int32x2_t rhs_mul = vdup_n_s32((int32_t) rhs_multiplier);
+
+        for (; index + 4 <= n; index += 4) {
+            const int32x4_t lhs_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(lhs + index))), lhs_zero);
+            const int32x4_t rhs_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(rhs + index))), rhs_zero);
+            const int64x2_t sum_lo = vaddq_s64(
+                vmull_s32(vget_low_s32(lhs_values), lhs_mul),
+                vmull_s32(vget_low_s32(rhs_values), rhs_mul));
+            const int64x2_t sum_hi = vaddq_s64(
+                vmull_s32(vget_high_s32(lhs_values), lhs_mul),
+                vmull_s32(vget_high_s32(rhs_values), rhs_mul));
+            const int64_t sum0 = vgetq_lane_s64(sum_lo, 0);
+            const int64_t sum1 = vgetq_lane_s64(sum_lo, 1);
+            const int64_t sum2 = vgetq_lane_s64(sum_hi, 0);
+            const int64_t sum3 = vgetq_lane_s64(sum_hi, 1);
+            output[index + 0] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(sum0, requant_shift) + output_zero_point));
+            output[index + 1] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(sum1, requant_shift) + output_zero_point));
+            output[index + 2] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(sum2, requant_shift) + output_zero_point));
+            output[index + 3] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(sum3, requant_shift) + output_zero_point));
+        }
+    }
+#endif
+
+    for (; index < n; ++index) {
+        const int64_t lhs_value = (int64_t) lhs[index] - lhs_zero_point;
+        const int64_t rhs_value = (int64_t) rhs[index] - rhs_zero_point;
+        const int64_t scaled_sum = lhs_value * lhs_multiplier + rhs_value * rhs_multiplier;
+        const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+            scaled_sum, requant_shift) + output_zero_point;
+        output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+    }
+}
+
+void ggml_vec_add_affine_u16_qnn_q15(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int64_t lhs_multiplier,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int64_t rhs_multiplier,
+        int32_t rhs_zero_point,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    for (int index = 0; index < n; ++index) {
+        const int64_t lhs_value = (int64_t) lhs[index] - lhs_zero_point;
+        const int64_t rhs_value = (int64_t) rhs[index] - rhs_zero_point;
+        const int64_t scaled_sum =
+            lhs_value * lhs_multiplier + rhs_value * rhs_multiplier;
+        const int64_t quantized =
+            ggml_u16_htp_round_shift(scaled_sum, 15) + output_zero_point;
+        output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+    }
+}
+
+static inline uint16_t ggml_u16_mul_requant_fixed(
+        int64_t lhs,
+        int64_t rhs,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    const int64_t product = lhs * rhs;
+    GGML_ASSERT(multiplier >= 0);
+    GGML_ASSERT(product == 0 || multiplier <= INT64_MAX / llabs(product));
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        product * multiplier, GGML_U16_Q20_SHIFT) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_mul_affine_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int32_t rhs_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    GGML_ASSERT(product_to_output_q20 >= 0);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t lhs_zero = vdupq_n_s32(lhs_zero_point);
+    const int32x4_t rhs_zero = vdupq_n_s32(rhs_zero_point);
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t lhs_values = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(lhs + index))), lhs_zero);
+        const int32x4_t rhs_values = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(rhs + index))), rhs_zero);
+        const int64x2_t product_lo = vmull_s32(
+            vget_low_s32(lhs_values), vget_low_s32(rhs_values));
+        const int64x2_t product_hi = vmull_s32(
+            vget_high_s32(lhs_values), vget_high_s32(rhs_values));
+        output[index + 0] = ggml_u16_mul_requant_fixed(
+            vgetq_lane_s64(product_lo, 0), 1, product_to_output_q20, output_zero_point);
+        output[index + 1] = ggml_u16_mul_requant_fixed(
+            vgetq_lane_s64(product_lo, 1), 1, product_to_output_q20, output_zero_point);
+        output[index + 2] = ggml_u16_mul_requant_fixed(
+            vgetq_lane_s64(product_hi, 0), 1, product_to_output_q20, output_zero_point);
+        output[index + 3] = ggml_u16_mul_requant_fixed(
+            vgetq_lane_s64(product_hi, 1), 1, product_to_output_q20, output_zero_point);
+    }
+#endif
+    for (; index < n; ++index) {
+        output[index] = ggml_u16_mul_requant_fixed(
+            (int32_t) lhs[index] - lhs_zero_point,
+            (int32_t) rhs[index] - rhs_zero_point,
+            product_to_output_q20,
+            output_zero_point);
+    }
+}
+
+static inline uint16_t ggml_u16_add_requant_fixed(
+        int64_t lhs,
+        int64_t lhs_multiplier,
+        int64_t rhs,
+        int64_t rhs_multiplier,
+        int32_t output_zero_point);
+
+void ggml_vec_add_affine_u16_qnn_fixed_scalar(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int64_t lhs_multiplier,
+        int32_t lhs_zero_point,
+        uint16_t rhs_code,
+        int64_t rhs_multiplier,
+        int32_t rhs_zero_point,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    const int64_t rhs_value = (int32_t) rhs_code - rhs_zero_point;
+    for (int index = 0; index < n; ++index) {
+        const int64_t lhs_value = (int32_t) lhs[index] - lhs_zero_point;
+        output[index] = ggml_u16_add_requant_fixed(
+            lhs_value, lhs_multiplier, rhs_value, rhs_multiplier,
+            output_zero_point);
+    }
+}
+
+void ggml_vec_mul_affine_u16_qnn_fixed_scalar(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int32_t lhs_zero_point,
+        uint16_t rhs_code,
+        int32_t rhs_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    const int64_t rhs_value = (int32_t) rhs_code - rhs_zero_point;
+    for (int index = 0; index < n; ++index) {
+        output[index] = ggml_u16_mul_requant_fixed(
+            (int32_t) lhs[index] - lhs_zero_point,
+            rhs_value, product_to_output_q20, output_zero_point);
+    }
+}
+
+static inline uint16_t ggml_u16_add_requant_fixed(
+        int64_t lhs,
+        int64_t lhs_multiplier,
+        int64_t rhs,
+        int64_t rhs_multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(lhs == 0 || llabs(lhs_multiplier) <= INT64_MAX / llabs(lhs));
+    GGML_ASSERT(rhs == 0 || llabs(rhs_multiplier) <= INT64_MAX / llabs(rhs));
+    const int64_t lhs_scaled = lhs * lhs_multiplier;
+    const int64_t rhs_scaled = rhs * rhs_multiplier;
+    GGML_ASSERT((rhs_scaled <= 0 || lhs_scaled <= INT64_MAX - rhs_scaled) &&
+                (rhs_scaled >= 0 || lhs_scaled >= INT64_MIN - rhs_scaled));
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        lhs_scaled + rhs_scaled, GGML_U16_Q20_SHIFT) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_requant_q31(
+        int64_t value,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(value == 0 || llabs(multiplier) <= INT64_MAX / llabs(value));
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        value * multiplier, 31) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_mul_product_requant_q31(
+        int64_t value,
+        int64_t multiplier,
+        int64_t nudge,
+        int32_t output_zero_point) {
+    GGML_ASSERT(value == 0 || llabs(multiplier) <= INT64_MAX / llabs(value));
+    // QNN HTP ElementWiseMultiply switches to the upper output code below
+    // the conventional half-way point. Preserve that requantization behavior
+    // in the integer path instead of correcting the output afterwards.
+    const int64_t quantized =
+        ggml_u16_floor_shift(value * multiplier + nudge, 31) +
+        output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_mul_requant_q31(
+        int64_t lhs,
+        int64_t rhs,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(lhs == 0 || llabs(rhs) <= INT64_MAX / llabs(lhs));
+    return ggml_u16_requant_q31(lhs * rhs, multiplier, output_zero_point);
+}
+
+static inline uint16_t ggml_u16_mul_requant_htp_shift3(
+        int64_t lhs,
+        int64_t rhs,
+        int64_t multiplier_q31_shift3,
+        int32_t output_zero_point) {
+    GGML_ASSERT(lhs == 0 || llabs(rhs) <= INT64_MAX / llabs(lhs));
+    const int64_t product = lhs * rhs;
+    GGML_ASSERT(product == 0 ||
+        llabs(multiplier_q31_shift3) <= INT64_MAX / llabs(product));
+    const int64_t q31 = ggml_u16_htp_round_shift(
+        product * multiplier_q31_shift3, 31);
+    const int64_t quantized =
+        ggml_u16_htp_round_shift(q31, 3) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_binary_requant_htp_q15(
+        uint16_t lhs,
+        int32_t lhs_multiplier_q15,
+        uint16_t rhs,
+        int32_t rhs_multiplier_q15,
+        int32_t shift,
+        int64_t bias,
+        bool subtract) {
+    GGML_ASSERT(lhs_multiplier_q15 >= 0 && lhs_multiplier_q15 <= INT16_MAX);
+    GGML_ASSERT(rhs_multiplier_q15 >= 0 && rhs_multiplier_q15 <= INT16_MAX);
+    GGML_ASSERT(shift > 0 && shift < 31);
+    const int64_t lhs_scaled = (int64_t) lhs * lhs_multiplier_q15;
+    const int64_t rhs_scaled = (int64_t) rhs * rhs_multiplier_q15;
+    const int64_t average = ggml_u16_floor_shift(
+        lhs_scaled + (subtract ? -rhs_scaled : rhs_scaled), 1);
+    const int64_t quantized = ggml_u16_htp_round_shift(
+        average + bias, shift);
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_mul_affine_u16_qnn_q31(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int32_t rhs_zero_point,
+        int64_t product_to_output_q31,
+        int64_t product_requant_nudge_q31,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    GGML_ASSERT(product_to_output_q31 >= 0);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t lhs_zero = vdupq_n_s32(lhs_zero_point);
+    const int32x4_t rhs_zero = vdupq_n_s32(rhs_zero_point);
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t lhs_values = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(lhs + index))), lhs_zero);
+        const int32x4_t rhs_values = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(rhs + index))), rhs_zero);
+        const int64x2_t product_lo = vmull_s32(
+            vget_low_s32(lhs_values), vget_low_s32(rhs_values));
+        const int64x2_t product_hi = vmull_s32(
+            vget_high_s32(lhs_values), vget_high_s32(rhs_values));
+        output[index + 0] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_lo, 0), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 1] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_lo, 1), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 2] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_hi, 0), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 3] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_hi, 1), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+    }
+#endif
+    for (; index < n; ++index) {
+        const int64_t lhs_value = (int32_t) lhs[index] - lhs_zero_point;
+        const int64_t rhs_value = (int32_t) rhs[index] - rhs_zero_point;
+        GGML_ASSERT(lhs_value == 0 ||
+            llabs(rhs_value) <= INT64_MAX / llabs(lhs_value));
+        output[index] = ggml_u16_mul_product_requant_q31(
+            lhs_value * rhs_value, product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+    }
+}
+
+void ggml_vec_mul_affine_u16_qnn_q31_scalar(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int32_t lhs_zero_point,
+        uint16_t rhs_code,
+        int32_t rhs_zero_point,
+        int64_t product_to_output_q31,
+        int64_t product_requant_nudge_q31,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    const int32_t rhs_value = (int32_t) rhs_code - rhs_zero_point;
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t lhs_zero = vdupq_n_s32(lhs_zero_point);
+    const int32x2_t rhs_pair = vdup_n_s32(rhs_value);
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t lhs_values = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(lhs + index))), lhs_zero);
+        const int64x2_t product_lo = vmull_s32(
+            vget_low_s32(lhs_values), rhs_pair);
+        const int64x2_t product_hi = vmull_s32(
+            vget_high_s32(lhs_values), rhs_pair);
+        output[index + 0] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_lo, 0), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 1] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_lo, 1), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 2] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_hi, 0), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+        output[index + 3] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(product_hi, 1), product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+    }
+#endif
+    for (; index < n; ++index) {
+        const int64_t lhs_value = (int32_t) lhs[index] - lhs_zero_point;
+        GGML_ASSERT(lhs_value == 0 ||
+            llabs(rhs_value) <= INT64_MAX / llabs(lhs_value));
+        output[index] = ggml_u16_mul_product_requant_q31(
+            lhs_value * rhs_value, product_to_output_q31,
+            product_requant_nudge_q31, output_zero_point);
+    }
+}
+
+void ggml_vec_mul_static_affine_u16_qnn_q15(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        int32_t multiplier_q15,
+        int32_t right_shift,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    GGML_ASSERT(multiplier_q15 >= INT16_MIN &&
+        multiplier_q15 <= INT16_MAX);
+    GGML_ASSERT(right_shift > 0 && right_shift < 31);
+    for (int index = 0; index < n; ++index) {
+        const int64_t centered =
+            (int32_t) input[index] - input_zero_point;
+        const int64_t quantized = ggml_u16_htp_round_shift(
+            centered * multiplier_q15, right_shift) + output_zero_point;
+        output[index] = (uint16_t) MAX(
+            0, MIN(UINT16_MAX, quantized));
+    }
+}
+
+static inline void ggml_u16_rope_requant_pair_storage_tables(
+        uint16_t * GGML_RESTRICT output_first,
+        uint16_t * GGML_RESTRICT output_second,
+        int64_t input_first,
+        int64_t input_second,
+        uint16_t table_code0,
+        uint16_t table_code1,
+        uint16_t table_code2,
+        uint16_t table_code3,
+        const struct ggml_u16_rope_qnn_fixed_params * params) {
+    const uint16_t split_first = (uint16_t) MAX(0, MIN(UINT16_MAX,
+        ggml_gptq2_32_round_shift_away_from_zero(
+            (input_first - params->split_input_zero_point) *
+                params->split_to_output_q31[0],
+            31) + params->split_output_zero_points[0]));
+    const uint16_t split_second = (uint16_t) MAX(0, MIN(UINT16_MAX,
+        ggml_gptq2_32_round_shift_away_from_zero(
+            (input_second - params->split_input_zero_point) *
+                params->split_to_output_q31[1],
+            31) + params->split_output_zero_points[1]));
+    const uint16_t table_codes[4] = {
+        table_code0,
+        table_code1,
+        table_code2,
+        table_code3,
+    };
+    const uint16_t products[4] = {
+        ggml_u16_mul_requant_htp_shift3(
+            (int64_t) split_first - params->lhs_zero_points[0],
+            (int64_t) table_codes[0] - params->table_zero_points[0],
+            params->product_to_output_q31_shift3[0],
+            params->product_output_zero_points[0]),
+        ggml_u16_mul_requant_htp_shift3(
+            (int64_t) split_second - params->lhs_zero_points[1],
+            (int64_t) table_codes[1] - params->table_zero_points[1],
+            params->product_to_output_q31_shift3[1],
+            params->product_output_zero_points[1]),
+        ggml_u16_mul_requant_htp_shift3(
+            (int64_t) split_first - params->lhs_zero_points[2],
+            (int64_t) table_codes[2] - params->table_zero_points[2],
+            params->product_to_output_q31_shift3[2],
+            params->product_output_zero_points[2]),
+        ggml_u16_mul_requant_htp_shift3(
+            (int64_t) split_second - params->lhs_zero_points[3],
+            (int64_t) table_codes[3] - params->table_zero_points[3],
+            params->product_to_output_q31_shift3[3],
+            params->product_output_zero_points[3]),
+    };
+    *output_first = ggml_u16_binary_requant_htp_q15(
+        products[0], params->combine_multipliers_q15[0],
+        products[1], params->combine_multipliers_q15[1],
+        params->combine_shifts[0], params->combine_biases[0], true);
+    *output_second = ggml_u16_binary_requant_htp_q15(
+        products[2], params->combine_multipliers_q15[2],
+        products[3], params->combine_multipliers_q15[3],
+        params->combine_shifts[1], params->combine_biases[1], false);
+}
+
+#if defined(__ARM_NEON)
+static inline int64_t ggml_u16_max_centered_code(int32_t zero_point) {
+    return MAX((int64_t) zero_point, (int64_t) UINT16_MAX - zero_point);
+}
+
+static inline int32x4_t ggml_u16_requant_i32x4_q31(
+        int32x4_t values,
+        int32_t multiplier,
+        int32_t output_zero_point) {
+    const int32x2_t multiplier_pair = vdup_n_s32(multiplier);
+    const int64x2_t products_lo = vmull_s32(
+        vget_low_s32(values), multiplier_pair);
+    const int64x2_t products_hi = vmull_s32(
+        vget_high_s32(values), multiplier_pair);
+    int32x4_t result = vdupq_n_s32(0);
+    result = vsetq_lane_s32(ggml_u16_requant_q31(
+        vgetq_lane_s64(products_lo, 0), 1, output_zero_point), result, 0);
+    result = vsetq_lane_s32(ggml_u16_requant_q31(
+        vgetq_lane_s64(products_lo, 1), 1, output_zero_point), result, 1);
+    result = vsetq_lane_s32(ggml_u16_requant_q31(
+        vgetq_lane_s64(products_hi, 0), 1, output_zero_point), result, 2);
+    result = vsetq_lane_s32(ggml_u16_requant_q31(
+        vgetq_lane_s64(products_hi, 1), 1, output_zero_point), result, 3);
+    return result;
+}
+
+static inline int32x4_t ggml_u16_requant_i32x4_htp_shift3(
+        int32x4_t values,
+        int32_t multiplier_q31_shift3,
+        int32_t output_zero_point) {
+    int32x4_t result = vdupq_n_s32(0);
+    result = vsetq_lane_s32(ggml_u16_mul_requant_htp_shift3(
+        vgetq_lane_s32(values, 0), 1, multiplier_q31_shift3,
+        output_zero_point), result, 0);
+    result = vsetq_lane_s32(ggml_u16_mul_requant_htp_shift3(
+        vgetq_lane_s32(values, 1), 1, multiplier_q31_shift3,
+        output_zero_point), result, 1);
+    result = vsetq_lane_s32(ggml_u16_mul_requant_htp_shift3(
+        vgetq_lane_s32(values, 2), 1, multiplier_q31_shift3,
+        output_zero_point), result, 2);
+    result = vsetq_lane_s32(ggml_u16_mul_requant_htp_shift3(
+        vgetq_lane_s32(values, 3), 1, multiplier_q31_shift3,
+        output_zero_point), result, 3);
+    return result;
+}
+
+static inline int32x4_t ggml_u16_binary_requant_i32x4_htp_q15(
+        int32x4_t lhs,
+        int32_t lhs_multiplier_q15,
+        int32x4_t rhs,
+        int32_t rhs_multiplier_q15,
+        int32_t shift,
+        int64_t bias,
+        bool subtract) {
+    int32x4_t result = vdupq_n_s32(0);
+    result = vsetq_lane_s32(ggml_u16_binary_requant_htp_q15(
+        (uint16_t) vgetq_lane_s32(lhs, 0), lhs_multiplier_q15,
+        (uint16_t) vgetq_lane_s32(rhs, 0), rhs_multiplier_q15,
+        shift, bias, subtract), result, 0);
+    result = vsetq_lane_s32(ggml_u16_binary_requant_htp_q15(
+        (uint16_t) vgetq_lane_s32(lhs, 1), lhs_multiplier_q15,
+        (uint16_t) vgetq_lane_s32(rhs, 1), rhs_multiplier_q15,
+        shift, bias, subtract), result, 1);
+    result = vsetq_lane_s32(ggml_u16_binary_requant_htp_q15(
+        (uint16_t) vgetq_lane_s32(lhs, 2), lhs_multiplier_q15,
+        (uint16_t) vgetq_lane_s32(rhs, 2), rhs_multiplier_q15,
+        shift, bias, subtract), result, 2);
+    result = vsetq_lane_s32(ggml_u16_binary_requant_htp_q15(
+        (uint16_t) vgetq_lane_s32(lhs, 3), lhs_multiplier_q15,
+        (uint16_t) vgetq_lane_s32(rhs, 3), rhs_multiplier_q15,
+        shift, bias, subtract), result, 3);
+    return result;
+}
+
+static inline bool ggml_u16_rope_direct_neon_is_safe(
+        const struct ggml_u16_rope_qnn_fixed_params * params) {
+    if (params->split_to_output_q31[0] != (INT64_C(1) << 31) ||
+        params->split_input_zero_point != params->split_output_zero_points[0]) {
+        return false;
+    }
+    for (int operation = 0; operation < 4; ++operation) {
+        if (params->product_to_output_q31_shift3[operation] > INT32_MAX) {
+            return false;
+        }
+        const int64_t lhs_max =
+            ggml_u16_max_centered_code(params->lhs_zero_points[operation]);
+        const int64_t table_max =
+            ggml_u16_max_centered_code(params->table_zero_points[operation]);
+        if (lhs_max * table_max > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline void ggml_u16_rope_requant_four_direct_neon(
+        uint16_t * GGML_RESTRICT output_first,
+        uint16_t * GGML_RESTRICT output_second,
+        const uint16_t * GGML_RESTRICT input_first,
+        const uint16_t * GGML_RESTRICT input_second,
+        const uint16_t * GGML_RESTRICT cos_codes,
+        const uint16_t * GGML_RESTRICT sin_codes,
+        const struct ggml_u16_rope_qnn_fixed_params * params) {
+    const int32x4_t first = vreinterpretq_s32_u32(
+        vmovl_u16(vld1_u16(input_first)));
+    const uint16x4_t second_codes = vld1_u16(input_second);
+    int32x4_t second = vdupq_n_s32(0);
+    second = vsetq_lane_s32(ggml_u16_requant_q31(
+        (int64_t) vget_lane_u16(second_codes, 0) - params->split_input_zero_point,
+        params->split_to_output_q31[1],
+        params->split_output_zero_points[1]), second, 0);
+    second = vsetq_lane_s32(ggml_u16_requant_q31(
+        (int64_t) vget_lane_u16(second_codes, 1) - params->split_input_zero_point,
+        params->split_to_output_q31[1],
+        params->split_output_zero_points[1]), second, 1);
+    second = vsetq_lane_s32(ggml_u16_requant_q31(
+        (int64_t) vget_lane_u16(second_codes, 2) - params->split_input_zero_point,
+        params->split_to_output_q31[1],
+        params->split_output_zero_points[1]), second, 2);
+    second = vsetq_lane_s32(ggml_u16_requant_q31(
+        (int64_t) vget_lane_u16(second_codes, 3) - params->split_input_zero_point,
+        params->split_to_output_q31[1],
+        params->split_output_zero_points[1]), second, 3);
+    const int32x4_t cos_values = vreinterpretq_s32_u32(
+        vmovl_u16(vld1_u16(cos_codes)));
+    const int32x4_t sin_values = vreinterpretq_s32_u32(
+        vmovl_u16(vld1_u16(sin_codes)));
+    const int32x4_t products[4] = {
+        ggml_u16_requant_i32x4_htp_shift3(
+            vmulq_s32(
+                vsubq_s32(first, vdupq_n_s32(params->lhs_zero_points[0])),
+                vsubq_s32(cos_values, vdupq_n_s32(params->table_zero_points[0]))),
+            (int32_t) params->product_to_output_q31_shift3[0],
+            params->product_output_zero_points[0]),
+        ggml_u16_requant_i32x4_htp_shift3(
+            vmulq_s32(
+                vsubq_s32(second, vdupq_n_s32(params->lhs_zero_points[1])),
+                vsubq_s32(sin_values, vdupq_n_s32(params->table_zero_points[1]))),
+            (int32_t) params->product_to_output_q31_shift3[1],
+            params->product_output_zero_points[1]),
+        ggml_u16_requant_i32x4_htp_shift3(
+            vmulq_s32(
+                vsubq_s32(first, vdupq_n_s32(params->lhs_zero_points[2])),
+                vsubq_s32(sin_values, vdupq_n_s32(params->table_zero_points[2]))),
+            (int32_t) params->product_to_output_q31_shift3[2],
+            params->product_output_zero_points[2]),
+        ggml_u16_requant_i32x4_htp_shift3(
+            vmulq_s32(
+                vsubq_s32(second, vdupq_n_s32(params->lhs_zero_points[3])),
+                vsubq_s32(cos_values, vdupq_n_s32(params->table_zero_points[3]))),
+            (int32_t) params->product_to_output_q31_shift3[3],
+            params->product_output_zero_points[3]),
+    };
+    const int32x4_t combined_first =
+        ggml_u16_binary_requant_i32x4_htp_q15(
+            products[0], params->combine_multipliers_q15[0],
+            products[1], params->combine_multipliers_q15[1],
+            params->combine_shifts[0], params->combine_biases[0], true);
+    const int32x4_t combined_second =
+        ggml_u16_binary_requant_i32x4_htp_q15(
+            products[2], params->combine_multipliers_q15[2],
+            products[3], params->combine_multipliers_q15[3],
+            params->combine_shifts[1], params->combine_biases[1], false);
+    vst1_u16(output_first, vqmovun_s32(combined_first));
+    vst1_u16(output_second, vqmovun_s32(combined_second));
+}
+#endif
+
+static inline void ggml_u16_rope_requant_pair(
+        uint16_t * GGML_RESTRICT output_first,
+        uint16_t * GGML_RESTRICT output_second,
+        int64_t input_first,
+        int64_t input_second,
+        int64_t cos_code,
+        int64_t sin_code,
+        const struct ggml_u16_rope_qnn_fixed_params * params) {
+    const uint16_t table_codes[4] = {
+        (uint16_t) MAX(0, MIN(UINT16_MAX,
+            ggml_gptq2_32_round_shift_away_from_zero(
+                (cos_code - params->table_source_zero_points[0]) *
+                    params->table_source_to_storage_q31[0],
+                31) + params->table_zero_points[0])),
+        (uint16_t) MAX(0, MIN(UINT16_MAX,
+            ggml_gptq2_32_round_shift_away_from_zero(
+                (sin_code - params->table_source_zero_points[1]) *
+                    params->table_source_to_storage_q31[1],
+                31) + params->table_zero_points[1])),
+        (uint16_t) MAX(0, MIN(UINT16_MAX,
+            ggml_gptq2_32_round_shift_away_from_zero(
+                (sin_code - params->table_source_zero_points[2]) *
+                    params->table_source_to_storage_q31[2],
+                31) + params->table_zero_points[2])),
+        (uint16_t) MAX(0, MIN(UINT16_MAX,
+            ggml_gptq2_32_round_shift_away_from_zero(
+                (cos_code - params->table_source_zero_points[3]) *
+                    params->table_source_to_storage_q31[3],
+                31) + params->table_zero_points[3])),
+    };
+    ggml_u16_rope_requant_pair_storage_tables(
+        output_first,
+        output_second,
+        input_first,
+        input_second,
+        table_codes[0],
+        table_codes[1],
+        table_codes[2],
+        table_codes[3],
+        params);
+}
+
+void ggml_vec_rope_affine_u16_qnn_fixed(
+        int half_dimension,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const uint16_t * GGML_RESTRICT cos_codes,
+        const uint16_t * GGML_RESTRICT sin_codes,
+        const struct ggml_u16_rope_qnn_fixed_params * params) {
+    GGML_ASSERT(half_dimension > 0);
+    GGML_ASSERT(output != NULL && input != NULL);
+    GGML_ASSERT(cos_codes != NULL && sin_codes != NULL && params != NULL);
+    for (int parameter = 0; parameter < 4; ++parameter) {
+        GGML_ASSERT(params->table_source_to_storage_q31[parameter] >= 0);
+        GGML_ASSERT(params->product_to_output_q31_shift3[parameter] >= 0);
+        GGML_ASSERT(params->combine_multipliers_q15[parameter] >= 0);
+        GGML_ASSERT(params->combine_multipliers_q15[parameter] <= INT16_MAX);
+    }
+    for (int output_index = 0; output_index < 2; ++output_index) {
+        GGML_ASSERT(params->combine_shifts[output_index] > 0);
+        GGML_ASSERT(params->combine_shifts[output_index] < 31);
+    }
+
+    int index = 0;
+    bool direct_tables = true;
+    for (int parameter = 0; parameter < 4; ++parameter) {
+        direct_tables =
+            direct_tables &&
+            params->table_source_to_storage_q31[parameter] == (INT64_C(1) << 31) &&
+            params->table_source_zero_points[parameter] ==
+                params->table_zero_points[parameter];
+    }
+    if (direct_tables) {
+#if defined(__ARM_NEON)
+        if (ggml_u16_rope_direct_neon_is_safe(params)) {
+            for (; index + 4 <= half_dimension; index += 4) {
+                ggml_u16_rope_requant_four_direct_neon(
+                    output + index,
+                    output + half_dimension + index,
+                    input + index,
+                    input + half_dimension + index,
+                    cos_codes + index,
+                    sin_codes + index,
+                    params);
+            }
+        }
+#endif
+        for (; index < half_dimension; ++index) {
+            ggml_u16_rope_requant_pair_storage_tables(
+                output + index,
+                output + half_dimension + index,
+                input[index],
+                input[half_dimension + index],
+                cos_codes[index],
+                sin_codes[index],
+                sin_codes[index],
+                cos_codes[index],
+                params);
+        }
+        return;
+    }
+#if defined(__ARM_NEON)
+    for (; index + 4 <= half_dimension; index += 4) {
+        const uint16x4_t first = vld1_u16(input + index);
+        const uint16x4_t second = vld1_u16(input + half_dimension + index);
+        const uint16x4_t cos_values = vld1_u16(cos_codes + index);
+        const uint16x4_t sin_values = vld1_u16(sin_codes + index);
+#define GGML_U16_ROPE_LANE(LANE)                                      \
+        ggml_u16_rope_requant_pair(                                   \
+            output + index + (LANE),                                  \
+            output + half_dimension + index + (LANE),                 \
+            vget_lane_u16(first, (LANE)),                              \
+            vget_lane_u16(second, (LANE)),                             \
+            vget_lane_u16(cos_values, (LANE)),                         \
+            vget_lane_u16(sin_values, (LANE)),                         \
+            params)
+        GGML_U16_ROPE_LANE(0);
+        GGML_U16_ROPE_LANE(1);
+        GGML_U16_ROPE_LANE(2);
+        GGML_U16_ROPE_LANE(3);
+#undef GGML_U16_ROPE_LANE
+    }
+#endif
+    for (; index < half_dimension; ++index) {
+        ggml_u16_rope_requant_pair(
+            output + index,
+            output + half_dimension + index,
+            input[index],
+            input[half_dimension + index],
+            cos_codes[index],
+            sin_codes[index],
+            params);
+    }
+}
+
+static inline uint16_t ggml_u16_matmul_requant_q31(
+        int64_t accumulator,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(multiplier >= 0);
+    GGML_ASSERT(accumulator == 0 ||
+        multiplier <= INT64_MAX / llabs(accumulator));
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        accumulator * multiplier, 31) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_htp_matmul_requant_q31(
+        int64_t accumulator,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(multiplier >= 0);
+    GGML_ASSERT(accumulator == 0 ||
+        multiplier <= INT64_MAX / llabs(accumulator));
+    const int64_t quantized = ggml_u16_floor_shift(
+        accumulator * multiplier, 31) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+static inline uint16_t ggml_u16_htp_matmul_requant_symmetric_u16(
+        int64_t accumulator,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    GGML_ASSERT(multiplier >= 0);
+    GGML_ASSERT(accumulator == 0 ||
+        multiplier <= INT64_MAX / llabs(accumulator));
+    const int64_t scaled = ggml_u16_htp_round_shift(
+        accumulator * multiplier, 31);
+    const int64_t symmetric_s16 = MAX(INT16_MIN, MIN(INT16_MAX, scaled));
+    const int64_t public_code = symmetric_s16 + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, public_code));
+}
+
+static void ggml_vec_hadamard_128_u16_s16_qnn_fixed(
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        int64_t product_to_output_q24,
+        int32_t output_zero_point) {
+    int32_t transformed[128];
+    int64_t input_sum = 0;
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+    for (; index + 8 <= 128; index += 8) {
+        const uint16x8_t packed = vld1q_u16(input + index);
+        const int32x4_t low = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(packed))), input_zero);
+        const int32x4_t high = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(packed))), input_zero);
+        vst1q_s32(transformed + index, low);
+        vst1q_s32(transformed + index + 4, high);
+        input_sum += vaddvq_s32(low);
+        input_sum += vaddvq_s32(high);
+    }
+#endif
+    for (; index < 128; ++index) {
+        transformed[index] = (int32_t) input[index] - input_zero_point;
+        input_sum += transformed[index];
+    }
+
+    for (int width = 1; width < 128; width <<= 1) {
+        for (int base = 0; base < 128; base += width << 1) {
+            int lane = 0;
+#if defined(__ARM_NEON)
+            for (; lane + 4 <= width; lane += 4) {
+                const int32x4_t first = vld1q_s32(transformed + base + lane);
+                const int32x4_t second =
+                    vld1q_s32(transformed + base + width + lane);
+                vst1q_s32(transformed + base + lane, vaddq_s32(first, second));
+                vst1q_s32(
+                    transformed + base + width + lane, vsubq_s32(first, second));
+            }
+#endif
+            for (; lane < width; ++lane) {
+                const int32_t first = transformed[base + lane];
+                const int32_t second = transformed[base + width + lane];
+                transformed[base + lane] = first + second;
+                transformed[base + width + lane] = first - second;
+            }
+        }
+    }
+
+    for (int column = 0; column < 128; ++column) {
+        // ConvLayer_s1.opt reconstructs +32767 as (127, 127) = 32639,
+        // while -32767 remains (1, -128) = -32767. For Hadamard sign h,
+        // the resulting coefficient is 32703*h - 64.
+        const int64_t centered =
+            INT64_C(32703) * transformed[column] - INT64_C(64) * input_sum;
+        const int64_t weight_sum =
+            column == 0 ? INT64_C(4177792) : -8192;
+        const int64_t correction =
+            (int64_t) input_zero_point * weight_sum;
+
+        // HTP reduces the unsigned raw dot and affine correction separately
+        // to S16 before subtracting. The final scale is prepared as Q24 for
+        // this reduced domain, preserving all runtime intermediates as ints.
+        const int64_t reduced =
+            ggml_u16_floor_shift(centered + correction, 16)
+            - ggml_u16_htp_round_shift(correction, 16);
+        GGML_ASSERT(reduced == 0 ||
+            product_to_output_q24 <= INT64_MAX / llabs(reduced));
+        const int64_t scaled = ggml_u16_htp_round_shift(
+            reduced * product_to_output_q24, 24);
+        const int64_t public_code = scaled + output_zero_point;
+        output[column] =
+            (uint16_t) MAX(0, MIN(UINT16_MAX, public_code));
+    }
+}
+
+void ggml_vec_matmul_u16_s16_qnn_fixed(
+        int input_dimension,
+        int output_dimension,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const int16_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point,
+        int weight_right_shift,
+        int accumulator_reduction_shift) {
+    GGML_ASSERT(input_dimension > 0 && output_dimension > 0);
+    GGML_ASSERT(output != NULL && input != NULL && weights != NULL);
+    GGML_ASSERT(product_to_output_q20 >= 0);
+    GGML_ASSERT(weight_right_shift == 0 || weight_right_shift == 7);
+    GGML_ASSERT(accumulator_reduction_shift >= 0 &&
+        accumulator_reduction_shift < 31);
+    GGML_ASSERT(accumulator_reduction_shift == 0 ||
+        (weight_right_shift == 7 &&
+         input_dimension == 128 && output_dimension == 128));
+    GGML_ASSERT(weight_right_shift == 0 || weight_zero_point == 0);
+    const bool use_hadamard_fast_path =
+        weight_right_shift == 7 &&
+        input_dimension == 128 && output_dimension == 128;
+
+    if (use_hadamard_fast_path) {
+        GGML_ASSERT(accumulator_reduction_shift == 16);
+        ggml_vec_hadamard_128_u16_s16_qnn_fixed(
+            output, input, input_zero_point, product_to_output_q20,
+            output_zero_point);
+        return;
+    }
+
+    GGML_ASSERT(product_to_output_q20 <= (INT64_MAX >> weight_right_shift));
+    const int64_t effective_multiplier =
+        product_to_output_q20 << weight_right_shift;
+
+    int column = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+    for (; column + 8 <= output_dimension; column += 8) {
+        int64x2_t accumulators[4] = {
+            vdupq_n_s64(0), vdupq_n_s64(0),
+            vdupq_n_s64(0), vdupq_n_s64(0),
+        };
+        for (int row = 0; row < input_dimension; ++row) {
+            const int32_t input_value = (int32_t) input[row] - input_zero_point;
+            const int32x2_t input_pair = vdup_n_s32(input_value);
+            int16x8_t packed = vld1q_s16(
+                weights + (size_t) row * output_dimension + column);
+            if (weight_right_shift == 7) {
+                // QNN HTP narrows this S16 Hadamard operand to signed 9-bit
+                // lanes before multiplication: +32767/-32767 -> +255/-256.
+                packed = vshrq_n_s16(packed, 7);
+            }
+            const int32x4_t low = vsubq_s32(
+                vmovl_s16(vget_low_s16(packed)), weight_zero);
+            const int32x4_t high = vsubq_s32(
+                vmovl_s16(vget_high_s16(packed)), weight_zero);
+            accumulators[0] = vmlal_s32(
+                accumulators[0], vget_low_s32(low), input_pair);
+            accumulators[1] = vmlal_s32(
+                accumulators[1], vget_high_s32(low), input_pair);
+            accumulators[2] = vmlal_s32(
+                accumulators[2], vget_low_s32(high), input_pair);
+            accumulators[3] = vmlal_s32(
+                accumulators[3], vget_high_s32(high), input_pair);
+        }
+#define GGML_U16_S16_STORE(LANE, ACCUMULATOR, ACCUMULATOR_LANE)                  \
+        output[column + (LANE)] = weight_right_shift == 0                        \
+            ? ggml_u16_matmul_requant_q31(                                       \
+                vgetq_lane_s64((ACCUMULATOR), (ACCUMULATOR_LANE)),               \
+                effective_multiplier, output_zero_point)                         \
+            : ggml_u16_htp_matmul_requant_q31(                                   \
+                vgetq_lane_s64((ACCUMULATOR), (ACCUMULATOR_LANE)),               \
+                effective_multiplier, output_zero_point)
+        GGML_U16_S16_STORE(0, accumulators[0], 0);
+        GGML_U16_S16_STORE(1, accumulators[0], 1);
+        GGML_U16_S16_STORE(2, accumulators[1], 0);
+        GGML_U16_S16_STORE(3, accumulators[1], 1);
+        GGML_U16_S16_STORE(4, accumulators[2], 0);
+        GGML_U16_S16_STORE(5, accumulators[2], 1);
+        GGML_U16_S16_STORE(6, accumulators[3], 0);
+        GGML_U16_S16_STORE(7, accumulators[3], 1);
+#undef GGML_U16_S16_STORE
+    }
+#endif
+    for (; column < output_dimension; ++column) {
+        int64_t accumulator = 0;
+        for (int row = 0; row < input_dimension; ++row) {
+            const int64_t input_value = (int32_t) input[row] - input_zero_point;
+            int64_t weight_value =
+                (int32_t) weights[(size_t) row * output_dimension + column] -
+                weight_zero_point;
+            if (weight_right_shift == 7) {
+                weight_value = weight_value >= 0
+                    ? weight_value >> 7
+                    : -(((-weight_value) + 127) >> 7);
+            }
+            accumulator += input_value * weight_value;
+        }
+        output[column] = weight_right_shift == 0
+            ? ggml_u16_matmul_requant_q31(
+                accumulator, effective_multiplier, output_zero_point)
+            : ggml_u16_htp_matmul_requant_q31(
+                accumulator, effective_multiplier, output_zero_point);
+    }
+}
+
+static inline uint8_t ggml_u16_to_u8_requant_q31(
+        int64_t centered,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        centered * multiplier, 31) + output_zero_point;
+    return (uint8_t) MAX(0, MIN(UINT8_MAX, quantized));
+}
+
+void ggml_vec_convert_u16_u8_qnn_fixed(
+        int n,
+        uint8_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        int64_t input_to_output_q31,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0 && output != NULL && input != NULL);
+    GGML_ASSERT(input_to_output_q31 >= 0 && input_to_output_q31 <= INT32_MAX);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+    const int32x2_t multiplier = vdup_n_s32((int32_t) input_to_output_q31);
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t centered = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))),
+            input_zero);
+        const int64x2_t product_lo = vmull_s32(
+            vget_low_s32(centered), multiplier);
+        const int64x2_t product_hi = vmull_s32(
+            vget_high_s32(centered), multiplier);
+        output[index + 0] = ggml_u16_to_u8_requant_q31(
+            vgetq_lane_s64(product_lo, 0), 1, output_zero_point);
+        output[index + 1] = ggml_u16_to_u8_requant_q31(
+            vgetq_lane_s64(product_lo, 1), 1, output_zero_point);
+        output[index + 2] = ggml_u16_to_u8_requant_q31(
+            vgetq_lane_s64(product_hi, 0), 1, output_zero_point);
+        output[index + 3] = ggml_u16_to_u8_requant_q31(
+            vgetq_lane_s64(product_hi, 1), 1, output_zero_point);
+    }
+#endif
+    for (; index < n; ++index) {
+        const int64_t centered = (int32_t) input[index] - input_zero_point;
+        output[index] = ggml_u16_to_u8_requant_q31(
+            centered, input_to_output_q31, output_zero_point);
+    }
+}
+
+void ggml_vec_matmul_u16_u8_qnn_fixed(
+        int input_dimension,
+        int output_dimension,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+        input_dimension, output_dimension, (size_t) output_dimension,
+        output, input, weights, input_zero_point, weight_zero_point,
+        product_to_output_q20, output_zero_point);
+}
+
+void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+        int input_dimension,
+        int output_dimension,
+        size_t weight_row_stride,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    GGML_ASSERT(input_dimension > 0 && output_dimension > 0);
+    GGML_ASSERT(output != NULL && input != NULL && weights != NULL);
+    GGML_ASSERT(weight_row_stride >= (size_t) output_dimension);
+    GGML_ASSERT(product_to_output_q20 >= 0);
+
+    int column = 0;
+#if defined(__ARM_NEON)
+    const uint64_t max_abs_input = (uint64_t) MAX(
+        input_zero_point, (int32_t) UINT16_MAX - input_zero_point);
+    const uint64_t max_abs_weight = (uint64_t) MAX(
+        weight_zero_point, (int32_t) UINT8_MAX - weight_zero_point);
+    const bool int32_accumulator_safe =
+        max_abs_input * max_abs_weight * (uint64_t) input_dimension <= INT32_MAX &&
+        product_to_output_q20 <= INT32_MAX;
+    const bool skip_zero_rows = input_zero_point == 0;
+    if (int32_accumulator_safe) {
+        const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+        for (; column + 16 <= output_dimension; column += 16) {
+            int32x4_t accumulators[4] = {
+                vdupq_n_s32(0), vdupq_n_s32(0),
+                vdupq_n_s32(0), vdupq_n_s32(0),
+            };
+            int32x4_t weight_sums[4] = {
+                vdupq_n_s32(0), vdupq_n_s32(0),
+                vdupq_n_s32(0), vdupq_n_s32(0),
+            };
+            for (int row = 0; row < input_dimension; ++row) {
+                if (skip_zero_rows && input[row] == 0) {
+                    continue;
+                }
+                const int32_t input_value =
+                    (int32_t) input[row] - input_zero_point;
+                const uint8x16_t packed = vld1q_u8(
+                    weights + (size_t) row * weight_row_stride + column);
+                const uint16x8_t low_u16 = vmovl_u8(vget_low_u8(packed));
+                const uint16x8_t high_u16 = vmovl_u8(vget_high_u8(packed));
+                const int32x4_t weight_values[4] = {
+                    vsubq_s32(
+                        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(low_u16))),
+                        weight_zero),
+                    vsubq_s32(
+                        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(low_u16))),
+                        weight_zero),
+                    vsubq_s32(
+                        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(high_u16))),
+                        weight_zero),
+                    vsubq_s32(
+                        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(high_u16))),
+                        weight_zero),
+                };
+                for (int block = 0; block < 4; ++block) {
+                    accumulators[block] = vmlaq_n_s32(
+                        accumulators[block], weight_values[block], input_value);
+                    weight_sums[block] = vaddq_s32(
+                        weight_sums[block], weight_values[block]);
+                }
+            }
+            for (int block = 0; block < 4; ++block) {
+                int32_t accumulator_lanes[4];
+                int32_t weight_sum_lanes[4];
+                vst1q_s32(accumulator_lanes, accumulators[block]);
+                vst1q_s32(weight_sum_lanes, weight_sums[block]);
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int64_t reduced =
+                        ggml_qnn_a16s8_reduce_accumulator(
+                            accumulator_lanes[lane],
+                            weight_sum_lanes[lane],
+                            input_zero_point);
+                    output[column + block * 4 + lane] =
+                        ggml_u16_matmul_requant_q31(
+                            reduced,
+                            product_to_output_q20,
+                            output_zero_point);
+                }
+            }
+        }
+    }
+    const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+    for (; column + 8 <= output_dimension; column += 8) {
+        int64x2_t accumulators[4] = {
+            vdupq_n_s64(0), vdupq_n_s64(0),
+            vdupq_n_s64(0), vdupq_n_s64(0),
+        };
+        int32x4_t weight_sums[2] = {
+            vdupq_n_s32(0), vdupq_n_s32(0),
+        };
+        for (int row = 0; row < input_dimension; ++row) {
+            if (skip_zero_rows && input[row] == 0) {
+                continue;
+            }
+            const int32_t input_value = (int32_t) input[row] - input_zero_point;
+            const int32x2_t input_pair = vdup_n_s32(input_value);
+            const uint16x8_t packed = vmovl_u8(vld1_u8(
+                weights + (size_t) row * weight_row_stride + column));
+            const int32x4_t low = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(packed))),
+                weight_zero);
+            const int32x4_t high = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(packed))),
+                weight_zero);
+            weight_sums[0] = vaddq_s32(weight_sums[0], low);
+            weight_sums[1] = vaddq_s32(weight_sums[1], high);
+            accumulators[0] = vmlal_s32(
+                accumulators[0], vget_low_s32(low), input_pair);
+            accumulators[1] = vmlal_s32(
+                accumulators[1], vget_high_s32(low), input_pair);
+            accumulators[2] = vmlal_s32(
+                accumulators[2], vget_low_s32(high), input_pair);
+            accumulators[3] = vmlal_s32(
+                accumulators[3], vget_high_s32(high), input_pair);
+        }
+        int32_t weight_sum_lanes[8];
+        int64_t accumulator_lanes[8];
+        vst1q_s32(weight_sum_lanes, weight_sums[0]);
+        vst1q_s32(weight_sum_lanes + 4, weight_sums[1]);
+        for (int block = 0; block < 4; ++block) {
+            vst1q_s64(accumulator_lanes + block * 2, accumulators[block]);
+        }
+        for (int lane = 0; lane < 8; ++lane) {
+            const int64_t accumulator = ggml_qnn_a16s8_reduce_accumulator(
+                accumulator_lanes[lane],
+                weight_sum_lanes[lane],
+                input_zero_point);
+            output[column + lane] = ggml_u16_matmul_requant_q31(
+                accumulator, product_to_output_q20, output_zero_point);
+        }
+    }
+#endif
+    for (; column < output_dimension; ++column) {
+        int64_t accumulator = 0;
+        int64_t weight_sum = 0;
+        for (int row = 0; row < input_dimension; ++row) {
+            if (input_zero_point == 0 && input[row] == 0) {
+                continue;
+            }
+            const int32_t weight =
+                (int32_t) weights[(size_t) row * weight_row_stride + column] -
+                weight_zero_point;
+            accumulator +=
+                ((int32_t) input[row] - input_zero_point) * weight;
+            weight_sum += weight;
+        }
+        accumulator = ggml_qnn_a16s8_reduce_accumulator(
+            accumulator, weight_sum, input_zero_point);
+        output[column] = ggml_u16_matmul_requant_q31(
+            accumulator, product_to_output_q20, output_zero_point);
+    }
+}
+
+static inline uint16_t ggml_u16_requant_q20(
+        int64_t centered,
+        int64_t multiplier,
+        int32_t output_zero_point) {
+    const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+        centered * multiplier, 20) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_requant_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        int64_t input_to_output_q20,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0 && output != NULL && input != NULL);
+    GGML_ASSERT(input_to_output_q20 >= 0 && input_to_output_q20 <= INT32_MAX);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+    const int32x2_t multiplier = vdup_n_s32((int32_t) input_to_output_q20);
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t centered = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))),
+            input_zero);
+        const int64x2_t product_lo = vmull_s32(vget_low_s32(centered), multiplier);
+        const int64x2_t product_hi = vmull_s32(vget_high_s32(centered), multiplier);
+        output[index + 0] = ggml_u16_requant_q20(
+            vgetq_lane_s64(product_lo, 0), 1, output_zero_point);
+        output[index + 1] = ggml_u16_requant_q20(
+            vgetq_lane_s64(product_lo, 1), 1, output_zero_point);
+        output[index + 2] = ggml_u16_requant_q20(
+            vgetq_lane_s64(product_hi, 0), 1, output_zero_point);
+        output[index + 3] = ggml_u16_requant_q20(
+            vgetq_lane_s64(product_hi, 1), 1, output_zero_point);
+    }
+#endif
+    for (; index < n; ++index) {
+        output[index] = ggml_u16_requant_q20(
+            (int32_t) input[index] - input_zero_point,
+            input_to_output_q20, output_zero_point);
+    }
+}
+
+void ggml_vec_select_affine_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint8_t * GGML_RESTRICT condition,
+        const uint16_t * GGML_RESTRICT when_true,
+        int32_t true_zero_point,
+        int32_t true_multiplier_q15,
+        int32_t true_right_shift,
+        const uint16_t * GGML_RESTRICT when_false,
+        int false_stride,
+        int32_t false_zero_point,
+        int32_t false_multiplier_q15,
+        int32_t false_right_shift,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0 && output != NULL && condition != NULL);
+    GGML_ASSERT(when_true != NULL && when_false != NULL);
+    GGML_ASSERT(false_stride == 0 || false_stride == 1);
+    GGML_ASSERT(true_multiplier_q15 > 0 && true_multiplier_q15 <= INT16_MAX);
+    GGML_ASSERT(false_multiplier_q15 > 0 && false_multiplier_q15 <= INT16_MAX);
+    GGML_ASSERT(true_right_shift > 0 && true_right_shift < 63);
+    GGML_ASSERT(false_right_shift > 0 && false_right_shift < 63);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t true_zero = vdupq_n_s32(true_zero_point);
+    const int32x4_t false_zero = vdupq_n_s32(false_zero_point);
+    const int32x4_t true_multiplier = vdupq_n_s32(true_multiplier_q15);
+    const int32x4_t false_multiplier = vdupq_n_s32(false_multiplier_q15);
+    const int32x4_t true_shift = vdupq_n_s32(-true_right_shift);
+    const int32x4_t false_shift = vdupq_n_s32(-false_right_shift);
+    const int32x4_t output_zero = vdupq_n_s32(output_zero_point);
+    const uint32x4_t mask_zero = vdupq_n_u32(0);
+    for (; index + 8 <= n; index += 8) {
+        const uint8x8_t condition_values = vld1_u8(condition + index);
+        const uint16x8_t condition_wide = vmovl_u8(condition_values);
+        const uint32x4_t condition_mask_lo = vcgtq_u32(
+            vmovl_u16(vget_low_u16(condition_wide)), mask_zero);
+        const uint32x4_t condition_mask_hi = vcgtq_u32(
+            vmovl_u16(vget_high_u16(condition_wide)), mask_zero);
+
+        const uint16x8_t true_values = vld1q_u16(when_true + index);
+        const uint16x8_t false_values = false_stride == 0
+            ? vdupq_n_u16(when_false[0])
+            : vld1q_u16(when_false + index);
+        const int32x4_t true_centered_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(true_values))),
+            true_zero);
+        const int32x4_t true_centered_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(true_values))),
+            true_zero);
+        const int32x4_t false_centered_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(false_values))),
+            false_zero);
+        const int32x4_t false_centered_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(false_values))),
+            false_zero);
+        const int32x4_t centered_lo = vbslq_s32(
+            condition_mask_lo, true_centered_lo, false_centered_lo);
+        const int32x4_t centered_hi = vbslq_s32(
+            condition_mask_hi, true_centered_hi, false_centered_hi);
+        const int32x4_t multiplier_lo = vbslq_s32(
+            condition_mask_lo, true_multiplier, false_multiplier);
+        const int32x4_t multiplier_hi = vbslq_s32(
+            condition_mask_hi, true_multiplier, false_multiplier);
+        const int32x4_t shift_lo = vbslq_s32(
+            condition_mask_lo, true_shift, false_shift);
+        const int32x4_t shift_hi = vbslq_s32(
+            condition_mask_hi, true_shift, false_shift);
+
+        const int64x2_t product_0 = vmull_s32(
+            vget_low_s32(centered_lo), vget_low_s32(multiplier_lo));
+        const int64x2_t product_1 = vmull_s32(
+            vget_high_s32(centered_lo), vget_high_s32(multiplier_lo));
+        const int64x2_t product_2 = vmull_s32(
+            vget_low_s32(centered_hi), vget_low_s32(multiplier_hi));
+        const int64x2_t product_3 = vmull_s32(
+            vget_high_s32(centered_hi), vget_high_s32(multiplier_hi));
+
+        const int32x4_t codes_lo = vaddq_s32(
+            vcombine_s32(
+                vmovn_s64(vrshlq_s64(product_0, vmovl_s32(vget_low_s32(shift_lo)))),
+                vmovn_s64(vrshlq_s64(product_1, vmovl_s32(vget_high_s32(shift_lo))))),
+            output_zero);
+        const int32x4_t codes_hi = vaddq_s32(
+            vcombine_s32(
+                vmovn_s64(vrshlq_s64(product_2, vmovl_s32(vget_low_s32(shift_hi)))),
+                vmovn_s64(vrshlq_s64(product_3, vmovl_s32(vget_high_s32(shift_hi))))),
+            output_zero);
+        vst1q_u16(
+            output + index,
+            vcombine_u16(vqmovun_s32(codes_lo), vqmovun_s32(codes_hi)));
+    }
+#endif
+    for (; index < n; ++index) {
+        const int64_t product = condition[index]
+            ? ((int32_t) when_true[index] - true_zero_point) *
+                true_multiplier_q15
+            : ((int32_t) when_false[index * false_stride] - false_zero_point) *
+                false_multiplier_q15;
+        const int32_t right_shift = condition[index]
+            ? true_right_shift : false_right_shift;
+        const int64_t centered = ggml_u16_htp_round_shift(product, right_shift);
+        const int64_t quantized = centered + output_zero_point;
+        output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+    }
+}
+
+static inline uint32_t ggml_u16_softmax_exp_q31(
+        uint32_t code_delta,
+        int64_t scale_over_ln2_q24,
+        const uint32_t * GGML_RESTRICT exp2_lut_q31) {
+    const uint64_t exponent_q24 = (uint64_t) code_delta *
+        (uint64_t) scale_over_ln2_q24;
+    const uint32_t integer_part = (uint32_t) (exponent_q24 >> 24);
+    if (integer_part >= 31) {
+        return 0;
+    }
+    const uint32_t fraction = (uint32_t) exponent_q24 & 0x00ffffffU;
+    const uint32_t table_index = fraction >> 16;
+    const uint32_t remainder = fraction & 0xffffU;
+    const uint32_t high = exp2_lut_q31[table_index];
+    const uint32_t low = exp2_lut_q31[table_index + 1];
+    const uint32_t interpolated = high - (uint32_t) (
+        ((uint64_t) (high - low) * remainder + UINT64_C(32768)) >> 16);
+    return (interpolated + (integer_part == 0 ? 0U : 1U << (integer_part - 1))) >>
+        integer_part;
+}
+
+static inline int32_t ggml_u16_softmax_sat_i16(int64_t value) {
+    return (int32_t) MAX(INT16_MIN, MIN(INT16_MAX, value));
+}
+
+static inline uint16_t ggml_u16_softmax_exp_htp(
+        uint32_t code_delta,
+        uint16_t exponent_multiplier_q22) {
+    static const uint16_t base[4] = {
+        UINT16_C(0x10cc), UINT16_C(0x13ff),
+        UINT16_C(0x17c7), UINT16_C(0x1c3e),
+    };
+    static const uint16_t linear[4] = {
+        UINT16_C(0x587c), UINT16_C(0x5538),
+        UINT16_C(0x4d91), UINT16_C(0x4014),
+    };
+    static const uint16_t quadratic[4] = {
+        UINT16_C(0x8001), UINT16_C(0x806c),
+        UINT16_C(0x825b), UINT16_C(0x8773),
+    };
+
+    const uint32_t exponent_q16 =
+        (uint32_t) (((uint64_t) code_delta * exponent_multiplier_q22) >> 6);
+    const uint16_t fraction = (uint16_t) ~(uint16_t) exponent_q16;
+    const uint32_t segment = fraction >> 14;
+    int32_t polynomial = ggml_u16_softmax_sat_i16(
+        ((int64_t) base[segment] * fraction +
+            ((int64_t) linear[segment] << 15)) >> 16);
+    polynomial = ggml_u16_softmax_sat_i16(
+        ((int64_t) polynomial * fraction +
+            ((int64_t) quadratic[segment] << 15)) >> 16);
+    const uint32_t integer_part = MIN(UINT32_C(15), exponent_q16 >> 16);
+    return (uint16_t) ((uint16_t) polynomial >> integer_part);
+}
+
+static inline int32_t ggml_u16_softmax_vmpye(
+        int32_t value,
+        uint16_t multiplier) {
+    return (int32_t) (((int64_t) value * multiplier) >> 16);
+}
+
+static inline int32_t ggml_u16_softmax_shift_left_variable(
+        int32_t value,
+        int32_t shift) {
+    return shift >= 0 ? (int32_t) ((uint32_t) value << shift) :
+        value >> -shift;
+}
+
+static inline int32_t ggml_u16_softmax_shift_right_variable(
+        int32_t value,
+        int32_t shift) {
+    return shift >= 0 ? value >> shift :
+        (int32_t) ((uint32_t) value << -shift);
+}
+
+static inline uint16_t ggml_u16_softmax_reciprocal_htp(
+        uint32_t exponential_sum,
+        int32_t * final_right_shift) {
+    const int32_t scaled_sum = ggml_u16_softmax_vmpye(
+        (int32_t) exponential_sum, UINT16_C(0x8000));
+    GGML_ASSERT(scaled_sum > 0);
+    const int32_t normalization_shift =
+        15 - (int32_t) __builtin_clz((uint32_t) scaled_sum);
+    const int32_t target = ggml_u16_softmax_shift_left_variable(
+        INT32_C(0x10000), normalization_shift);
+    int32_t reciprocal = INT32_C(0x8000);
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        const int32_t error = target -
+            ggml_u16_softmax_vmpye(scaled_sum, (uint16_t) reciprocal);
+        const int32_t correction = ggml_u16_softmax_shift_right_variable(
+            ggml_u16_softmax_vmpye(error, (uint16_t) reciprocal),
+            normalization_shift);
+        reciprocal += correction;
+    }
+    *final_right_shift = normalization_shift + 17;
+    return (uint16_t) reciprocal;
+}
+
+static inline uint64_t ggml_u64_divide_reciprocal_exact(
+        uint64_t numerator,
+        uint64_t denominator,
+        uint64_t reciprocal_q64) {
+    uint64_t quotient = (uint64_t) (
+        (ggml_uint128_t) numerator * reciprocal_q64 >> 64);
+    const uint64_t remainder = numerator - quotient * denominator;
+    quotient += remainder >= denominator;
+    return quotient;
+}
+
+void ggml_vec_softmax_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int64_t scale_over_ln2_q24,
+        int64_t output_unit_code,
+        int32_t output_zero_point,
+        const uint32_t * GGML_RESTRICT exp2_lut_q31) {
+    GGML_ASSERT(n > 0 && output != NULL && input != NULL && exp2_lut_q31 != NULL);
+    GGML_ASSERT(scale_over_ln2_q24 > 0 && output_unit_code > 0);
+    uint16_t maximum = input[0];
+    for (int index = 1; index < n; ++index) {
+        maximum = MAX(maximum, input[index]);
+    }
+    if ((output_unit_code == UINT16_MAX ||
+         output_unit_code == (int64_t) UINT16_MAX + 1) &&
+        output_zero_point == 0) {
+        const uint16_t exponent_multiplier_q22 =
+            (uint16_t) (scale_over_ln2_q24 >> 2);
+        GGML_ASSERT(exponent_multiplier_q22 > 0);
+        uint32_t exponential_sum = 0;
+        for (int index = 0; index < n; ++index) {
+            output[index] = ggml_u16_softmax_exp_htp(
+                (uint32_t) maximum - input[index],
+                exponent_multiplier_q22);
+            exponential_sum += output[index];
+        }
+        int32_t final_right_shift = 0;
+        const uint16_t reciprocal = ggml_u16_softmax_reciprocal_htp(
+            exponential_sum, &final_right_shift);
+        GGML_ASSERT(final_right_shift >= 0 && final_right_shift < 32);
+        for (int index = 0; index < n; ++index) {
+            output[index] = (uint16_t) MIN(UINT16_MAX,
+                ((uint32_t) output[index] * reciprocal) >> final_right_shift);
+        }
+        return;
+    }
+    uint64_t sum = 0;
+    if (n <= 4096) {
+        uint32_t exponentials[n];
+        for (int index = 0; index < n; ++index) {
+            exponentials[index] = ggml_u16_softmax_exp_q31(
+                (uint32_t) maximum - input[index],
+                scale_over_ln2_q24, exp2_lut_q31);
+            sum += exponentials[index];
+        }
+        GGML_ASSERT(sum > 0);
+        const uint64_t reciprocal_q64 = (uint64_t) (
+            ((ggml_uint128_t) 1 << 64) / sum);
+        for (int index = 0; index < n; ++index) {
+            const uint64_t numerator = (uint64_t) exponentials[index] *
+                (uint64_t) output_unit_code;
+            const int64_t centered = (int64_t)
+                ggml_u64_divide_reciprocal_exact(
+                    numerator, sum, reciprocal_q64);
+            output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                centered + output_zero_point));
+        }
+        return;
+    }
+    for (int index = 0; index < n; ++index) {
+        sum += ggml_u16_softmax_exp_q31(
+            (uint32_t) maximum - input[index],
+            scale_over_ln2_q24, exp2_lut_q31);
+    }
+    GGML_ASSERT(sum > 0);
+    const uint64_t reciprocal_q64 = (uint64_t) (
+        ((ggml_uint128_t) 1 << 64) / sum);
+    for (int index = 0; index < n; ++index) {
+        const uint64_t exponential = ggml_u16_softmax_exp_q31(
+            (uint32_t) maximum - input[index],
+            scale_over_ln2_q24, exp2_lut_q31);
+        const uint64_t numerator = exponential * (uint64_t) output_unit_code;
+        const int64_t centered = (int64_t)
+            ggml_u64_divide_reciprocal_exact(
+                numerator, sum, reciprocal_q64);
+        output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+            centered + output_zero_point));
+    }
+}
+
+static inline int64_t ggml_u16_square_sum_scalar(
+        const uint16_t * GGML_RESTRICT input,
+        int n,
+        int32_t input_zero_point) {
+    int64_t square_sum = 0;
+    for (int index = 0; index < n; ++index) {
+        const int64_t centered = (int32_t) input[index] - input_zero_point;
+        square_sum += centered * centered;
+    }
+    return square_sum;
+}
+
+#if defined(__ARM_NEON)
+static inline int64_t ggml_u16_square_sum_neon(
+        const uint16_t * GGML_RESTRICT input,
+        int n,
+        int32_t input_zero_point) {
+    const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+    int64_t square_sum = 0;
+    int index = 0;
+
+    for (; index + 4 <= n; index += 4) {
+        const int32x4_t centered = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))), input_zero);
+        const int64x2_t square_lo = vmull_s32(
+            vget_low_s32(centered), vget_low_s32(centered));
+        const int64x2_t square_hi = vmull_s32(
+            vget_high_s32(centered), vget_high_s32(centered));
+        square_sum += vgetq_lane_s64(square_lo, 0) + vgetq_lane_s64(square_lo, 1);
+        square_sum += vgetq_lane_s64(square_hi, 0) + vgetq_lane_s64(square_hi, 1);
+    }
+
+    return square_sum + ggml_u16_square_sum_scalar(
+        input + index, n - index, input_zero_point);
+}
+#endif
+
+void ggml_vec_rms_norm_affine_u16_qnn(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        float input_scale,
+        int32_t input_zero_point,
+        const uint16_t * GGML_RESTRICT weight,
+        float weight_scale,
+        int32_t weight_zero_point,
+        float epsilon,
+        float output_scale,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n > 0);
+    GGML_ASSERT(input_scale > 0.0f);
+    GGML_ASSERT(weight_scale > 0.0f);
+    GGML_ASSERT(epsilon >= 0.0f);
+    GGML_ASSERT(output_scale > 0.0f);
+
+#if defined(__ARM_NEON)
+    const int64_t square_sum = ggml_u16_square_sum_neon(
+        input, n, input_zero_point);
+#else
+    const int64_t square_sum = ggml_u16_square_sum_scalar(
+        input, n, input_zero_point);
+#endif
+    const double variance_in_codes = (double) square_sum / (double) n;
+    const double epsilon_in_codes = (double) epsilon /
+        ((double) input_scale * (double) input_scale);
+    const double inverse_rms = 1.0 / sqrt(variance_in_codes + epsilon_in_codes);
+    const int requant_shift = 20;
+    const int64_t multiplier = (int64_t) llround(ldexp(
+        ((double) weight_scale * inverse_rms) /
+            (double) output_scale, requant_shift));
+    GGML_ASSERT(multiplier >= INT32_MIN && multiplier <= INT32_MAX);
+    int index = 0;
+
+#if defined(__ARM_NEON)
+    {
+        const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+        const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+        for (; index + 4 <= n; index += 4) {
+            const int32x4_t input_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))), input_zero);
+            const int32x4_t weight_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(weight + index))), weight_zero);
+            const int64x2_t product_lo = vmull_s32(
+                vget_low_s32(input_values), vget_low_s32(weight_values));
+            const int64x2_t product_hi = vmull_s32(
+                vget_high_s32(input_values), vget_high_s32(weight_values));
+            const int64_t product0 = vgetq_lane_s64(product_lo, 0);
+            const int64_t product1 = vgetq_lane_s64(product_lo, 1);
+            const int64_t product2 = vgetq_lane_s64(product_hi, 0);
+            const int64_t product3 = vgetq_lane_s64(product_hi, 1);
+            output[index + 0] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(product0 * multiplier, requant_shift) + output_zero_point));
+            output[index + 1] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(product1 * multiplier, requant_shift) + output_zero_point));
+            output[index + 2] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(product2 * multiplier, requant_shift) + output_zero_point));
+            output[index + 3] = (uint16_t) MAX(0, MIN(UINT16_MAX,
+                ggml_gptq2_32_round_shift_away_from_zero(product3 * multiplier, requant_shift) + output_zero_point));
+        }
+    }
+#endif
+
+    for (; index < n; ++index) {
+        const int64_t input_value = (int32_t) input[index] - input_zero_point;
+        const int64_t weight_value = (int32_t) weight[index] - weight_zero_point;
+        const int64_t quantized = ggml_gptq2_32_round_shift_away_from_zero(
+            input_value * weight_value * multiplier, requant_shift) + output_zero_point;
+        output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+    }
+}
+
+static uint64_t ggml_u128_isqrt(__uint128_t value) {
+    __uint128_t bit = ((__uint128_t) 1) << 126;
+    __uint128_t root = 0;
+    while (bit > value) bit >>= 2;
+    while (bit != 0) {
+        if (value >= root + bit) {
+            value -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    GGML_ASSERT(root <= UINT64_MAX);
+    return (uint64_t) root;
+}
+
+static int64_t ggml_i128_floor_shift(ggml_int128_t value, int shift) {
+    GGML_ASSERT(shift > 0 && shift < 127);
+    const bool negative = value < 0;
+    const __uint128_t magnitude = negative
+        ? (__uint128_t) (-(value + 1)) + 1 : (__uint128_t) value;
+    const __uint128_t shifted = negative
+        ? (magnitude + (((__uint128_t) 1) << shift) - 1) >> shift
+        : magnitude >> shift;
+    GGML_ASSERT(shifted <= (negative
+        ? (__uint128_t) INT64_MAX + 1 : (__uint128_t) INT64_MAX));
+    if (negative && shifted == (__uint128_t) INT64_MAX + 1) {
+        return INT64_MIN;
+    }
+    return negative ? -(int64_t) shifted : (int64_t) shifted;
+}
+
+static inline uint16_t ggml_u16_rms_requant_fixed(
+        int64_t product,
+        uint64_t inverse_rms_q47,
+        int64_t weight_to_output_q31,
+        int32_t output_zero_point) {
+    // QNN HTP floors the fused RMS normalization and affine requantization.
+    // Retain the guarded Q47 inverse RMS through the fused product. Reducing it
+    // to Q31 first loses visible precision for low-amplitude Q/K vectors.
+    const int64_t quantized = ggml_i128_floor_shift(
+        (ggml_int128_t) product * inverse_rms_q47 * weight_to_output_q31,
+        78) + output_zero_point;
+    return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
+}
+
+void ggml_vec_rms_norm_affine_u16_qnn_fixed(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        const uint16_t * GGML_RESTRICT weight,
+        int32_t weight_zero_point,
+        uint64_t epsilon_in_codes_q16,
+        int64_t weight_to_output_q31,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n > 0);
+    GGML_ASSERT(weight_to_output_q31 >= 0);
+#if defined(__ARM_NEON)
+    const int64_t square_sum_signed = ggml_u16_square_sum_neon(input, n, input_zero_point);
+#else
+    const int64_t square_sum_signed = ggml_u16_square_sum_scalar(input, n, input_zero_point);
+#endif
+    const uint64_t square_sum = square_sum_signed > 0 ? (uint64_t) square_sum_signed : 0;
+    const __uint128_t denominator_q16 =
+        ((__uint128_t) square_sum << 16) +
+        (__uint128_t) epsilon_in_codes_q16 * (uint64_t) n;
+    GGML_ASSERT(denominator_q16 > 0);
+    // sqrt(n / denominator) in Q31, retaining 16 guard bits through isqrt.
+    const __uint128_t inverse_square_q94 =
+        (((__uint128_t) (uint64_t) n) << 110) / denominator_q16;
+    const uint64_t inverse_rms_q47 = ggml_u128_isqrt(inverse_square_q94);
+    int index = 0;
+#if defined(__ARM_NEON)
+    {
+        const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
+        const int32x4_t weight_zero = vdupq_n_s32(weight_zero_point);
+        for (; index + 4 <= n; index += 4) {
+            const int32x4_t input_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))), input_zero);
+            const int32x4_t weight_values = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vld1_u16(weight + index))), weight_zero);
+            const int64x2_t product_lo = vmull_s32(vget_low_s32(input_values), vget_low_s32(weight_values));
+            const int64x2_t product_hi = vmull_s32(vget_high_s32(input_values), vget_high_s32(weight_values));
+            output[index + 0] = ggml_u16_rms_requant_fixed(vgetq_lane_s64(product_lo, 0), inverse_rms_q47, weight_to_output_q31, output_zero_point);
+            output[index + 1] = ggml_u16_rms_requant_fixed(vgetq_lane_s64(product_lo, 1), inverse_rms_q47, weight_to_output_q31, output_zero_point);
+            output[index + 2] = ggml_u16_rms_requant_fixed(vgetq_lane_s64(product_hi, 0), inverse_rms_q47, weight_to_output_q31, output_zero_point);
+            output[index + 3] = ggml_u16_rms_requant_fixed(vgetq_lane_s64(product_hi, 1), inverse_rms_q47, weight_to_output_q31, output_zero_point);
+        }
+    }
+#endif
+    for (; index < n; ++index) {
+        const int64_t input_value =
+            (int32_t) input[index] - input_zero_point;
+        const int64_t weight_value =
+            (int32_t) weight[index] - weight_zero_point;
+        const int64_t product = input_value * weight_value;
+        output[index] = ggml_u16_rms_requant_fixed(product, inverse_rms_q47, weight_to_output_q31, output_zero_point);
+    }
 }
 
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

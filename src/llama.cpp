@@ -9,10 +9,12 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-qnn-quant-profile.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-cpu/quants.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -33,6 +35,66 @@
 //
 // interface implementation
 //
+
+static ggml_tensor * llama_qnn_linear_weight(
+        llama_model_base & model,
+        const llama_qnn_linear_qparams & qparams) {
+    GGML_ASSERT(qparams.layer_id >= 0 &&
+        qparams.layer_id < static_cast<int32_t>(model.layers.size()));
+    llama_layer & layer = model.layers[qparams.layer_id];
+    if (qparams.projection == "self_attn.q_proj") return layer.wq;
+    if (qparams.projection == "self_attn.k_proj") return layer.wk;
+    if (qparams.projection == "self_attn.v_proj") return layer.wv;
+    if (qparams.projection == "self_attn.o_proj") return layer.wo;
+    if (qparams.projection == "mlp.gate_proj") return layer.ffn_gate;
+    if (qparams.projection == "mlp.up_proj") return layer.ffn_up;
+    if (qparams.projection == "mlp.down_proj") return layer.ffn_down;
+    return nullptr;
+}
+
+static void llama_prepare_qnn_linear_block_metadata(llama_model_base & model) {
+    if (model.qnn_u16_profile == nullptr || model.hparams.no_alloc) {
+        return;
+    }
+    size_t prepared_blocks = 0;
+    for (llama_qnn_linear_qparams & qparams :
+            model.qnn_u16_profile->linear_qparams) {
+        ggml_tensor * weights = llama_qnn_linear_weight(model, qparams);
+        GGML_ASSERT(weights != nullptr && weights->data != nullptr);
+        int group_size = 0;
+        switch (weights->type) {
+            case GGML_TYPE_GPTQ2_32:  group_size = 32;  break;
+            case GGML_TYPE_GPTQ2_64:  group_size = 64;  break;
+            case GGML_TYPE_GPTQ2_128: group_size = 128; break;
+            default: GGML_ABORT(
+                "QNN U16 linear %s has unsupported weight type %s",
+                weights->name, ggml_type_name(weights->type));
+        }
+        GGML_ASSERT(weights->ne[0] % group_size == 0);
+        GGML_ASSERT(qparams.qnn_weight_blocks_per_row == weights->ne[0] / 32);
+        GGML_ASSERT(qparams.qnn_weight_block_scale_codes.size() ==
+            static_cast<size_t>(
+                weights->ne[1] * qparams.qnn_weight_blocks_per_row));
+        for (int64_t row = 0; row < weights->ne[1]; ++row) {
+            uint8_t * block_codes =
+                qparams.qnn_weight_block_scale_codes.data() +
+                row * qparams.qnn_weight_blocks_per_row;
+            const void * packed_weights =
+                static_cast<const char *>(weights->data) + row * weights->nb[1];
+            ggml_gptq2_prepare_qnn_block_codes(
+                static_cast<int>(weights->ne[0]),
+                block_codes,
+                packed_weights,
+                block_codes,
+                group_size);
+            prepared_blocks += qparams.qnn_weight_blocks_per_row;
+        }
+        qparams.qnn_weight_block_codes_prepared = true;
+    }
+    LLAMA_LOG_INFO(
+        "%s: prepared source zero-points in %zu existing QNN block metadata bytes\n",
+        __func__, prepared_blocks);
+}
 
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
     switch (flash_attn_type) {
@@ -310,6 +372,18 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        if (auto qnn_u16_profile = llama_qnn_quant_profile_load_from_environment()) {
+            model->qnn_u16_profile = std::move(qnn_u16_profile);
+            LLAMA_LOG_INFO(
+                "%s: loaded exact QNN U16 qparams: tensors=%zu linear_pairs=%zu operations=%zu source_bits=%d group_size=%d manifest=%s\n",
+                __func__,
+                model->qnn_u16_profile->u16_tensor_count(),
+                model->qnn_u16_profile->linear_qparams_count(),
+                model->qnn_u16_profile->operation_count(),
+                model->qnn_u16_profile->source_weight_bits,
+                model->qnn_u16_profile->source_group_size,
+                model->qnn_u16_profile->source_path.c_str());
+        }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
@@ -330,6 +404,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        llama_prepare_qnn_linear_block_metadata(*model);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
@@ -578,4 +653,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

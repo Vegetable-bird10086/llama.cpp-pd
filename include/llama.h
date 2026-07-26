@@ -155,7 +155,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_GPTQ2_32      = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_GPTQ2_32       = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_GPTQ2_64       = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_GPTQ2_128      = 43, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

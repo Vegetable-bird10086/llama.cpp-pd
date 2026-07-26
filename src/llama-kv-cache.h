@@ -112,7 +112,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   qnn_u8_layout = false);
 
     ~llama_kv_cache() = default;
 
@@ -231,6 +232,7 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    bool qnn_u8_layout = false; // K is dim-major, V is token-major, both raw U8
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

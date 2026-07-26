@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-qnn-u16.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2321,6 +2322,11 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_QWEN3 &&
+            model.get_qnn_u16_profile() != nullptr &&
+            llama_qnn_u16_activations_enabled()) {
+        return std::max<uint32_t>(16384u, 64u * model.n_tensors());
+    }
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }

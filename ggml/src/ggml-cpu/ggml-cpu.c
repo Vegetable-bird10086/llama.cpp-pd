@@ -406,8 +406,26 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_GPTQ2_64] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_gptq2_64_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_GPTQ2_128] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_gptq2_128_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    // U16 activations are produced and consumed by custom U16 graph
+    // operations. Do not provide a generic from_float conversion: that would
+    // silently introduce an unparameterized F32 activation path.
+    [GGML_TYPE_U16] = {
+        .from_float               = NULL,
     },
 };
 

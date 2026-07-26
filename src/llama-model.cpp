@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-qnn-u16.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2207,13 +2208,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        const bool qnn_u8_layout =
+                            arch == LLM_ARCH_QWEN3 &&
+                            qnn_u16_profile != nullptr &&
+                            llama_qnn_u16_activations_enabled();
+                        const ggml_type kv_type_k = qnn_u8_layout
+                            ? GGML_TYPE_I8 : params.type_k;
+                        const ggml_type kv_type_v = qnn_u8_layout
+                            ? GGML_TYPE_I8 : params.type_v;
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
+                                kv_type_k,
+                                kv_type_v,
+                                qnn_u8_layout ? false : !cparams.flash_attn,
+                                qnn_u8_layout ? false : cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
@@ -2223,7 +2233,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                qnn_u8_layout);
                     }
                 }
             }

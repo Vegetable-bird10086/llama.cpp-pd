@@ -631,6 +631,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(int16_t),
         .is_quantized             = false,
     },
+    [GGML_TYPE_U16] = {
+        .type_name                = "u16",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint16_t),
+        .is_quantized             = false,
+    },
     [GGML_TYPE_I32] = {
         .type_name                = "i32",
         .blck_size                = 1,
@@ -912,6 +918,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 12,
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_gptq2_32,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_GPTQ2_64] = {
+        .type_name                = "gptq2_64",
+        .blck_size                = 64,
+        .type_size                = 20,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gptq2_64,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_GPTQ2_128] = {
+        .type_name                = "gptq2_128",
+        .blck_size                = 128,
+        .type_size                = 36,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gptq2_128,
         .from_float_ref           = NULL,
     },
     [36] = { // GGML_TYPE_IQ4_NL_4_4
@@ -1435,6 +1457,8 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ3_S:         wtype = GGML_TYPE_IQ3_S;    break;
         case GGML_FTYPE_MOSTLY_IQ2_S:         wtype = GGML_TYPE_IQ2_S;    break;
         case GGML_FTYPE_MOSTLY_GPTQ2_32:      wtype = GGML_TYPE_GPTQ2_32; break;
+        case GGML_FTYPE_MOSTLY_GPTQ2_64:      wtype = GGML_TYPE_GPTQ2_64; break;
+        case GGML_FTYPE_MOSTLY_GPTQ2_128:     wtype = GGML_TYPE_GPTQ2_128; break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
     }
@@ -3916,7 +3940,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == a->type);
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));

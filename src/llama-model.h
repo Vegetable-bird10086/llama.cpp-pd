@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-qnn-quant-profile.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -589,6 +590,11 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // Optional exact QNN U16 activation qparams loaded from the prefill shard
+    // manifest. Block metadata is prepared once after GGUF tensor loading,
+    // then shared read-only by every decode context.
+    std::shared_ptr<llama_qnn_quant_profile> qnn_u16_profile;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -635,6 +641,10 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    const llama_qnn_quant_profile * get_qnn_u16_profile() const {
+        return qnn_u16_profile.get();
+    }
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

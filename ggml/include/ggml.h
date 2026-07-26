@@ -429,8 +429,14 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_GPTQ2_32 = 42, // GPTQ 2-bit asymmetric, fixed group_size=32
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_GPTQ2_32  = 42, // GPTQ 2-bit asymmetric, group_size=32
+        // Runtime-only unsigned activation storage for the opt-in QNN-aligned
+        // decode path. Keep it after all on-disk GGUF types so its value is
+        // never serialized as a model tensor type.
+        GGML_TYPE_GPTQ2_64  = 44, // GPTQ 2-bit asymmetric, group_size=64
+        GGML_TYPE_GPTQ2_128 = 45, // GPTQ 2-bit asymmetric, group_size=128
+        GGML_TYPE_U16       = 46,
+        GGML_TYPE_COUNT     = 47,
     };
 
     // precision
@@ -469,7 +475,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ3_S   = 20, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ2_S   = 21, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_XS  = 22, // except 1d tensors
-        GGML_FTYPE_MOSTLY_GPTQ2_32 = 41, // except 1d tensors
+        GGML_FTYPE_MOSTLY_GPTQ2_32  = 41, // except 1d tensors
+        GGML_FTYPE_MOSTLY_GPTQ2_64  = 42, // except 1d tensors
+        GGML_FTYPE_MOSTLY_GPTQ2_128 = 43, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors

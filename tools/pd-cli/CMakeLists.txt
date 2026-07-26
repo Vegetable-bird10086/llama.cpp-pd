@@ -3,6 +3,7 @@ set(TARGET llama-pd-cli)
 add_executable(${TARGET} pd_cli.cpp)
 target_include_directories(${TARGET} PRIVATE
     ${PROJECT_SOURCE_DIR}/common
+    ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/vendor/nlohmann
 )
 target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
