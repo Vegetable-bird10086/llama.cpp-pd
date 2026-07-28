@@ -1259,6 +1259,8 @@ void qnn_u16_mul_mat_compute(
         qparams->qnn_weight_block_codes_prepared &&
         source_group_size == 32) {
         thread_local std::vector<int32_t> activation_block_sums;
+        thread_local std::vector<uint8_t> activation_low;
+        thread_local std::vector<int8_t> activation_high;
         thread_local std::vector<uint8_t> gs32_row_scratch;
         activation_block_sums.resize(weights->ne[0] / 32);
         if (qparams->weights_gs32_source && rows % 8 != 0) {
@@ -1268,7 +1270,14 @@ void qnn_u16_mul_mat_compute(
         bool activations_fit_i16 = false;
         const int64_t row_groups = (rows + 7) / 8;
         const int64_t grouped_work_items = row_groups * vectors;
-        for (int64_t work = ith; work < grouped_work_items; work += nth) {
+        const int64_t work_begin = vectors == 1
+            ? grouped_work_items * ith / nth
+            : ith;
+        const int64_t work_end = vectors == 1
+            ? grouped_work_items * (ith + 1) / nth
+            : grouped_work_items;
+        const int64_t work_stride = vectors == 1 ? 1 : nth;
+        for (int64_t work = work_begin; work < work_end; work += work_stride) {
             const int64_t vector = work / row_groups;
             const int64_t row = (work - vector * row_groups) * 8;
             const int64_t i1 = vector % input->ne[1];
@@ -1292,6 +1301,15 @@ void qnn_u16_mul_mat_compute(
                     }
                     activation_block_sums[block] = sum;
                 }
+                if (activations_fit_i16 && qparams->weights_gs32_source &&
+                    ggml_gptq2_32_gs32_dotprod_enabled()) {
+                    activation_low.resize(weights->ne[0]);
+                    activation_high.resize(weights->ne[0]);
+                    ggml_gptq2_32_prepare_u16_dotprod_activation(
+                        static_cast<int>(weights->ne[0]), activation,
+                        qparams->input.zero_point,
+                        activation_low.data(), activation_high.data());
+                }
                 cached_vector = vector;
             }
             auto * output = reinterpret_cast<uint16_t *>(
@@ -1305,6 +1323,8 @@ void qnn_u16_mul_mat_compute(
                 ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                     static_cast<int>(weights->ne[0]), output,
                     weights->data, row, activation,
+                    activations_fit_i16 ? activation_low.data() : nullptr,
+                    activations_fit_i16 ? activation_high.data() : nullptr,
                     activation_block_sums.data(), activations_fit_i16,
                     qparams->qnn_weight_block_scale_codes.data() +
                         row * qparams->qnn_weight_blocks_per_row,

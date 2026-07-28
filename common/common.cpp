@@ -11,11 +11,13 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1209,7 +1211,38 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    llama_model * model = nullptr;
+#if !defined(_WIN32)
+    if (params.model.path.rfind("fd:", 0) == 0) {
+        const char * value = params.model.path.c_str() + 3;
+        char * end = nullptr;
+        errno = 0;
+        const long inherited_fd = std::strtol(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' ||
+            inherited_fd < 0 || inherited_fd > INT_MAX) {
+            COM_ERR("invalid inherited model fd: %s\n", params.model.path.c_str());
+            return;
+        }
+        const int model_fd = dup(static_cast<int>(inherited_fd));
+        if (model_fd < 0) {
+            COM_ERR("failed to duplicate inherited model fd %ld: %s\n",
+                    inherited_fd, std::strerror(errno));
+            return;
+        }
+        FILE * model_file = fdopen(model_fd, "rb");
+        if (model_file == nullptr) {
+            COM_ERR("failed to open inherited model fd %ld: %s\n",
+                    inherited_fd, std::strerror(errno));
+            close(model_fd);
+            return;
+        }
+        model = llama_model_load_from_file_ptr(model_file, mparams);
+        fclose(model_file);
+    } else
+#endif
+    {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     if (model == NULL) {
         return;
     }

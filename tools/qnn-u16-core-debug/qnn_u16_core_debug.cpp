@@ -1925,6 +1925,12 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
                         }
                         uint16_t row_major_output[8];
                         uint16_t gs32_output[8];
+                        std::vector<uint8_t> activation_low(tensor->ne[0]);
+                        std::vector<int8_t> activation_high(tensor->ne[0]);
+                        ggml_gptq2_32_prepare_u16_dotprod_activation(
+                            static_cast<int>(tensor->ne[0]), activations.data(),
+                            qparams.input.zero_point,
+                            activation_low.data(), activation_high.data());
                         ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
                             static_cast<int>(tensor->ne[0]), row_major_output,
                             tile.data(), row_bytes, activations.data(),
@@ -1936,6 +1942,7 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
                         ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                             static_cast<int>(tensor->ne[0]), gs32_output,
                             gs32_row_block.data(), 0, activations.data(),
+                            activation_low.data(), activation_high.data(),
                             activation_sums.data(), activations_fit_i16,
                             prepared.data(), blocks,
                             qparams.qnn_channel_scale_to_output_q31.data() + row,
@@ -3566,7 +3573,7 @@ int run_u16_source_group_kernel_test(size_t group_size) {
     return match ? 0 : 9;
 }
 
-int run_gptq2_u16_gemv_4row_test() {
+int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
     constexpr int input_size = 2048;
     constexpr int output_size = 4096;
     constexpr int blocks = input_size / 32;
@@ -3699,6 +3706,8 @@ int run_gptq2_u16_gemv_4row_test() {
         }
         activation_block_sums[block] = sum;
     }
+    std::vector<uint8_t> activation_low(input_size);
+    std::vector<int8_t> activation_high(input_size);
 
     const auto run_scalar = [&]() {
         for (int row = 0; row < output_size; ++row) {
@@ -3740,10 +3749,14 @@ int run_gptq2_u16_gemv_4row_test() {
         }
     };
     const auto run_gs32_8rows = [&]() {
+        ggml_gptq2_32_prepare_u16_dotprod_activation(
+            input_size, activations.data(), activation_zero_point,
+            activation_low.data(), activation_high.data());
         for (int row = 0; row < output_size; row += 8) {
             ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                 input_size, row8_outputs.data() + row,
                 gs32_weights.data(), row, activations.data(),
+                activation_low.data(), activation_high.data(),
                 activation_block_sums.data(), activations_fit_i16,
                 tiled_metadata.data() + row * metadata_row_stride,
                 0, channel_scales.data() + row,
@@ -3783,6 +3796,115 @@ int run_gptq2_u16_gemv_4row_test() {
                 input_size, q8_k_activations.data(), input_size, 1);
         }
     };
+
+    if (multithread_test_threads > 0) {
+        run_gs32_8rows();
+        const std::vector<uint16_t> reference_outputs = row8_outputs;
+
+        llama_qnn_linear_qparams qparams;
+        qparams.projection = "self_attn.q_proj";
+        qparams.input.scale = 2.0f;
+        qparams.input.zero_point = activation_zero_point;
+        qparams.output.scale = 1.0f;
+        qparams.output.zero_point = output_zero_point;
+        qparams.activation_to_output_q20 = 1;
+        qparams.qnn_weight_block_size = 32;
+        qparams.qnn_weight_blocks_per_row = blocks;
+        qparams.qnn_channel_scale_to_output_q31 = channel_scales;
+        qparams.qnn_weight_block_scale_codes = tiled_metadata;
+        qparams.qnn_prepared_weight_sums = prepared_weight_sums;
+        qparams.qnn_weight_block_codes_prepared = true;
+        qparams.weights_gs32_source = true;
+        qparams.qnn_weight_block_code_layout =
+            LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR;
+
+        ggml_init_params graph_params {
+            /* .mem_size = */ ggml_tensor_overhead() * 16 +
+                ggml_graph_overhead_custom(8, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * graph_ctx = ggml_init(graph_params);
+        if (graph_ctx == nullptr) {
+            return 18;
+        }
+        ggml_tensor * graph_weights = ggml_new_tensor_2d(
+            graph_ctx, GGML_TYPE_GPTQ2_32, input_size, output_size);
+        ggml_backend_buffer_t weight_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(
+                graph_ctx, ggml_backend_cpu_buffer_type());
+        if (weight_buffer == nullptr) {
+            ggml_free(graph_ctx);
+            return 19;
+        }
+        ggml_backend_tensor_set(
+            graph_weights, gs32_weights.data(), 0, gs32_weights.size());
+
+        ggml_tensor * graph_input =
+            ggml_new_tensor_2d(graph_ctx, GGML_TYPE_U16, input_size, 1);
+        ggml_tensor * graph_output = llama_qnn_u16_mul_mat(
+            graph_ctx, graph_weights, graph_input, &qparams);
+        ggml_backend_buffer_t compute_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(
+                graph_ctx, ggml_backend_cpu_buffer_type());
+        if (compute_buffer == nullptr) {
+            ggml_backend_buffer_free(weight_buffer);
+            ggml_free(graph_ctx);
+            return 20;
+        }
+        ggml_backend_tensor_set(
+            graph_input, activations.data(), 0,
+            activations.size() * sizeof(activations[0]));
+
+        ggml_cgraph * graph = ggml_new_graph_custom(graph_ctx, 8, false);
+        ggml_build_forward_expand(graph, graph_output);
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        ggml_threadpool_params threadpool_params =
+            ggml_threadpool_params_default(multithread_test_threads);
+        ggml_threadpool * threadpool = ggml_threadpool_new(&threadpool_params);
+        ggml_backend_cpu_set_n_threads(backend, multithread_test_threads);
+        ggml_backend_cpu_set_threadpool(backend, threadpool);
+
+        const ggml_status warmup_status =
+            ggml_backend_graph_compute(backend, graph);
+        std::array<double, 4> elapsed_ms {};
+        ggml_status status = warmup_status;
+        for (int iteration = 0; iteration < 4 && status == GGML_STATUS_SUCCESS;
+             ++iteration) {
+            const auto start = std::chrono::steady_clock::now();
+            status = ggml_backend_graph_compute(backend, graph);
+            elapsed_ms[iteration] =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+        }
+        std::vector<uint16_t> graph_outputs(output_size);
+        ggml_backend_tensor_get(
+            graph_output, graph_outputs.data(), 0,
+            graph_outputs.size() * sizeof(graph_outputs[0]));
+        const bool graph_exact = graph_outputs == reference_outputs;
+        uint64_t graph_checksum = 0;
+        for (int row = 0; row < output_size; row += 127) {
+            graph_checksum += graph_outputs[row];
+        }
+        const double average_ms =
+            (elapsed_ms[0] + elapsed_ms[1] + elapsed_ms[2] + elapsed_ms[3]) /
+            elapsed_ms.size();
+        std::printf(
+            "qnn-gptq2-u16-gemv-mt-test: input=%d output=%d threads=%d "
+            "iterations=4 times_ms=%.6f,%.6f,%.6f,%.6f average_ms=%.6f "
+            "exact=%d checksum=%llu\n",
+            input_size, output_size, multithread_test_threads,
+            elapsed_ms[0], elapsed_ms[1], elapsed_ms[2], elapsed_ms[3],
+            average_ms, graph_exact ? 1 : 0,
+            static_cast<unsigned long long>(graph_checksum));
+
+        ggml_backend_free(backend);
+        ggml_threadpool_free(threadpool);
+        ggml_backend_buffer_free(compute_buffer);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(graph_ctx);
+        return status == GGML_STATUS_SUCCESS && graph_exact ? 0 : 21;
+    }
 
     run_scalar();
     run_4rows();
@@ -6895,6 +7017,7 @@ void print_usage(const char * program) {
         "usage: GGML_QNN_U16_ACTIVATIONS=1 %s --self-test "
         "--backend=scalar|neon|compare\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-test\n"
+        "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-mt-test [threads]\n"
         "       %s --lm-head-gemv-test <q8_0|q6_k> [threads] [rows]\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --graph-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gguf-test <model.gguf> "
@@ -6947,12 +7070,29 @@ void print_usage(const char * program) {
         program,
         program,
         program,
+        program,
         program);
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc >= 2 && argc <= 3 &&
+        std::string_view(argv[1]) == "--gptq2-gemv-mt-test") {
+        if (!u16_activations_enabled()) {
+            std::fprintf(
+                stderr,
+                "U16 activation core is disabled; set "
+                "GGML_QNN_U16_ACTIVATIONS=1 explicitly.\n");
+            return 2;
+        }
+        if (!initialize_ggml_cpu_backend()) {
+            std::fprintf(stderr, "failed to initialize GGML CPU backend.\n");
+            return 6;
+        }
+        const int threads = argc == 3 ? std::stoi(argv[2]) : 6;
+        return run_gptq2_u16_gemv_4row_test(threads);
+    }
     if (argc >= 3 && argc <= 5 &&
         std::string_view(argv[1]) == "--lm-head-gemv-test") {
         const std::string_view type(argv[2]);

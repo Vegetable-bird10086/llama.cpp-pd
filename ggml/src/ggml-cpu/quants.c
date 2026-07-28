@@ -985,10 +985,14 @@ static inline void ggml_gptq2_32_dot_s16_neon_gs32_8rows(
 #if defined(__clang__)
 __attribute__((target("dotprod")))
 static inline void ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
-        int16x8_t activation0,
-        int16x8_t activation1,
-        int16x8_t activation2,
-        int16x8_t activation3,
+        uint8x8_t activation_low0,
+        uint8x8_t activation_low1,
+        uint8x8_t activation_low2,
+        uint8x8_t activation_low3,
+        int8x8_t activation_high0,
+        int8x8_t activation_high1,
+        int8x8_t activation_high2,
+        int8x8_t activation_high3,
         uint8x16_t packed_pair0,
         uint8x16_t packed_pair1,
         uint8x16_t packed_pair2,
@@ -1002,66 +1006,62 @@ static inline void ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
     int32x4_t high47 = vdupq_n_s32(0);
 
 #define GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE( \
-        CODE0, CODE1, CODE2, CODE3, ACTIVATION) do { \
+        CODE0, CODE1, CODE2, CODE3, ACTIVATION_LOW, ACTIVATION_HIGH) do { \
             const uint16x8x2_t codes01 = vzipq_u16( \
                 vreinterpretq_u16_u8((CODE0)), \
                 vreinterpretq_u16_u8((CODE1))); \
             const uint16x8x2_t codes23 = vzipq_u16( \
                 vreinterpretq_u16_u8((CODE2)), \
                 vreinterpretq_u16_u8((CODE3))); \
-            const uint8x8_t activation_low = vmovn_u16( \
-                vreinterpretq_u16_s16((ACTIVATION))); \
-            const int8x8_t activation_high = \
-                vshrn_n_s16((ACTIVATION), 8); \
             low03 = vdotq_lane_u32( \
                 low03, vreinterpretq_u8_u16(codes01.val[0]), \
-                activation_low, 0); \
+                (ACTIVATION_LOW), 0); \
             low47 = vdotq_lane_u32( \
                 low47, vreinterpretq_u8_u16(codes01.val[1]), \
-                activation_low, 0); \
+                (ACTIVATION_LOW), 0); \
             high03 = vdotq_lane_s32( \
                 high03, vreinterpretq_s8_u16(codes01.val[0]), \
-                activation_high, 0); \
+                (ACTIVATION_HIGH), 0); \
             high47 = vdotq_lane_s32( \
                 high47, vreinterpretq_s8_u16(codes01.val[1]), \
-                activation_high, 0); \
+                (ACTIVATION_HIGH), 0); \
             low03 = vdotq_lane_u32( \
                 low03, vreinterpretq_u8_u16(codes23.val[0]), \
-                activation_low, 1); \
+                (ACTIVATION_LOW), 1); \
             low47 = vdotq_lane_u32( \
                 low47, vreinterpretq_u8_u16(codes23.val[1]), \
-                activation_low, 1); \
+                (ACTIVATION_LOW), 1); \
             high03 = vdotq_lane_s32( \
                 high03, vreinterpretq_s8_u16(codes23.val[0]), \
-                activation_high, 1); \
+                (ACTIVATION_HIGH), 1); \
             high47 = vdotq_lane_s32( \
                 high47, vreinterpretq_s8_u16(codes23.val[1]), \
-                activation_high, 1); \
+                (ACTIVATION_HIGH), 1); \
         } while (0)
     GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE(
         vandq_u8(packed_pair0, mask),
         vandq_u8(packed_pair1, mask),
         vandq_u8(packed_pair2, mask),
         vandq_u8(packed_pair3, mask),
-        activation0);
+        activation_low0, activation_high0);
     GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE(
         vandq_u8(vshrq_n_u8(packed_pair0, 2), mask),
         vandq_u8(vshrq_n_u8(packed_pair1, 2), mask),
         vandq_u8(vshrq_n_u8(packed_pair2, 2), mask),
         vandq_u8(vshrq_n_u8(packed_pair3, 2), mask),
-        activation1);
+        activation_low1, activation_high1);
     GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE(
         vandq_u8(vshrq_n_u8(packed_pair0, 4), mask),
         vandq_u8(vshrq_n_u8(packed_pair1, 4), mask),
         vandq_u8(vshrq_n_u8(packed_pair2, 4), mask),
         vandq_u8(vshrq_n_u8(packed_pair3, 4), mask),
-        activation2);
+        activation_low2, activation_high2);
     GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE(
         vshrq_n_u8(packed_pair0, 6),
         vshrq_n_u8(packed_pair1, 6),
         vshrq_n_u8(packed_pair2, 6),
         vshrq_n_u8(packed_pair3, 6),
-        activation3);
+        activation_low3, activation_high3);
 #undef GGML_GPTQ2_GS32_DOTPROD_ACCUMULATE
 
     *dot03 = vaddq_s32(
@@ -1076,7 +1076,8 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
         const uint8_t * GGML_RESTRICT tensor_source,
         size_t row_outer,
         size_t row_middle,
-        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT activation_low,
+        const int8_t * GGML_RESTRICT activation_high,
         const int32_t * GGML_RESTRICT activation_block_sums,
         const uint8_t * GGML_RESTRICT prepared_block_codes,
         size_t prepared_row_stride,
@@ -1090,25 +1091,18 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
         (((row_outer * 4 + 2) * 4 + row_middle) * 8) * 2;
     const size_t pair3_offset =
         (((row_outer * 4 + 3) * 4 + row_middle) * 8) * 2;
-    const uint16x8_t activation_zero =
-        vdupq_n_u16((uint16_t) activation_zero_point);
+    (void) activation_zero_point;
 
-#pragma clang loop unroll(disable)
+#pragma clang loop unroll_count(2)
     for (int block = 0; block < blocks; ++block) {
         const uint8_t * source_group =
             tensor_source + (size_t) block * 768;
-        const uint16x8x4_t activation_lanes =
-            vld4q_u16(activations + block * 32);
         int32x4_t dot03;
         int32x4_t dot47;
-        const int16x8_t activation0 = vreinterpretq_s16_u16(vsubq_u16(
-            activation_lanes.val[0], activation_zero));
-        const int16x8_t activation1 = vreinterpretq_s16_u16(vsubq_u16(
-            activation_lanes.val[1], activation_zero));
-        const int16x8_t activation2 = vreinterpretq_s16_u16(vsubq_u16(
-            activation_lanes.val[2], activation_zero));
-        const int16x8_t activation3 = vreinterpretq_s16_u16(vsubq_u16(
-            activation_lanes.val[3], activation_zero));
+        const uint8_t * const activation_low_block =
+            activation_low + block * 32;
+        const int8_t * const activation_high_block =
+            activation_high + block * 32;
         const uint8x16_t packed_pair0 =
             vld1q_u8(source_group + pair0_offset);
         const uint8x16_t packed_pair1 =
@@ -1118,7 +1112,14 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
         const uint8x16_t packed_pair3 =
             vld1q_u8(source_group + pair3_offset);
         ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
-            activation0, activation1, activation2, activation3,
+            vld1_u8(activation_low_block + 0),
+            vld1_u8(activation_low_block + 8),
+            vld1_u8(activation_low_block + 16),
+            vld1_u8(activation_low_block + 24),
+            vld1_s8(activation_high_block + 0),
+            vld1_s8(activation_high_block + 8),
+            vld1_s8(activation_high_block + 16),
+            vld1_s8(activation_high_block + 24),
             packed_pair0, packed_pair1, packed_pair2, packed_pair3,
             &dot03, &dot47);
 
@@ -1195,6 +1196,47 @@ static inline void ggml_gptq2_32_dot_u16_neon_4rows(
         dot0, dot1, dot2, dot3);
 }
 #endif
+
+void ggml_gptq2_32_prepare_u16_dotprod_activation(
+        int n,
+        const uint16_t * GGML_RESTRICT activations,
+        int32_t activation_zero_point,
+        uint8_t * GGML_RESTRICT activation_low,
+        int8_t * GGML_RESTRICT activation_high) {
+    GGML_ASSERT(n > 0 && n % 32 == 0);
+    GGML_ASSERT(activations != NULL);
+    GGML_ASSERT(activation_low != NULL && activation_high != NULL);
+
+    for (int block = 0; block < n / 32; ++block) {
+#if defined(__ARM_NEON)
+        const uint16x8x4_t lanes = vld4q_u16(activations + block * 32);
+        const uint16x8_t zero =
+            vdupq_n_u16((uint16_t) activation_zero_point);
+        for (int group = 0; group < 4; ++group) {
+            const int16x8_t centered = vreinterpretq_s16_u16(
+                vsubq_u16(lanes.val[group], zero));
+            vst1_u8(
+                activation_low + block * 32 + group * 8,
+                vmovn_u16(vreinterpretq_u16_s16(centered)));
+            vst1_s8(
+                activation_high + block * 32 + group * 8,
+                vshrn_n_s16(centered, 8));
+        }
+#else
+        for (int group = 0; group < 4; ++group) {
+            for (int lane = 0; lane < 8; ++lane) {
+                const int16_t centered = (int16_t) (
+                    (int32_t) activations[block * 32 + lane * 4 + group] -
+                    activation_zero_point);
+                activation_low[block * 32 + group * 8 + lane] =
+                    (uint8_t) centered;
+                activation_high[block * 32 + group * 8 + lane] =
+                    (int8_t) (centered >> 8);
+            }
+        }
+#endif
+    }
+}
 
 static void ggml_vec_dot_gptq2_u16_qnn(
         int n,
@@ -2247,6 +2289,8 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
         const void * GGML_RESTRICT gs32_weights,
         int64_t first_row,
         const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT activation_low,
+        const int8_t * GGML_RESTRICT activation_high,
         const int32_t * GGML_RESTRICT activation_block_sums,
         int activations_fit_i16,
         const uint8_t * GGML_RESTRICT prepared_block_codes,
@@ -2268,6 +2312,8 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
     GGML_ASSERT(first_row / 64 == (first_row + 7) / 64);
 #if !defined(__ARM_NEON)
     (void) activations_fit_i16;
+    (void) activation_low;
+    (void) activation_high;
 #endif
     (void) fractional_constant;
     (void) final_round_to_nearest;
@@ -2286,9 +2332,10 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
 
 #if defined(__ARM_NEON) && defined(__aarch64__) && defined(__clang__)
     if (activations_fit_i16 && ggml_gptq2_32_gs32_dotprod_enabled()) {
+        GGML_ASSERT(activation_low != NULL && activation_high != NULL);
         ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
             blocks, tensor_source, row_outer, row_middle,
-            activations, activation_block_sums,
+            activation_low, activation_high, activation_block_sums,
             prepared_block_codes, prepared_row_stride,
             activation_zero_point,
             centered_dots);
