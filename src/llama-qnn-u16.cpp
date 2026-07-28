@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -323,6 +324,14 @@ struct qnn_u16_softmax_params {
     int64_t output_unit_code;
     int32_t output_zero_point;
     const uint32_t * exp2_lut_q31;
+};
+
+struct qnn_u16_attention_softmax_params {
+    qnn_u16_unary_requant_params divide;
+    qnn_u16_unary_requant_params minimum;
+    qnn_u16_static_binary_params floor_add;
+    qnn_u16_select_params select;
+    qnn_u16_softmax_params softmax;
 };
 
 template <typename T>
@@ -828,6 +837,74 @@ void qnn_u16_softmax_compute(
     }
 }
 
+void qnn_u16_attention_softmax_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params =
+        static_cast<const qnn_u16_attention_softmax_params *>(userdata);
+    const ggml_tensor * score = dst->src[0];
+    const ggml_tensor * condition = dst->src[1];
+    GGML_ASSERT(params != nullptr && score != nullptr && condition != nullptr);
+    GGML_ASSERT(score->type == GGML_TYPE_U16 &&
+        condition->type == GGML_TYPE_I8 && dst->type == GGML_TYPE_U16);
+    GGML_ASSERT(ggml_are_same_shape(score, condition));
+    GGML_ASSERT(ggml_are_same_shape(score, dst));
+    GGML_ASSERT(score->ne[0] <= std::numeric_limits<int>::max());
+
+    const int n = static_cast<int>(score->ne[0]);
+    const int64_t rows = qnn_u16_rows(score);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint16_t * score_row = qnn_u16_row(score, row);
+        uint16_t * output = qnn_u16_row(dst, row);
+
+        ggml_vec_requant_u16_qnn_fixed(
+            n, output, score_row,
+            params->divide.input_zero_point,
+            params->divide.input_to_output_q20,
+            params->divide.output_zero_point);
+
+        uint16_t minimum = output[0];
+        for (int index = 1; index < n; ++index) {
+            minimum = std::min(minimum, output[index]);
+        }
+        uint16_t requantized_minimum;
+        ggml_vec_requant_u16_qnn_fixed(
+            1, &requantized_minimum, &minimum,
+            params->minimum.input_zero_point,
+            params->minimum.input_to_output_q20,
+            params->minimum.output_zero_point);
+
+        uint16_t mask_floor;
+        ggml_vec_add_affine_u16_qnn_fixed_scalar(
+            1, &mask_floor, &requantized_minimum,
+            params->floor_add.binary.lhs_multiplier,
+            params->floor_add.binary.lhs_zero_point,
+            params->floor_add.rhs_code,
+            params->floor_add.binary.rhs_multiplier,
+            params->floor_add.binary.rhs_zero_point,
+            params->floor_add.binary.output_zero_point);
+
+        ggml_vec_select_affine_u16_qnn_fixed(
+            n, output, qnn_u8_row(condition, row), output,
+            params->select.true_zero_point,
+            params->select.true_multiplier_q15,
+            params->select.true_right_shift,
+            &mask_floor, 0,
+            params->select.false_zero_point,
+            params->select.false_multiplier_q15,
+            params->select.false_right_shift,
+            params->select.output_zero_point);
+        ggml_vec_softmax_u16_qnn_fixed(
+            n, output, output,
+            params->softmax.scale_over_ln2_q24,
+            params->softmax.output_unit_code,
+            params->softmax.output_zero_point,
+            params->softmax.exp2_lut_q31);
+    }
+}
+
 void qnn_u16_mul_mat_compute(
         ggml_tensor * dst,
         int ith,
@@ -858,6 +935,11 @@ void qnn_u16_mul_mat_compute(
             static_cast<size_t>(rows));
         GGML_ASSERT(qparams->qnn_weight_block_scale_codes.size() ==
             static_cast<size_t>(rows * qparams->qnn_weight_blocks_per_row));
+        if (qparams->qnn_weight_block_codes_prepared &&
+            weights->type == GGML_TYPE_GPTQ2_32) {
+            GGML_ASSERT(qparams->qnn_prepared_weight_sums.size() ==
+                static_cast<size_t>(rows));
+        }
     }
     const bool use_blockwise_requant =
         has_qnn_block_scales &&
@@ -882,44 +964,120 @@ void qnn_u16_mul_mat_compute(
     if (has_qnn_block_scales &&
         qparams->qnn_weight_block_codes_prepared &&
         source_group_size == 32) {
-        const int64_t row_groups = (rows + 3) / 4;
+        thread_local std::vector<int32_t> activation_block_sums;
+        thread_local std::vector<uint8_t> gs32_row_scratch;
+        activation_block_sums.resize(weights->ne[0] / 32);
+        if (qparams->weights_gs32_source && rows % 8 != 0) {
+            gs32_row_scratch.resize(8 * weights->nb[1]);
+        }
+        int64_t cached_vector = -1;
+        bool activations_fit_i16 = false;
+        const int64_t row_groups = (rows + 7) / 8;
         const int64_t grouped_work_items = row_groups * vectors;
         for (int64_t work = ith; work < grouped_work_items; work += nth) {
             const int64_t vector = work / row_groups;
-            const int64_t row = (work - vector * row_groups) * 4;
+            const int64_t row = (work - vector * row_groups) * 8;
             const int64_t i1 = vector % input->ne[1];
             const int64_t i2 = (vector / input->ne[1]) % input->ne[2];
             const int64_t i3 = vector / (input->ne[1] * input->ne[2]);
             const auto * activation = reinterpret_cast<const uint16_t *>(
                 reinterpret_cast<const char *>(input->data) +
                 i1 * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+            if (vector != cached_vector) {
+                activations_fit_i16 = true;
+                for (int64_t block = 0; block < weights->ne[0] / 32; ++block) {
+                    int32_t sum = 0;
+                    for (int64_t lane = 0; lane < 32; ++lane) {
+                        const int32_t centered =
+                            static_cast<int32_t>(activation[block * 32 + lane]) -
+                            qparams->input.zero_point;
+                        sum += centered;
+                        activations_fit_i16 = activations_fit_i16 &&
+                            centered >= std::numeric_limits<int16_t>::min() &&
+                            centered <= std::numeric_limits<int16_t>::max();
+                    }
+                    activation_block_sums[block] = sum;
+                }
+                cached_vector = vector;
+            }
             auto * output = reinterpret_cast<uint16_t *>(
                 reinterpret_cast<char *>(dst->data) +
                 row * dst->nb[0] + i1 * dst->nb[1] +
                 i2 * dst->nb[2] + i3 * dst->nb[3]);
-
-            if (row + 4 <= rows) {
-                ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_4rows(
+            if (qparams->weights_gs32_source && row + 8 <= rows) {
+                const bool tiled_block_codes =
+                    qparams->qnn_weight_block_code_layout ==
+                        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR;
+                ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                     static_cast<int>(weights->ne[0]), output,
-                    reinterpret_cast<const char *>(weights->data) +
-                        row * weights->nb[1],
+                    weights->data, row, activation,
+                    activation_block_sums.data(), activations_fit_i16,
+                    qparams->qnn_weight_block_scale_codes.data() +
+                        row * qparams->qnn_weight_blocks_per_row,
+                    tiled_block_codes ? 0 :
+                        qparams->qnn_weight_blocks_per_row,
+                    qparams->qnn_channel_scale_to_output_q31.data() + row,
+                    qparams->qnn_prepared_weight_sums.data() + row,
+                    qparams->input.zero_point, qparams->output.zero_point,
+                    use_blockwise_requant ? 29 : 0,
+                    final_round_to_nearest, output_bias_q7);
+                continue;
+            }
+            const void * packed_row_group =
+                reinterpret_cast<const char *>(weights->data) +
+                    row * weights->nb[1];
+            if (qparams->weights_gs32_source) {
+                const int row_count =
+                    static_cast<int>(std::min<int64_t>(8, rows - row));
+                ggml_gptq2_32_gs32_restore_rows(
+                    static_cast<int>(weights->ne[0]), weights->data,
+                    row, row_count, gs32_row_scratch.data(), weights->nb[1]);
+                packed_row_group = gs32_row_scratch.data();
+            }
+
+            if (row + 8 <= rows) {
+                ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
+                    static_cast<int>(weights->ne[0]), output,
+                    packed_row_group,
                     weights->nb[1], activation,
+                    activation_block_sums.data(), activations_fit_i16,
                     qparams->qnn_weight_block_scale_codes.data() +
                         row * qparams->qnn_weight_blocks_per_row,
                     qparams->qnn_weight_blocks_per_row,
                     qparams->qnn_channel_scale_to_output_q31.data() + row,
+                    qparams->qnn_prepared_weight_sums.data() + row,
                     qparams->input.zero_point, qparams->output.zero_point,
                     use_blockwise_requant ? 29 : 0,
                     final_round_to_nearest, output_bias_q7);
                 continue;
             }
 
-            for (int64_t tail_row = row; tail_row < rows; ++tail_row) {
+            int64_t tail_start = row;
+            if (tail_start + 4 <= rows) {
+                ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_4rows(
+                    static_cast<int>(weights->ne[0]),
+                    output + (tail_start - row),
+                    reinterpret_cast<const char *>(packed_row_group) +
+                        (tail_start - row) * weights->nb[1],
+                    weights->nb[1], activation,
+                    activation_block_sums.data(), activations_fit_i16,
+                    qparams->qnn_weight_block_scale_codes.data() +
+                        tail_start * qparams->qnn_weight_blocks_per_row,
+                    qparams->qnn_weight_blocks_per_row,
+                    qparams->qnn_channel_scale_to_output_q31.data() + tail_start,
+                    qparams->qnn_prepared_weight_sums.data() + tail_start,
+                    qparams->input.zero_point, qparams->output.zero_point,
+                    use_blockwise_requant ? 29 : 0,
+                    final_round_to_nearest, output_bias_q7);
+                tail_start += 4;
+            }
+
+            for (int64_t tail_row = tail_start; tail_row < rows; ++tail_row) {
                 ggml_vec_dot_gptq2_u16_qnn_blockwise_affine(
                     static_cast<int>(weights->ne[0]),
                     output + (tail_row - row),
-                    reinterpret_cast<const char *>(weights->data) +
-                        tail_row * weights->nb[1],
+                    reinterpret_cast<const char *>(packed_row_group) +
+                        (tail_row - row) * weights->nb[1],
                     activation,
                     qparams->qnn_weight_block_scale_codes.data() +
                         tail_row * qparams->qnn_weight_blocks_per_row,
@@ -934,6 +1092,11 @@ void qnn_u16_mul_mat_compute(
     }
 
     const int64_t work_items = rows * vectors;
+    thread_local std::vector<uint8_t> gs32_single_row_scratch;
+    if (qparams->weights_gs32_source) {
+        GGML_ASSERT(weights->type == GGML_TYPE_GPTQ2_32);
+        gs32_single_row_scratch.resize(weights->nb[1]);
+    }
     for (int64_t work = ith; work < work_items; work += nth) {
         const int64_t vector = work / rows;
         const int64_t row = work - vector * rows;
@@ -943,8 +1106,16 @@ void qnn_u16_mul_mat_compute(
         const auto * activation = reinterpret_cast<const uint16_t *>(
             reinterpret_cast<const char *>(input->data) +
             i1 * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
-        const void * packed_weights =
-            reinterpret_cast<const char *>(weights->data) + row * weights->nb[1];
+        const void * packed_weights;
+        if (qparams->weights_gs32_source) {
+            ggml_gptq2_32_gs32_restore_rows(
+                static_cast<int>(weights->ne[0]), weights->data,
+                row, 1, gs32_single_row_scratch.data(), weights->nb[1]);
+            packed_weights = gs32_single_row_scratch.data();
+        } else {
+            packed_weights =
+                reinterpret_cast<const char *>(weights->data) + row * weights->nb[1];
+        }
         auto * output = reinterpret_cast<uint16_t *>(
             reinterpret_cast<char *>(dst->data) +
             row * dst->nb[0] + i1 * dst->nb[1] +
@@ -1756,4 +1927,109 @@ ggml_tensor * llama_qnn_u16_softmax(
     return ggml_custom_4d(
         ctx, GGML_TYPE_U16, input->ne[0], input->ne[1], input->ne[2], input->ne[3],
         args, 1, qnn_u16_softmax_compute, GGML_N_TASKS_MAX, params);
+}
+
+ggml_tensor * llama_qnn_u16_attention_softmax(
+        ggml_context * ctx,
+        ggml_tensor * score,
+        ggml_tensor * condition,
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * divide_operation,
+        const llama_qnn_operation * minimum_operation,
+        const llama_qnn_operation * floor_add_operation,
+        const llama_qnn_operation * select_operation,
+        const llama_qnn_operation * softmax_operation) {
+    GGML_ASSERT(ctx != nullptr && score != nullptr && condition != nullptr);
+    GGML_ASSERT(profile != nullptr && divide_operation != nullptr);
+    GGML_ASSERT(minimum_operation != nullptr && floor_add_operation != nullptr);
+    GGML_ASSERT(select_operation != nullptr && softmax_operation != nullptr);
+    GGML_ASSERT(score->type == GGML_TYPE_U16 && condition->type == GGML_TYPE_I8);
+    GGML_ASSERT(ggml_are_same_shape(score, condition));
+    GGML_ASSERT(divide_operation->type_name == "ElementWiseDivide");
+    GGML_ASSERT(minimum_operation->type_name == "ReduceMin");
+    GGML_ASSERT(floor_add_operation->type_name == "ElementWiseAdd");
+    GGML_ASSERT(select_operation->type_name == "ElementWiseSelect");
+    GGML_ASSERT(softmax_operation->type_name == "Softmax");
+
+    const auto * divide_input =
+        require_u16_operand(profile, divide_operation, "input", 0);
+    const auto * divide_output =
+        require_u16_operand(profile, divide_operation, "output", 0);
+    const auto * minimum_input =
+        require_u16_operand(profile, minimum_operation, "input", 0);
+    const auto * minimum_output =
+        require_u16_operand(profile, minimum_operation, "output", 0);
+    const auto * floor_lhs =
+        require_u16_operand(profile, floor_add_operation, "input", 0);
+    const auto * floor_rhs =
+        require_u16_operand(profile, floor_add_operation, "input", 1);
+    const auto * floor_output =
+        require_u16_operand(profile, floor_add_operation, "output", 0);
+    const auto * select_true =
+        require_u16_operand(profile, select_operation, "input", 1);
+    const auto * select_false =
+        require_u16_operand(profile, select_operation, "input", 2);
+    const auto * select_output =
+        require_u16_operand(profile, select_operation, "output", 0);
+    const auto * softmax_output =
+        require_u16_operand(profile, softmax_operation, "output", 0);
+    GGML_ASSERT(divide_operation->unary_input_to_output_q20 > 0);
+    GGML_ASSERT(minimum_operation->unary_input_to_output_q20 > 0);
+    GGML_ASSERT(floor_add_operation->input_to_output_q20.size() >= 2);
+    GGML_ASSERT(floor_rhs->static_data.size() == 1);
+    GGML_ASSERT(softmax_operation->softmax_scale_over_ln2_q24 > 0);
+    GGML_ASSERT(softmax_operation->softmax_unit_code > 0);
+    GGML_ASSERT(softmax_operation->softmax_exp2_lut_q31.size() == 257);
+
+    const qnn_u16_scalefactor_q15 true_scalefactor =
+        qnn_u16_htp_scalefactor_q15(select_true, select_output);
+    const qnn_u16_scalefactor_q15 false_scalefactor =
+        qnn_u16_htp_scalefactor_q15(select_false, select_output);
+    const qnn_u16_attention_softmax_params value {
+        {
+            divide_input->qparams.scale_offsets[0].zero_point,
+            divide_operation->unary_input_to_output_q20,
+            divide_output->qparams.scale_offsets[0].zero_point,
+        },
+        {
+            minimum_input->qparams.scale_offsets[0].zero_point,
+            minimum_operation->unary_input_to_output_q20,
+            minimum_output->qparams.scale_offsets[0].zero_point,
+        },
+        {
+            {
+                floor_add_operation->input_to_output_q20[0],
+                floor_add_operation->input_to_output_q20[1],
+                floor_add_operation->product_requant_nudge_q31,
+                floor_lhs->qparams.scale_offsets[0].zero_point,
+                floor_rhs->qparams.scale_offsets[0].zero_point,
+                floor_output->qparams.scale_offsets[0].zero_point,
+                false,
+            },
+            floor_rhs->static_data[0],
+            0,
+            0,
+        },
+        {
+            select_true->qparams.scale_offsets[0].zero_point,
+            true_scalefactor.multiplier,
+            true_scalefactor.right_shift,
+            select_false->qparams.scale_offsets[0].zero_point,
+            false_scalefactor.multiplier,
+            false_scalefactor.right_shift,
+            select_output->qparams.scale_offsets[0].zero_point,
+        },
+        {
+            softmax_operation->softmax_scale_over_ln2_q24,
+            softmax_operation->softmax_unit_code,
+            softmax_output->qparams.scale_offsets[0].zero_point,
+            softmax_operation->softmax_exp2_lut_q31.data(),
+        },
+    };
+    auto * params = new_qnn_u16_params(ctx, value);
+    ggml_tensor * args[] = { score, condition };
+    return ggml_custom_4d(
+        ctx, GGML_TYPE_U16,
+        score->ne[0], score->ne[1], score->ne[2], score->ne[3],
+        args, 2, qnn_u16_attention_softmax_compute, GGML_N_TASKS_MAX, params);
 }

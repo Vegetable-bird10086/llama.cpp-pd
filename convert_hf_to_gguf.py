@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
     )
     parser.add_argument(
-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "gptq2_32", "auto"], default="auto",
-        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, gptq2_32 for fixed-layout GPTQ 2-bit group_size=32 weights, and auto for the highest-fidelity 16-bit float type",
+        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "gptq2_32", "gptq2_32_gs32", "auto"], default="auto",
+        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, gptq2_32 for fixed-layout GPTQ 2-bit group_size=32 weights, gptq2_32_gs32 for the offline QNN Prefill GS32 source layout, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -152,6 +152,16 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--gptq2-32-gs32-lm-head-type",
+        choices=["q8_0", "f16", "bf16"],
+        default="q8_0",
+        help=(
+            "LM-head storage type for tied-embedding gptq2_32_gs32 exports "
+            "(default: q8_0). F16/BF16 improve fidelity at substantially "
+            "higher model size and Decode RSS."
+        ),
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -209,6 +219,7 @@ def main() -> None:
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
         "gptq2_32": gguf.LlamaFileType.MOSTLY_GPTQ2_32,
+        "gptq2_32_gs32": gguf.LlamaFileType.MOSTLY_GPTQ2_32,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
@@ -234,6 +245,20 @@ def main() -> None:
 
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
+        lm_head_type_map = {
+            "q8_0": gguf.GGMLQuantizationType.Q8_0,
+            "f16": gguf.GGMLQuantizationType.F16,
+            "bf16": gguf.GGMLQuantizationType.BF16,
+        }
+        if (
+            args.gptq2_32_gs32_lm_head_type != "q8_0"
+            and args.outtype != "gptq2_32_gs32"
+        ):
+            logger.error(
+                "--gptq2-32-gs32-lm-head-type only applies to "
+                "--outtype gptq2_32_gs32"
+            )
+            sys.exit(1)
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
@@ -282,6 +307,10 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     gptq2_32_gs32_source=args.outtype == "gptq2_32_gs32",
+                                     gptq2_32_gs32_lm_head_type=lm_head_type_map[
+                                         args.gptq2_32_gs32_lm_head_type
+                                     ],
                                      )
 
         if args.vocab_only:

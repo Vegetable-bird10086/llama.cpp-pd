@@ -1484,7 +1484,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // The shared GS32 PD model deliberately keeps its large token embedding
+    // external. Do not MAP_POPULATE the GGUF: Decode supplies each embedding
+    // row from the shared SEMB file and the unused GGUF embedding pages must
+    // never become resident.
+    ml.init_mappings(
+        !ml.gptq2_32_gs32_source,
+        use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

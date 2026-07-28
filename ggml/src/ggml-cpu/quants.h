@@ -166,6 +166,24 @@ void ggml_gptq2_prepare_qnn_block_codes(
         const uint8_t * block_scale_codes,
         int group_size);
 
+// Materialize a small row window from the persistent gs32_source_v1 layout
+// into the ordinary row-major GPTQ2_32 block layout. This is intended for
+// per-thread Decode scratch, never for rewriting or duplicating a tensor.
+void ggml_gptq2_32_gs32_restore_rows(
+        int n,
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        int row_count,
+        void * GGML_RESTRICT row_major_weights,
+        size_t row_major_stride);
+
+// Sum of the prepared, block-scaled centered INT2 weights for one GS32 row.
+// This is independent of activations and should be computed once at model load.
+int64_t ggml_gptq2_32_qnn_prepared_weight_sum(
+        int n,
+        const void * GGML_RESTRICT packed_weights,
+        const uint8_t * GGML_RESTRICT prepared_block_codes);
+
 void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_prepared(
         int n,
         uint16_t * GGML_RESTRICT output,
@@ -236,9 +254,75 @@ void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_4rows(
         const void * GGML_RESTRICT packed_weights,
         size_t weight_row_stride,
         const uint16_t * GGML_RESTRICT activations,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        int activations_fit_i16,
         const uint8_t * GGML_RESTRICT prepared_block_codes,
         size_t prepared_row_stride,
         const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7);
+
+// Eight-row GS32 GEMV for decode. The block activation load and centering are
+// shared by two sequential four-row micro-kernels to avoid register spilling.
+void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
+        int n,
+        uint16_t * GGML_RESTRICT outputs,
+        const void * GGML_RESTRICT packed_weights,
+        size_t weight_row_stride,
+        const uint16_t * GGML_RESTRICT activations,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        int activations_fit_i16,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        size_t prepared_row_stride,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7);
+
+// Eight-row Decode GEMV that consumes gs32_source_v1 in place. Each source
+// group exposes four contiguous 16-byte qcode-pair tiles for the eight rows;
+// no row-major tensor or row window is materialized.
+int ggml_gptq2_32_gs32_dotprod_enabled(void);
+
+void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
+        int n,
+        uint16_t * GGML_RESTRICT outputs,
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        const uint16_t * GGML_RESTRICT activations,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        int activations_fit_i16,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        size_t prepared_row_stride,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7);
+
+// Sixteen-row experiment: four sequential four-row micro-kernels reuse one
+// centered activation block. The non-S16 path falls back to two 8-row calls.
+void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_16rows(
+        int n,
+        uint16_t * GGML_RESTRICT outputs,
+        const void * GGML_RESTRICT packed_weights,
+        size_t weight_row_stride,
+        const uint16_t * GGML_RESTRICT activations,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        int activations_fit_i16,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        size_t prepared_row_stride,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
         int32_t activation_zero_point,
         int32_t output_zero_point,
         int fractional_constant,

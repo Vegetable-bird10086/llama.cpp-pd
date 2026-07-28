@@ -122,7 +122,9 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 gptq2_32_gs32_source: bool = False,
+                 gptq2_32_gs32_lm_head_type: gguf.GGMLQuantizationType = gguf.GGMLQuantizationType.Q8_0):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -155,6 +157,8 @@ class ModelBase:
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
         self._gptq2_32_tensors: set[str] = set()
+        self._gptq2_32_gs32_source = gptq2_32_gs32_source
+        self._gptq2_32_gs32_lm_head_type = gptq2_32_gs32_lm_head_type
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -450,6 +454,19 @@ class ModelBase:
                 scale_bytes = scales.numpy().astype(np.float16).view(np.uint8).reshape(m, n_groups, 2)
                 zero_bias_bytes = (scales * zeros).numpy().astype(np.float16).view(np.uint8).reshape(m, n_groups, 2)
                 raw = np.concatenate((packed_codes, scale_bytes, zero_bias_bytes), axis=2).reshape(m, n_groups * 12)
+
+                if self._gptq2_32_gs32_source:
+                    assert m % 64 == 0
+                    blocks = raw.reshape(m // 64, 64, n_groups, 12)
+                    qbytes = blocks[:, :, :, :8].reshape(
+                        m // 64, 2, 4, 8, n_groups, 4, 2
+                    ).transpose(0, 4, 1, 5, 2, 3, 6).reshape(
+                        m // 64, n_groups, 512
+                    )
+                    metadata = blocks[:, :, :, 8:].transpose(0, 2, 1, 3).reshape(
+                        m // 64, n_groups, 256
+                    )
+                    raw = np.concatenate((qbytes, metadata), axis=2).reshape(m, n_groups * 12)
 
                 return torch.from_numpy(raw)
 
@@ -1044,7 +1061,7 @@ class ModelBase:
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_GPTQ2_32:
-                        if name in self._gptq2_32_tensors:
+                        if name in self._gptq2_32_tensors or new_name in self._gptq2_32_tensors:
                             data_qtype = gguf.GGMLQuantizationType.GPTQ2_32
                         elif old_dtype == torch.bfloat16:
                             data_qtype = gguf.GGMLQuantizationType.BF16
@@ -1113,6 +1130,8 @@ class ModelBase:
 
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+        if self._gptq2_32_gs32_source:
+            self.gguf_writer.add_string("general.gptq2_32.layout", "gs32_source_v1")
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")

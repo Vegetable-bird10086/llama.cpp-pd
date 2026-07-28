@@ -820,6 +820,19 @@ llama_model_loader::llama_model_loader(
         use_mmap = false;
     }
 
+    std::string gptq2_32_layout;
+    if (get_key("general.gptq2_32.layout", gptq2_32_layout, false)) {
+        if (gptq2_32_layout != "gs32_source_v1") {
+            throw std::runtime_error(format(
+                "unsupported general.gptq2_32.layout: %s",
+                gptq2_32_layout.c_str()));
+        }
+        gptq2_32_gs32_source = true;
+        LLAMA_LOG_INFO(
+            "%s: keeping gs32_source_v1 GPTQ2_32 tensors in their shared file-backed layout\n",
+            __func__);
+    }
+
     this->use_mmap = use_mmap;
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
@@ -1406,7 +1419,8 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
-    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+    if (check_tensors && !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32) &&
+        !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
     }
 }
@@ -1549,7 +1563,8 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
-            if (check_tensors) {
+            if (check_tensors &&
+                !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32)) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -1575,7 +1590,8 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
-                if (check_tensors) {
+                if (check_tensors &&
+                    !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32)) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
@@ -1639,7 +1655,9 @@ bool llama_model_loader::load_all_data(
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    if (check_tensors &&
+                        !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32) &&
+                        !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
                 }

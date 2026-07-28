@@ -7,25 +7,17 @@ For Android deployment, use the no-OpenMP build. The initial Android build
 that linked against `libomp.so` is not suitable for a minimal phone-side
 deployment because the runtime library must also be shipped.
 
-## Configure
-
-```bash
-cmake -S /root/autodl-tmp/llama.cpp \
-  -B /root/autodl-tmp/llama.cpp/build-android \
-  -DCMAKE_TOOLCHAIN_FILE=/root/autodl-tmp/android-ndk-r27d/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_BUILD_TESTS=OFF \
-  -DLLAMA_BUILD_SERVER=OFF \
-  -DGGML_OPENMP=OFF
-```
-
 ## Build
 
 ```bash
-cmake --build /root/autodl-tmp/llama.cpp/build-android -j 8 --target llama-completion
+export ANDROID_NDK_ROOT=/root/autodl-tmp/android-ndk-r27d
+/root/autodl-tmp/llama.cpp/scripts/build-android-pd.sh
 ```
+
+The build uses a portable ARMv8 baseline and verifies that the resulting CPU
+library contains the runtime-gated SDOT implementation. SDOT is enabled by
+default on supported CPUs. Set `GGML_GPTQ2_GS32_DOTPROD=0` only for an explicit
+fallback comparison.
 
 ## Push To Phone
 

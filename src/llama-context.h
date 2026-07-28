@@ -155,6 +155,13 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    bool state_seq_set_qnn_u8_kv(
+        llama_seq_id seq_id,
+        const uint8_t * kv,
+        uint32_t cell_count,
+        uint32_t num_layers,
+        uint32_t num_kv_heads,
+        uint32_t head_dim);
 
     bool state_load_file(
             const char * filepath,

@@ -856,9 +856,20 @@ extern "C" {
     //  - Zero: Failed to load
     LLAMA_API size_t llama_state_seq_set_data(
             struct llama_context * ctx,
-                   const uint8_t * src,
-                          size_t   size,
-                    llama_seq_id   dest_seq_id);
+                     const uint8_t * src,
+                              size_t   size,
+                        llama_seq_id   dest_seq_id);
+
+    // PD Decode fast path for an exact U8 KV handoff in
+    // [K_then_V][layer][kv_head][seq][head_dim] order.
+    LLAMA_API bool llama_state_seq_set_qnn_u8_kv(
+            struct llama_context * ctx,
+                     llama_seq_id   dest_seq_id,
+                     const uint8_t * kv,
+                           uint32_t   cell_count,
+                           uint32_t   num_layers,
+                           uint32_t   num_kv_heads,
+                           uint32_t   head_dim);
 
     LLAMA_API size_t llama_state_seq_save_file(
             struct llama_context * ctx,

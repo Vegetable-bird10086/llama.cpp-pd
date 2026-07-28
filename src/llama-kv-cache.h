@@ -162,6 +162,17 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // Import the Prefill handoff's exact U8 [layer, head, seq, dim] payload
+    // directly into the Decode cache, without constructing a serialized
+    // llama sequence-state blob.
+    bool import_qnn_u8(
+        const uint8_t * kv,
+        uint32_t cell_count,
+        uint32_t num_layers,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        llama_seq_id seq_id);
+
     //
     // graph_build API
     //

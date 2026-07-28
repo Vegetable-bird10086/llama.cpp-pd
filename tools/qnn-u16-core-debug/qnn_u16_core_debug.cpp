@@ -1464,6 +1464,32 @@ const char * projection_tensor_component(const std::string & projection) {
     return nullptr;
 }
 
+std::vector<uint8_t> qnn_linear_row_block_codes(
+        const llama_qnn_linear_qparams & qparams,
+        size_t row) {
+    const size_t blocks =
+        static_cast<size_t>(qparams.qnn_weight_blocks_per_row);
+    std::vector<uint8_t> result(blocks);
+    if (qparams.qnn_weight_block_code_layout ==
+        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR) {
+        const size_t tile = row / 8;
+        const size_t lane = row % 8;
+        for (size_t block = 0; block < blocks; ++block) {
+            result[block] =
+                qparams.qnn_weight_block_scale_codes[
+                    (tile * blocks + block) * 8 + lane] & 0x1f;
+        }
+    } else {
+        std::copy_n(
+            qparams.qnn_weight_block_scale_codes.begin() + row * blocks,
+            blocks, result.begin());
+        for (uint8_t & code : result) {
+            code &= 0x1f;
+        }
+    }
+    return result;
+}
+
 int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_path) {
     const auto profile = llama_qnn_quant_profile_load_file(profile_path);
     ggml_context * tensor_context = nullptr;
@@ -1484,9 +1510,14 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
         ggml_free(tensor_context);
         return 13;
     }
+    const int64_t layout_key = gguf_find_key(gguf, "general.gptq2_32.layout");
+    const bool weights_gs32_source =
+        layout_key >= 0 &&
+        std::string_view(gguf_get_val_str(gguf, layout_key)) == "gs32_source_v1";
 
     size_t checked = 0;
     size_t checked_pairs = 0;
+    size_t checked_gs32_tiles = 0;
     size_t exact = 0;
     size_t prepared_exact = 0;
     size_t saturated = 0;
@@ -1541,6 +1572,15 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
         }
         const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
         std::vector<uint8_t> packed(row_bytes);
+        std::vector<uint8_t> gs32_row_block;
+        if (weights_gs32_source) {
+            if (tensor->type != GGML_TYPE_GPTQ2_32 || tensor->ne[1] % 64 != 0) {
+                throw std::runtime_error(
+                    std::string("invalid gs32_source_v1 tensor geometry: ") +
+                    tensor_name);
+            }
+            gs32_row_block.resize(64 * row_bytes);
+        }
         std::vector<uint8_t> prepared_block_codes(
             static_cast<size_t>(qparams.qnn_weight_blocks_per_row));
         std::vector<uint16_t> activations(static_cast<size_t>(tensor->ne[0]));
@@ -1562,20 +1602,125 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         for (const int64_t row : rows) {
             file.clear();
-            file.seekg(
-                data_offset + static_cast<std::streamoff>(gguf_get_tensor_offset(gguf, tensor_id)) +
-                static_cast<std::streamoff>(row * row_bytes));
-            file.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size()));
-            if (!file || static_cast<size_t>(file.gcount()) != packed.size()) {
+            const std::streamoff tensor_data =
+                data_offset +
+                static_cast<std::streamoff>(gguf_get_tensor_offset(gguf, tensor_id));
+            if (weights_gs32_source) {
+                file.seekg(tensor_data + static_cast<std::streamoff>(
+                    (row / 64) * 64 * row_bytes));
+                file.read(
+                    reinterpret_cast<char *>(gs32_row_block.data()),
+                    static_cast<std::streamsize>(gs32_row_block.size()));
+                if (file &&
+                    static_cast<size_t>(file.gcount()) == gs32_row_block.size()) {
+                    ggml_gptq2_32_gs32_restore_rows(
+                        static_cast<int>(tensor->ne[0]), gs32_row_block.data(),
+                        row % 64, 1, packed.data(), row_bytes);
+                    if (row % 64 == 0) {
+                        std::vector<uint8_t> tile(8 * row_bytes);
+                        std::vector<uint8_t> single(row_bytes);
+                        ggml_gptq2_32_gs32_restore_rows(
+                            static_cast<int>(tensor->ne[0]),
+                            gs32_row_block.data(), 0, 8,
+                            tile.data(), row_bytes);
+                        for (int tile_row = 0; tile_row < 8; ++tile_row) {
+                            ggml_gptq2_32_gs32_restore_rows(
+                                static_cast<int>(tensor->ne[0]),
+                                gs32_row_block.data(), tile_row, 1,
+                                single.data(), row_bytes);
+                            if (std::memcmp(
+                                    tile.data() + tile_row * row_bytes,
+                                    single.data(), row_bytes) != 0) {
+                                throw std::runtime_error(
+                                    std::string("GS32 8-row tile mismatch: ") +
+                                    tensor_name);
+                            }
+                        }
+                        const size_t blocks =
+                            static_cast<size_t>(qparams.qnn_weight_blocks_per_row);
+                        std::vector<uint8_t> prepared(8 * blocks);
+                        std::vector<int64_t> weight_sums(8);
+                        std::vector<int32_t> activation_sums(blocks);
+                        bool activations_fit_i16 = true;
+                        for (size_t block = 0; block < blocks; ++block) {
+                            int32_t sum = 0;
+                            for (size_t lane = 0; lane < 32; ++lane) {
+                                const int32_t centered =
+                                    static_cast<int32_t>(
+                                        activations[block * 32 + lane]) -
+                                    qparams.input.zero_point;
+                                sum += centered;
+                                activations_fit_i16 =
+                                    activations_fit_i16 &&
+                                    centered >= std::numeric_limits<int16_t>::min() &&
+                                    centered <= std::numeric_limits<int16_t>::max();
+                            }
+                            activation_sums[block] = sum;
+                        }
+                        for (int tile_row = 0; tile_row < 8; ++tile_row) {
+                            uint8_t * row_prepared =
+                                prepared.data() + tile_row * blocks;
+                            const std::vector<uint8_t> row_codes =
+                                qnn_linear_row_block_codes(
+                                    qparams, row + tile_row);
+                            ggml_gptq2_prepare_qnn_block_codes(
+                                static_cast<int>(tensor->ne[0]), row_prepared,
+                                tile.data() + tile_row * row_bytes,
+                                row_codes.data(),
+                                32);
+                            weight_sums[tile_row] =
+                                ggml_gptq2_32_qnn_prepared_weight_sum(
+                                    static_cast<int>(tensor->ne[0]),
+                                    tile.data() + tile_row * row_bytes,
+                                    row_prepared);
+                        }
+                        uint16_t row_major_output[8];
+                        uint16_t gs32_output[8];
+                        ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
+                            static_cast<int>(tensor->ne[0]), row_major_output,
+                            tile.data(), row_bytes, activations.data(),
+                            activation_sums.data(), activations_fit_i16,
+                            prepared.data(), blocks,
+                            qparams.qnn_channel_scale_to_output_q31.data() + row,
+                            weight_sums.data(), qparams.input.zero_point,
+                            qparams.output.zero_point, 0, 0, 0);
+                        ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
+                            static_cast<int>(tensor->ne[0]), gs32_output,
+                            gs32_row_block.data(), 0, activations.data(),
+                            activation_sums.data(), activations_fit_i16,
+                            prepared.data(), blocks,
+                            qparams.qnn_channel_scale_to_output_q31.data() + row,
+                            weight_sums.data(), qparams.input.zero_point,
+                            qparams.output.zero_point, 0, 0, 0);
+                        if (std::memcmp(
+                                row_major_output, gs32_output,
+                                sizeof(row_major_output)) != 0) {
+                            throw std::runtime_error(
+                                std::string("GS32 direct GEMV mismatch: ") +
+                                tensor_name);
+                        }
+                        ++checked_gs32_tiles;
+                    }
+                }
+            } else {
+                file.seekg(tensor_data + static_cast<std::streamoff>(row * row_bytes));
+                file.read(
+                    reinterpret_cast<char *>(packed.data()),
+                    static_cast<std::streamsize>(packed.size()));
+            }
+            const size_t expected_read =
+                weights_gs32_source ? gs32_row_block.size() : packed.size();
+            if (!file || static_cast<size_t>(file.gcount()) != expected_read) {
                 std::fprintf(stderr, "failed to read packed row %lld for %s\n",
                     static_cast<long long>(row), tensor_name);
                 gguf_free(gguf);
                 ggml_free(tensor_context);
                 return 14;
             }
+            const std::vector<uint8_t> row_block_scale_codes =
+                qnn_linear_row_block_codes(qparams, row);
             const uint8_t * const block_scale_codes =
-                qparams.qnn_weight_block_scale_codes.data() +
-                row * qparams.qnn_weight_blocks_per_row;
+                row_block_scale_codes.data();
             const int64_t channel_scale_to_output_q31 =
                 qparams.qnn_channel_scale_to_output_q31[static_cast<size_t>(row)];
             const uint16_t reference = gptq2_u16_blockwise_scalar_reference(
@@ -1729,18 +1874,22 @@ int run_profile_gguf_linear_test(const char * profile_path, const char * gguf_pa
     const double mean_code_delta = checked == 0 ? 0.0 :
         static_cast<double>(total_code_delta) / static_cast<double>(checked);
     std::printf(
-        "qnn-profile-gguf-linear-test: pairs=%zu sampled_rows=%zu exact=%zu max_code_delta=%u "
+        "qnn-profile-gguf-linear-test: pairs=%zu sampled_rows=%zu gs32_tiles=%zu "
+        "exact=%zu max_code_delta=%u "
         "mean_code_delta=%.6f prepared_exact=%zu saturated=%zu source_bits=%d group_size=%d "
         "layer0_q_kernel_us=%.6f layer0_q_kernel_checksum=%llu "
         "layer0_q_prepared_kernel_us=%.6f layer0_q_prepared_kernel_checksum=%llu "
-        "activation_dequant_buffers=0 packed_int4_buffers=0 checksum=0x%016llx status=%s\n",
-        checked_pairs, checked, exact, max_code_delta, mean_code_delta,
+        "activation_dequant_buffers=0 packed_int4_buffers=0 layout=%s "
+        "checksum=0x%016llx status=%s\n",
+        checked_pairs, checked, checked_gs32_tiles,
+        exact, max_code_delta, mean_code_delta,
         prepared_exact, saturated,
         profile->source_weight_bits, profile->source_group_size,
         layer0_q_kernel_us,
         static_cast<unsigned long long>(layer0_q_kernel_checksum),
         layer0_q_prepared_kernel_us,
         static_cast<unsigned long long>(layer0_q_prepared_kernel_checksum),
+        weights_gs32_source ? "gs32_source_v1" : "row_major",
         static_cast<unsigned long long>(checksum),
         checked_pairs == profile->linear_qparams_count() &&
             prepared_exact == checked && max_code_delta <= 2 ? "pass" : "fail");
@@ -1970,8 +2119,9 @@ int run_profile_gguf_linear_vector_test(
             ggml_free(tensor_context);
             throw std::runtime_error("failed to read packed GGUF row " + std::to_string(row));
         }
-        const uint8_t * block_scale_codes =
-            qparams->qnn_weight_block_scale_codes.data() + row * qparams->qnn_weight_blocks_per_row;
+        const std::vector<uint8_t> row_block_scale_codes =
+            qnn_linear_row_block_codes(*qparams, row);
+        const uint8_t * block_scale_codes = row_block_scale_codes.data();
         const size_t source_code_bytes = static_cast<size_t>(group_size) / 4;
         const size_t source_block_bytes = source_code_bytes + 4;
         const uint8_t * source_row = packed.data();
@@ -3178,15 +3328,29 @@ int run_gptq2_u16_gemv_4row_test() {
     constexpr int fractional_constant = 29;
 
     std::vector<uint16_t> activations(input_size);
+    std::vector<float> activations_f32(input_size);
     std::vector<uint8_t> weights(output_size * weight_row_stride);
+    std::vector<uint8_t> gs32_weights(output_size * weight_row_stride);
     std::vector<uint8_t> metadata(output_size * metadata_row_stride);
     std::vector<int64_t> channel_scales(output_size);
+    std::vector<int64_t> prepared_weight_sums(output_size);
+    std::vector<int32_t> activation_block_sums(blocks);
     std::vector<uint16_t> scalar_outputs(output_size);
     std::vector<uint16_t> row4_outputs(output_size);
+    std::vector<uint16_t> row8_outputs(output_size);
+    std::vector<uint16_t> row16_outputs(output_size);
+    std::vector<float> f32_outputs(output_size);
+    constexpr int q2_k_blocks_per_row = input_size / QK_K;
+    std::vector<block_q2_K> q2_k_weights(
+        static_cast<size_t>(output_size) * q2_k_blocks_per_row);
+    std::vector<block_q8_K> q8_k_activations(input_size / QK_K);
+    std::vector<float> q2_k_outputs(output_size);
+    std::vector<float> q2_k_weight_row(input_size);
 
     for (int index = 0; index < input_size; ++index) {
         const int32_t centered = (index * 1229 + 811) % 8191 - 4095;
         activations[index] = static_cast<uint16_t>(activation_zero_point + centered);
+        activations_f32[index] = centered * 0.00025f;
     }
     for (int row = 0; row < output_size; ++row) {
         channel_scales[row] = 350000 + (row * 7919) % 900000;
@@ -3206,7 +3370,85 @@ int run_gptq2_u16_gemv_4row_test() {
             const uint8_t block_scale = static_cast<uint8_t>(1 + (row * 5 + block * 3) % 16);
             metadata[row * metadata_row_stride + block] =
                 static_cast<uint8_t>((zero_point << 5) | block_scale);
+            const ggml_fp16_t scale_fp16 =
+                ggml_fp32_to_fp16(0.001f * block_scale);
+            const ggml_fp16_t zero_fp16 =
+                ggml_fp32_to_fp16(0.001f * block_scale * zero_point);
+            std::memcpy(codes + 8, &scale_fp16, sizeof(scale_fp16));
+            std::memcpy(codes + 10, &zero_fp16, sizeof(zero_fp16));
         }
+        prepared_weight_sums[row] =
+            ggml_gptq2_32_qnn_prepared_weight_sum(
+                input_size,
+                weights.data() + row * weight_row_stride,
+                metadata.data() + row * metadata_row_stride);
+        for (int column = 0; column < input_size; ++column) {
+            q2_k_weight_row[column] =
+                0.015625f * static_cast<float>(
+                    ((row * 13 + column * 7 + (column / 32) * 3) & 0x3) - 2);
+        }
+        quantize_row_q2_K(
+            q2_k_weight_row.data(),
+            q2_k_weights.data() + static_cast<size_t>(row) * q2_k_blocks_per_row,
+            input_size);
+    }
+    quantize_row_q8_K(
+        activations_f32.data(), q8_k_activations.data(), input_size);
+
+    // Match gs32_source_v1 exactly: each 64-row/32-column source group keeps
+    // four 2-byte qcode pairs in row-interleaved 16-byte tiles, followed by
+    // the four metadata bytes for all 64 rows.
+    for (int row_block = 0; row_block < output_size / 64; ++row_block) {
+        uint8_t * gs32_row_block = gs32_weights.data() +
+            static_cast<size_t>(row_block) * 64 * weight_row_stride;
+        for (int block = 0; block < blocks; ++block) {
+            uint8_t * source_group =
+                gs32_row_block + static_cast<size_t>(block) * 768;
+            for (int row = 0; row < 64; ++row) {
+                const uint8_t * row_source = weights.data() +
+                    static_cast<size_t>(row_block * 64 + row) *
+                        weight_row_stride +
+                    static_cast<size_t>(block) * 12;
+                const size_t row_outer = static_cast<size_t>(row) / 32;
+                const size_t row_middle =
+                    (static_cast<size_t>(row) % 32) / 8;
+                const size_t row_inner = static_cast<size_t>(row) % 8;
+                for (size_t pair = 0; pair < 4; ++pair) {
+                    const size_t destination_offset =
+                        ((((row_outer * 4 + pair) * 4 + row_middle) * 8 +
+                            row_inner) * 2);
+                    std::memcpy(
+                        source_group + destination_offset,
+                        row_source + pair * 2, 2);
+                }
+                std::memcpy(source_group + 512 + row * 4, row_source + 8, 4);
+            }
+        }
+    }
+    std::vector<uint8_t> tiled_metadata(metadata.size());
+    for (int row = 0; row < output_size; ++row) {
+        const size_t tile = static_cast<size_t>(row) / 8;
+        const size_t lane = static_cast<size_t>(row) % 8;
+        for (int block = 0; block < blocks; ++block) {
+            tiled_metadata[
+                (tile * static_cast<size_t>(blocks) + block) * 8 + lane] =
+                metadata[
+                    static_cast<size_t>(row) * metadata_row_stride + block];
+        }
+    }
+    bool activations_fit_i16 = true;
+    for (int block = 0; block < blocks; ++block) {
+        int32_t sum = 0;
+        for (int lane = 0; lane < 32; ++lane) {
+            const int32_t centered =
+                static_cast<int32_t>(activations[block * 32 + lane]) -
+                activation_zero_point;
+            sum += centered;
+            activations_fit_i16 = activations_fit_i16 &&
+                centered >= std::numeric_limits<int16_t>::min() &&
+                centered <= std::numeric_limits<int16_t>::max();
+        }
+        activation_block_sums[block] = sum;
     }
 
     const auto run_scalar = [&]() {
@@ -3226,21 +3468,94 @@ int run_gptq2_u16_gemv_4row_test() {
                 input_size, row4_outputs.data() + row,
                 weights.data() + row * weight_row_stride,
                 weight_row_stride, activations.data(),
+                activation_block_sums.data(), activations_fit_i16,
                 metadata.data() + row * metadata_row_stride,
                 metadata_row_stride, channel_scales.data() + row,
+                prepared_weight_sums.data() + row,
                 activation_zero_point, output_zero_point,
                 fractional_constant, 0, 0);
+        }
+    };
+    const auto run_8rows = [&]() {
+        for (int row = 0; row < output_size; row += 8) {
+            ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
+                input_size, row8_outputs.data() + row,
+                weights.data() + row * weight_row_stride,
+                weight_row_stride, activations.data(),
+                activation_block_sums.data(), activations_fit_i16,
+                metadata.data() + row * metadata_row_stride,
+                metadata_row_stride, channel_scales.data() + row,
+                prepared_weight_sums.data() + row,
+                activation_zero_point, output_zero_point,
+                fractional_constant, 0, 0);
+        }
+    };
+    const auto run_gs32_8rows = [&]() {
+        for (int row = 0; row < output_size; row += 8) {
+            ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
+                input_size, row8_outputs.data() + row,
+                gs32_weights.data(), row, activations.data(),
+                activation_block_sums.data(), activations_fit_i16,
+                tiled_metadata.data() + row * metadata_row_stride,
+                0, channel_scales.data() + row,
+                prepared_weight_sums.data() + row,
+                activation_zero_point, output_zero_point,
+                fractional_constant, 0, 0);
+        }
+    };
+    const auto run_16rows = [&]() {
+        for (int row = 0; row < output_size; row += 16) {
+            ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_16rows(
+                input_size, row16_outputs.data() + row,
+                weights.data() + row * weight_row_stride,
+                weight_row_stride, activations.data(),
+                activation_block_sums.data(), activations_fit_i16,
+                metadata.data() + row * metadata_row_stride,
+                metadata_row_stride, channel_scales.data() + row,
+                prepared_weight_sums.data() + row,
+                activation_zero_point, output_zero_point,
+                fractional_constant, 0, 0);
+        }
+    };
+    const auto run_f32 = [&]() {
+        for (int row = 0; row < output_size; ++row) {
+            ggml_vec_dot_gptq2_32_f32(
+                input_size, f32_outputs.data() + row, sizeof(float),
+                weights.data() + row * weight_row_stride, input_size,
+                activations_f32.data(), input_size, 1);
+        }
+    };
+    const auto run_q2_k = [&]() {
+        for (int row = 0; row < output_size; ++row) {
+            ggml_vec_dot_q2_K_q8_K(
+                input_size, q2_k_outputs.data() + row, sizeof(float),
+                q2_k_weights.data() +
+                    static_cast<size_t>(row) * q2_k_blocks_per_row,
+                input_size, q8_k_activations.data(), input_size, 1);
         }
     };
 
     run_scalar();
     run_4rows();
-    const bool exact = scalar_outputs == row4_outputs;
-    constexpr int warmup = 2;
-    constexpr int iterations = 10;
+    run_8rows();
+    run_gs32_8rows();
+    run_16rows();
+    run_f32();
+    run_q2_k();
+    const bool fast_exact =
+        scalar_outputs == row4_outputs &&
+        scalar_outputs == row8_outputs &&
+        scalar_outputs == row16_outputs;
+    constexpr int warmup = 1;
+    constexpr int iterations = 4;
     for (int iteration = 0; iteration < warmup; ++iteration) {
         run_scalar();
         run_4rows();
+        run_8rows();
+        run_gs32_8rows();
+        run_16rows();
+        run_f32();
+        run_q2_k();
     }
     uint64_t checksum = 0;
     const auto scalar_start = std::chrono::steady_clock::now();
@@ -3255,16 +3570,104 @@ int run_gptq2_u16_gemv_4row_test() {
         checksum += row4_outputs[iteration % output_size];
     }
     const auto row4_end = std::chrono::steady_clock::now();
+    const auto row8_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_8rows();
+        checksum += row8_outputs[iteration % output_size];
+    }
+    const auto row8_end = std::chrono::steady_clock::now();
+    const auto gs32_row8_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_gs32_8rows();
+        checksum += row8_outputs[iteration % output_size];
+    }
+    const auto gs32_row8_end = std::chrono::steady_clock::now();
+    const auto row16_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_16rows();
+        checksum += row16_outputs[iteration % output_size];
+    }
+    const auto row16_end = std::chrono::steady_clock::now();
+    const auto f32_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_f32();
+        checksum += static_cast<uint64_t>(
+            std::llround(f32_outputs[iteration % output_size]));
+    }
+    const auto f32_end = std::chrono::steady_clock::now();
+    const auto q2_k_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_q2_k();
+        checksum += static_cast<uint64_t>(
+            std::llround(q2_k_outputs[iteration % output_size]));
+    }
+    const auto q2_k_end = std::chrono::steady_clock::now();
+    constexpr int q8_k_quant_iterations = 1000;
+    const auto q8_k_quant_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < q8_k_quant_iterations; ++iteration) {
+        quantize_row_q8_K(
+            activations_f32.data(), q8_k_activations.data(), input_size);
+        checksum += static_cast<uint64_t>(
+            static_cast<uint8_t>(q8_k_activations[0].qs[
+                iteration % QK_K]));
+    }
+    const auto q8_k_quant_end = std::chrono::steady_clock::now();
+    const uint16_t old_activation0 = activations[0];
+    activations[0] = UINT16_MAX;
+    activation_block_sums[0] +=
+        static_cast<int32_t>(activations[0]) - static_cast<int32_t>(old_activation0);
+    activations_fit_i16 = false;
+    run_scalar();
+    run_4rows();
+    run_8rows();
+    run_gs32_8rows();
+    run_16rows();
+    const bool wide_exact =
+        scalar_outputs == row4_outputs &&
+        scalar_outputs == row8_outputs &&
+        scalar_outputs == row16_outputs;
+    const bool exact = fast_exact && wide_exact;
     const double scalar_ms = std::chrono::duration<double, std::milli>(
         scalar_end - scalar_start).count() / iterations;
     const double row4_ms = std::chrono::duration<double, std::milli>(
         row4_end - row4_start).count() / iterations;
+    const double row8_ms = std::chrono::duration<double, std::milli>(
+        row8_end - row8_start).count() / iterations;
+    const double gs32_row8_ms = std::chrono::duration<double, std::milli>(
+        gs32_row8_end - gs32_row8_start).count() / iterations;
+    const double row16_ms = std::chrono::duration<double, std::milli>(
+        row16_end - row16_start).count() / iterations;
+    const double f32_ms = std::chrono::duration<double, std::milli>(
+        f32_end - f32_start).count() / iterations;
+    const double q2_k_ms = std::chrono::duration<double, std::milli>(
+        q2_k_end - q2_k_start).count() / iterations;
+    const double q8_k_quant_us = std::chrono::duration<double, std::micro>(
+        q8_k_quant_end - q8_k_quant_start).count() / q8_k_quant_iterations;
     std::printf(
         "qnn-gptq2-u16-gemv-4row-test: input=%d output=%d exact=%d "
-        "scalar_ms=%.6f row4_ms=%.6f speedup=%.3f checksum=%llu "
+        "fast_exact=%d wide_exact=%d gs32_dotprod=%d "
+        "scalar_ms=%.6f row4_ms=%.6f row8_ms=%.6f row16_ms=%.6f "
+        "gs32_row8_ms=%.6f gs32_vs_row_major=%.3f "
+        "row8_vs_row4_speedup=%.3f row16_vs_row8_speedup=%.3f "
+        "speedup=%.3f ggml_f32_ms=%.6f "
+        "u16_vs_ggml_speedup=%.3f q2_k_q8_k_ms=%.6f "
+        "q8_k_quant_us=%.6f q2_k_vs_u16_speedup=%.3f "
+        "gs32_vs_q2_k_ratio=%.3f gs32_vs_q2_k_gap_pct=%.3f "
+        "gptq2_bpw=%.3f q2_k_bpw=%.3f checksum=%llu "
         "activation_dequant_buffers=0 packed_int4_buffers=0\n",
         input_size, output_size, exact ? 1 : 0,
-        scalar_ms, row4_ms, scalar_ms / row4_ms,
+        fast_exact ? 1 : 0, wide_exact ? 1 : 0,
+        ggml_gptq2_32_gs32_dotprod_enabled(),
+        scalar_ms, row4_ms, row8_ms, row16_ms,
+        gs32_row8_ms, row8_ms / gs32_row8_ms,
+        row4_ms / row8_ms, row8_ms / row16_ms,
+        scalar_ms / row16_ms,
+        f32_ms, f32_ms / row16_ms,
+        q2_k_ms, q8_k_quant_us, row16_ms / q2_k_ms,
+        gs32_row8_ms / q2_k_ms,
+        (gs32_row8_ms / q2_k_ms - 1.0) * 100.0,
+        3.0,
+        8.0 * sizeof(block_q2_K) / QK_K,
         static_cast<unsigned long long>(checksum));
     return exact ? 0 : 10;
 }
@@ -4487,6 +4890,8 @@ int run_profile_u16_operation_test(const char * profile_path) {
         std::chrono::duration<double, std::micro>(
             qk_dense_end - qk_dense_start).count() /
         qk_benchmark_iterations;
+    dense_qk_benchmark(qk_query_data);
+    const std::vector<uint16_t> qk_decode_expected = qk_benchmark_output;
     constexpr int64_t value_benchmark_rows = 4096;
     constexpr int64_t value_benchmark_columns = 128;
     constexpr int value_benchmark_iterations = 100;
@@ -4571,6 +4976,84 @@ int run_profile_u16_operation_test(const char * profile_path) {
         value_benchmark_iterations;
     const bool value_sparse_match =
         value_benchmark_output == value_dense_output;
+
+    // Benchmark the actual CUSTOM scheduling shape used by Decode: one query
+    // row, with output columns divided among the GGML workers.
+    ggml_tensor * qk_decode_input = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_U16, rope_dimension);
+    ggml_tensor * qk_decode_matrix = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I8, qk_benchmark_columns, rope_dimension);
+    constexpr int decode_matmul_graph_nodes = 64;
+    std::vector<ggml_tensor *> qk_decode_outputs;
+    qk_decode_outputs.reserve(decode_matmul_graph_nodes);
+    for (int node = 0; node < decode_matmul_graph_nodes; ++node) {
+        qk_decode_outputs.push_back(llama_qnn_u16_u8_matmul(
+            ctx, qk_decode_input, qk_decode_matrix, profile.get(), qk_matmul));
+    }
+    std::memcpy(
+        qk_decode_input->data, qk_query_data,
+        rope_dimension * sizeof(uint16_t));
+    std::memcpy(
+        qk_decode_matrix->data, qk_benchmark_keys.data(),
+        qk_benchmark_keys.size() * sizeof(uint8_t));
+    ggml_cgraph * qk_decode_graph = ggml_new_graph_custom(ctx, 128, false);
+    for (ggml_tensor * output : qk_decode_outputs) {
+        ggml_build_forward_expand(qk_decode_graph, output);
+    }
+
+    ggml_tensor * value_decode_input = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_U16, value_benchmark_rows);
+    ggml_tensor * value_decode_matrix = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I8, value_benchmark_columns, value_benchmark_rows);
+    std::vector<ggml_tensor *> value_decode_outputs;
+    value_decode_outputs.reserve(decode_matmul_graph_nodes);
+    for (int node = 0; node < decode_matmul_graph_nodes; ++node) {
+        value_decode_outputs.push_back(llama_qnn_u16_u8_matmul(
+            ctx, value_decode_input, value_decode_matrix,
+            profile.get(), attention_value_matmul));
+    }
+    std::memcpy(
+        value_decode_input->data, value_benchmark_probabilities.data(),
+        value_benchmark_probabilities.size() * sizeof(uint16_t));
+    std::memcpy(
+        value_decode_matrix->data, value_benchmark_matrix.data(),
+        value_benchmark_matrix.size() * sizeof(uint8_t));
+    ggml_cgraph * value_decode_graph = ggml_new_graph_custom(ctx, 128, false);
+    for (ggml_tensor * output : value_decode_outputs) {
+        ggml_build_forward_expand(value_decode_graph, output);
+    }
+
+    constexpr int decode_matmul_graph_iterations = 3;
+    const auto benchmark_decode_graph = [](
+            ggml_context * graph_ctx,
+            ggml_cgraph * decode_graph,
+            int threads) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int iteration = 0;
+             iteration < decode_matmul_graph_iterations;
+             ++iteration) {
+            GGML_ASSERT(
+                ggml_graph_compute_with_ctx(
+                    graph_ctx, decode_graph, threads) == GGML_STATUS_SUCCESS);
+        }
+        return std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start).count() /
+            (decode_matmul_graph_iterations * decode_matmul_graph_nodes);
+    };
+    const double qk_decode_graph_1t_us =
+        benchmark_decode_graph(ctx, qk_decode_graph, 1);
+    const bool qk_decode_graph_match = same_values(
+        static_cast<const uint16_t *>(qk_decode_outputs.front()->data),
+        qk_decode_expected.data(), qk_decode_expected.size());
+    const double qk_decode_graph_4t_us =
+        benchmark_decode_graph(ctx, qk_decode_graph, 4);
+    const double value_decode_graph_1t_us =
+        benchmark_decode_graph(ctx, value_decode_graph, 1);
+    const bool value_decode_graph_match = same_values(
+        static_cast<const uint16_t *>(value_decode_outputs.front()->data),
+        value_benchmark_output.data(), value_benchmark_output.size());
+    const double value_decode_graph_4t_us =
+        benchmark_decode_graph(ctx, value_decode_graph, 4);
     const auto & divide_input_q = operation_affine(
         *profile, *attention_divide, "input", 0);
     const auto & divide_output_q = operation_affine(
@@ -5049,6 +5532,10 @@ int run_profile_u16_operation_test(const char * profile_path) {
         "softmax_benchmark_us=%.3f softmax_division_reference_us=%.3f "
         "softmax_vs_reference_speedup=%.2f softmax_division_match=%d "
         "softmax_benchmark_checksum=%llu softmax_reference_checksum=%llu "
+        "qk_decode_graph_1t_us=%.3f qk_decode_graph_4t_us=%.3f "
+        "qk_decode_graph_speedup=%.2f qk_decode_graph_match=%d "
+        "value_decode_graph_1t_us=%.3f value_decode_graph_4t_us=%.3f "
+        "value_decode_graph_speedup=%.2f value_decode_graph_match=%d "
         "k_convert_q31=%lld v_convert_q31=%lld f32_nodes=%d "
         "activation_dequant_buffers=0 temporary_weight_buffers=0 "
         "checksum=0x%016llx status=%s\n",
@@ -5084,6 +5571,14 @@ int run_profile_u16_operation_test(const char * profile_path) {
         softmax_reciprocal_match ? 1 : 0,
         static_cast<unsigned long long>(softmax_benchmark_checksum),
         static_cast<unsigned long long>(softmax_reference_checksum),
+        qk_decode_graph_1t_us,
+        qk_decode_graph_4t_us,
+        qk_decode_graph_1t_us / qk_decode_graph_4t_us,
+        qk_decode_graph_match ? 1 : 0,
+        value_decode_graph_1t_us,
+        value_decode_graph_4t_us,
+        value_decode_graph_1t_us / value_decode_graph_4t_us,
+        value_decode_graph_match ? 1 : 0,
         static_cast<long long>(k_convert->unary_input_to_output_q31),
         static_cast<long long>(v_convert->unary_input_to_output_q31),
         f32_nodes,
@@ -5092,6 +5587,7 @@ int run_profile_u16_operation_test(const char * profile_path) {
     return rms_match && add_match && sub_match && mul_match && sigmoid_match && rope_match &&
         rotation_match && k_convert_match && v_convert_match && qk_matmul_match &&
         attention_chain_match && attention_value_match && strided_u8_matmul_match &&
+        qk_decode_graph_match && value_decode_graph_match &&
         value_sparse_match &&
         select_reference_match && select_stride_reference_match &&
         softmax_max_code_delta <= 2 &&
@@ -5721,6 +6217,7 @@ void print_usage(const char * program) {
     std::printf(
         "usage: GGML_QNN_U16_ACTIVATIONS=1 %s --self-test "
         "--backend=scalar|neon|compare\n"
+        "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --graph-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gguf-test <model.gguf> "
         "[--tensor=<GPTQ2_{32,64,128} tensor>]\n"
@@ -5751,6 +6248,7 @@ void print_usage(const char * program) {
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-ffn-vector-test "
         "<runtime-profile.json> <layer> <gate.u16.bin> <up.u16.bin> "
         "<sigmoid.u16.bin> <silu.u16.bin> <product.u16.bin>\n",
+        program,
         program,
         program,
         program,
@@ -6018,6 +6516,19 @@ int main(int argc, char ** argv) {
             }
         }
         return run_profile_inspect(argv[2], shard_index);
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--gptq2-gemv-test") {
+        if (!u16_activations_enabled()) {
+            std::fprintf(
+                stderr,
+                "U16 activation core is disabled; set GGML_QNN_U16_ACTIVATIONS=1 explicitly.\n");
+            return 2;
+        }
+        if (!initialize_ggml_cpu_backend()) {
+            std::fprintf(stderr, "failed to initialize GGML CPU backend.\n");
+            return 6;
+        }
+        return run_gptq2_u16_gemv_4row_test();
     }
     if (argc == 3 && std::string_view(argv[1]) == "--self-test") {
         if (!u16_activations_enabled()) {

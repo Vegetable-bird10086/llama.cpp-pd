@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -2988,6 +2989,19 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+bool llama_context::state_seq_set_qnn_u8_kv(
+        llama_seq_id seq_id,
+        const uint8_t * kv,
+        uint32_t cell_count,
+        uint32_t num_layers,
+        uint32_t num_kv_heads,
+        uint32_t head_dim) {
+    synchronize();
+    auto * cache = dynamic_cast<llama_kv_cache *>(memory.get());
+    return cache != nullptr && cache->import_qnn_u8(
+        kv, cell_count, num_layers, num_kv_heads, head_dim, seq_id);
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -4005,6 +4019,18 @@ size_t llama_state_seq_get_data(llama_context * ctx, uint8_t * dst, size_t size,
 
 size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {
     return llama_state_seq_set_data_ext(ctx, src, size, seq_id, 0);
+}
+
+bool llama_state_seq_set_qnn_u8_kv(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        const uint8_t * kv,
+        uint32_t cell_count,
+        uint32_t num_layers,
+        uint32_t num_kv_heads,
+        uint32_t head_dim) {
+    return ctx->state_seq_set_qnn_u8_kv(
+        seq_id, kv, cell_count, num_layers, num_kv_heads, head_dim);
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {

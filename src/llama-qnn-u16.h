@@ -141,3 +141,18 @@ ggml_tensor * llama_qnn_u16_softmax(
     ggml_tensor * input,
     const llama_qnn_quant_profile * profile,
     const llama_qnn_operation * operation);
+
+// Fuses the Decode attention score post-processing chain
+// Divide -> ReduceMin -> static Add -> Select -> Softmax into one CUSTOM node.
+// This preserves the profiled QNN quantization boundaries while avoiding four
+// extra graph scheduling barriers for every attention head.
+ggml_tensor * llama_qnn_u16_attention_softmax(
+    ggml_context * ctx,
+    ggml_tensor * score,
+    ggml_tensor * condition,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_operation * divide_operation,
+    const llama_qnn_operation * minimum_operation,
+    const llama_qnn_operation * floor_add_operation,
+    const llama_qnn_operation * select_operation,
+    const llama_qnn_operation * softmax_operation);

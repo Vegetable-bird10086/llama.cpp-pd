@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cctype>
 #include <clocale>
 #include <cmath>
 #include <cstdint>
@@ -18,13 +19,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <tuple>
+#include <unistd.h>
 #include <unordered_set>
 #include <vector>
 
@@ -34,13 +41,239 @@ namespace {
 
 struct pd_args {
     std::string import_dir;
+    int memory_fd = -1;
+    size_t memory_size = 0;
+    int32_t prompt_length = 0;
+    int32_t num_layers = 0;
+    int32_t num_kv_heads = 0;
+    int32_t head_dim = 0;
+    llama_token first_token = -1;
+    bool first_token_is_prompt_tail = false;
     std::string ppl_tokens_path;
     std::string ppl_output_path;
+    std::string op_profile_path;
+    std::string disk_embedding_path;
     int32_t ppl_max_tokens = 0;
     bool import_ro = false;
     bool roundtrip_check = false;
     bool native_compare = false;
     bool native_first_token = false;
+};
+
+class pd_disk_embedding {
+public:
+    pd_disk_embedding() = default;
+    pd_disk_embedding(const pd_disk_embedding &) = delete;
+    pd_disk_embedding & operator=(const pd_disk_embedding &) = delete;
+
+    ~pd_disk_embedding() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    void open_file(const std::string & path) {
+        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) {
+            throw std::runtime_error("unable to open disk embedding: " + path);
+        }
+
+        uint8_t header[20] = {};
+        read_exact(0, header, sizeof(header));
+        if (std::memcmp(header, "SEMB", 4) != 0 ||
+            read_u32(header + 4) != 1 ||
+            read_u32(header + 8) != 0) {
+            throw std::runtime_error(
+                "disk embedding must be an unquantized SEMB v1 file");
+        }
+
+        dtype_ = read_u32(header + 12);
+        const uint32_t ndim = read_u32(header + 16);
+        if ((dtype_ != 1 && dtype_ != 2) || ndim != 2) {
+            throw std::runtime_error(
+                "disk embedding must be a rank-2 FP16 or FP32 tensor");
+        }
+
+        uint8_t descriptor[16] = {};
+        read_exact(sizeof(header), descriptor, sizeof(descriptor));
+        payload_bytes_ = read_u64(descriptor);
+        vocab_size_ = read_u32(descriptor + 8);
+        embedding_dim_ = read_u32(descriptor + 12);
+        data_offset_ = sizeof(header) + sizeof(descriptor);
+        const size_t element_bytes = dtype_ == 2 ? sizeof(ggml_fp16_t) : sizeof(float);
+        row_bytes_ = static_cast<size_t>(embedding_dim_) * element_bytes;
+        if (vocab_size_ == 0 || embedding_dim_ == 0 ||
+            payload_bytes_ != static_cast<uint64_t>(vocab_size_) * row_bytes_) {
+            throw std::runtime_error("disk embedding shape/payload mismatch");
+        }
+
+        struct stat info {};
+        if (fstat(fd_, &info) != 0 || info.st_size < 0 ||
+            static_cast<uint64_t>(info.st_size) < data_offset_ + payload_bytes_) {
+            throw std::runtime_error("disk embedding file is truncated");
+        }
+        fp32_row_.resize(embedding_dim_);
+        if (dtype_ == 2) {
+            fp16_row_.resize(embedding_dim_);
+        }
+        LOG_INF(
+            "PD disk embedding opened: path=%s vocab=%u dim=%u dtype=%s "
+            "table_bytes=%" PRIu64 " mode=pread-row\n",
+            path.c_str(),
+            vocab_size_,
+            embedding_dim_,
+            dtype_ == 2 ? "fp16" : "fp32",
+            payload_bytes_);
+    }
+
+    bool is_open() const {
+        return fd_ >= 0;
+    }
+
+    uint32_t vocab_size() const {
+        return vocab_size_;
+    }
+
+    uint32_t embedding_dim() const {
+        return embedding_dim_;
+    }
+
+    float * read_row(llama_token token) {
+        if (token < 0 || static_cast<uint32_t>(token) >= vocab_size_) {
+            throw std::runtime_error("disk embedding token is out of range");
+        }
+        const uint64_t offset =
+            data_offset_ + static_cast<uint64_t>(token) * row_bytes_;
+        if (dtype_ == 2) {
+            read_exact(offset, fp16_row_.data(), row_bytes_);
+            ggml_fp16_to_fp32_row(
+                fp16_row_.data(), fp32_row_.data(), embedding_dim_);
+        } else {
+            read_exact(offset, fp32_row_.data(), row_bytes_);
+        }
+        return fp32_row_.data();
+    }
+
+private:
+    static uint32_t read_u32(const uint8_t * data) {
+        uint32_t value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        return value;
+    }
+
+    static uint64_t read_u64(const uint8_t * data) {
+        uint64_t value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        return value;
+    }
+
+    void read_exact(uint64_t offset, void * destination, size_t bytes) const {
+        auto * output = static_cast<uint8_t *>(destination);
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t result = pread(
+                fd_,
+                output + done,
+                bytes - done,
+                static_cast<off_t>(offset + done));
+            if (result <= 0) {
+                throw std::runtime_error("disk embedding pread failed");
+            }
+            done += static_cast<size_t>(result);
+        }
+    }
+
+    int fd_ = -1;
+    uint32_t dtype_ = 0;
+    uint32_t vocab_size_ = 0;
+    uint32_t embedding_dim_ = 0;
+    uint64_t data_offset_ = 0;
+    uint64_t payload_bytes_ = 0;
+    size_t row_bytes_ = 0;
+    std::vector<ggml_fp16_t> fp16_row_;
+    std::vector<float> fp32_row_;
+};
+
+class pd_persistent_threadpools {
+public:
+    pd_persistent_threadpools() = default;
+    pd_persistent_threadpools(const pd_persistent_threadpools &) = delete;
+    pd_persistent_threadpools & operator=(const pd_persistent_threadpools &) = delete;
+
+    ~pd_persistent_threadpools() {
+        if (ctx_ != nullptr) {
+            llama_detach_threadpool(ctx_);
+        }
+        if (free_fn_ != nullptr) {
+            if (threadpool_ != nullptr) {
+                free_fn_(threadpool_);
+            }
+            if (threadpool_batch_ != nullptr) {
+                free_fn_(threadpool_batch_);
+            }
+        }
+    }
+
+    void attach(llama_context * ctx, const common_params & params) {
+        ggml_backend_dev_t cpu_dev =
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev == nullptr) {
+            throw std::runtime_error(
+                "unable to find CPU backend for persistent threadpool");
+        }
+        ggml_backend_reg_t cpu_reg =
+            ggml_backend_dev_backend_reg(cpu_dev);
+        new_fn_ = reinterpret_cast<decltype(new_fn_)>(
+            ggml_backend_reg_get_proc_address(
+                cpu_reg, "ggml_threadpool_new"));
+        free_fn_ = reinterpret_cast<decltype(free_fn_)>(
+            ggml_backend_reg_get_proc_address(
+                cpu_reg, "ggml_threadpool_free"));
+        if (new_fn_ == nullptr || free_fn_ == nullptr) {
+            throw std::runtime_error(
+                "CPU backend does not expose threadpool functions");
+        }
+
+        ggml_threadpool_params tpp =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams);
+        ggml_threadpool_params tpp_batch =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+        if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+            threadpool_batch_ = new_fn_(&tpp_batch);
+            if (threadpool_batch_ == nullptr) {
+                throw std::runtime_error(
+                    "unable to create persistent batch threadpool");
+            }
+            // Only one of the pools is active at a time. Match the common
+            // completion CLI and keep the generation pool paused until use.
+            tpp.paused = true;
+        }
+
+        threadpool_ = new_fn_(&tpp);
+        if (threadpool_ == nullptr) {
+            throw std::runtime_error(
+                "unable to create persistent generation threadpool");
+        }
+
+        llama_attach_threadpool(ctx, threadpool_, threadpool_batch_);
+        ctx_ = ctx;
+        LOG_INF(
+            "PD persistent CPU threadpool attached: generation_threads=%d "
+            "batch_threads=%d separate_batch_pool=%d\n",
+            tpp.n_threads,
+            tpp_batch.n_threads,
+            threadpool_batch_ != nullptr ? 1 : 0);
+    }
+
+private:
+    using new_fn_type = decltype(ggml_threadpool_new) *;
+    using free_fn_type = decltype(ggml_threadpool_free) *;
+
+    llama_context * ctx_ = nullptr;
+    ggml_threadpool * threadpool_ = nullptr;
+    ggml_threadpool * threadpool_batch_ = nullptr;
+    new_fn_type new_fn_ = nullptr;
+    free_fn_type free_fn_ = nullptr;
 };
 
 struct pd_capture_state {
@@ -230,6 +463,224 @@ static double elapsed_ms(
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct pd_op_profile_event {
+    int32_t decode_index = -1;
+    llama_token token = -1;
+    int64_t node_index = -1;
+    int32_t layer = -1;
+    std::string name;
+    std::string semantic_name;
+    std::string op;
+    double duration_us = 0.0;
+    int64_t ne[GGML_MAX_DIMS] = {};
+};
+
+static std::optional<int32_t> layer_from_node_name(const std::string & name) {
+    const size_t separator = name.rfind('-');
+    if (separator == std::string::npos || separator + 1 >= name.size()) {
+        return std::nullopt;
+    }
+    size_t end = separator + 1;
+    if (name[end] == '-') {
+        ++end;
+    }
+    if (end >= name.size() ||
+        !std::all_of(name.begin() + end, name.end(), [](unsigned char value) {
+            return std::isdigit(value);
+        })) {
+        return std::nullopt;
+    }
+    return std::stoi(name.substr(separator + 1));
+}
+
+static std::string semantic_node_name(const std::string & name) {
+    if (name.empty()) {
+        return "<unnamed>";
+    }
+    std::string result = name;
+    if (layer_from_node_name(result).has_value()) {
+        result.resize(result.rfind('-'));
+    }
+    const size_t head = result.rfind("_h");
+    if (head != std::string::npos && head + 2 < result.size() &&
+        std::all_of(result.begin() + head + 2, result.end(), [](unsigned char value) {
+            return std::isdigit(value);
+        })) {
+        result.resize(head);
+    }
+    return result;
+}
+
+static std::string csv_field(const std::string & value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) {
+        return value;
+    }
+    std::string result = "\"";
+    for (char character : value) {
+        if (character == '"') {
+            result += '"';
+        }
+        result += character;
+    }
+    result += '"';
+    return result;
+}
+
+struct pd_op_profile_state {
+    std::filesystem::path output_path;
+    std::vector<pd_op_profile_event> events;
+    steady_clock::time_point node_start;
+    ggml_tensor * pending = nullptr;
+    int32_t decode_index = -1;
+    llama_token token = -1;
+    int64_t node_index = 0;
+    int32_t inferred_layer = -1;
+    bool layer_granularity = false;
+    bool active = false;
+
+    ~pd_op_profile_state() {
+        if (output_path.empty()) {
+            return;
+        }
+        try {
+            write();
+        } catch (const std::exception & error) {
+            LOG_ERR("failed to write PD operator profile: %s\n", error.what());
+        }
+    }
+
+    void begin_decode(llama_token input_token) {
+        ++decode_index;
+        token = input_token;
+        node_index = 0;
+        inferred_layer = -1;
+        active = true;
+    }
+
+    void end_decode() {
+        active = false;
+        pending = nullptr;
+    }
+
+    void write() const {
+        if (!output_path.parent_path().empty()) {
+            std::filesystem::create_directories(output_path.parent_path());
+        }
+        std::ofstream raw(output_path, std::ios::trunc);
+        if (!raw.is_open()) {
+            throw std::runtime_error("unable to open " + output_path.string());
+        }
+        raw << "decode_index,token,node_index,layer,name,semantic_name,op,"
+               "duration_us,ne0,ne1,ne2,ne3\n";
+        for (const auto & event : events) {
+            raw << event.decode_index << ',' << event.token << ','
+                << event.node_index << ',' << event.layer << ','
+                << csv_field(event.name) << ','
+                << csv_field(event.semantic_name) << ','
+                << csv_field(event.op) << ',' << event.duration_us;
+            for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+                raw << ',' << event.ne[dimension];
+            }
+            raw << '\n';
+        }
+
+        struct aggregate {
+            int64_t count = 0;
+            double total_us = 0.0;
+            double min_us = std::numeric_limits<double>::infinity();
+            double max_us = 0.0;
+        };
+        using key = std::tuple<int32_t, std::string, std::string>;
+        std::map<key, aggregate> aggregates;
+        for (const auto & event : events) {
+            auto & value = aggregates[{event.layer, event.semantic_name, event.op}];
+            ++value.count;
+            value.total_us += event.duration_us;
+            value.min_us = std::min(value.min_us, event.duration_us);
+            value.max_us = std::max(value.max_us, event.duration_us);
+        }
+
+        std::filesystem::path summary_path = output_path;
+        summary_path += ".summary.csv";
+        std::ofstream summary(summary_path, std::ios::trunc);
+        if (!summary.is_open()) {
+            throw std::runtime_error("unable to open " + summary_path.string());
+        }
+        summary << "layer,semantic_name,op,count,total_us,mean_us,min_us,max_us\n";
+        for (const auto & [aggregate_key, value] : aggregates) {
+            const auto & [layer, name, op] = aggregate_key;
+            summary << layer << ',' << csv_field(name) << ',' << csv_field(op)
+                    << ',' << value.count << ',' << value.total_us << ','
+                    << value.total_us / value.count << ',' << value.min_us
+                    << ',' << value.max_us << '\n';
+        }
+    }
+};
+
+static bool pd_op_profile_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & state = *static_cast<pd_op_profile_state *>(user_data);
+    if (!state.active) {
+        return false;
+    }
+    if (ask) {
+        if (state.layer_granularity) {
+            const char * raw_name = ggml_get_name(tensor);
+            const std::string name = raw_name == nullptr ? "" : raw_name;
+            const bool is_layer_boundary =
+                name.rfind("qnn_layer_output-", 0) == 0;
+            if (name != "qnn_u16_input" &&
+                name != "result_output" &&
+                !is_layer_boundary) {
+                return false;
+            }
+        }
+        state.pending = tensor;
+        state.node_start = steady_clock::now();
+        return true;
+    }
+    if (state.pending != tensor) {
+        return false;
+    }
+
+    pd_op_profile_event event;
+    event.decode_index = state.decode_index;
+    event.token = state.token;
+    event.node_index = state.node_index++;
+    const char * raw_name = ggml_get_name(tensor);
+    event.name = raw_name == nullptr ? "" : raw_name;
+    event.semantic_name = semantic_node_name(event.name);
+    if (state.layer_granularity) {
+        if (event.name == "qnn_u16_input") {
+            event.semantic_name = "input";
+        } else if (event.name == "result_output") {
+            event.layer = -1;
+            event.semantic_name = "output_head";
+        } else {
+            event.layer = layer_from_node_name(event.name).value_or(-1);
+            event.semantic_name = "layer_total";
+        }
+        event.op = "GRAPH_SEGMENT";
+    } else {
+        if (const auto explicit_layer = layer_from_node_name(event.name);
+                explicit_layer.has_value()) {
+            event.layer = *explicit_layer;
+            if (event.name.rfind("qnn_", 0) == 0) {
+                state.inferred_layer = *explicit_layer;
+            }
+        } else {
+            event.layer = state.inferred_layer;
+        }
+        event.op = ggml_op_name(tensor->op);
+    }
+    event.duration_us =
+        std::chrono::duration<double, std::micro>(
+            steady_clock::now() - state.node_start).count();
+    std::copy(std::begin(tensor->ne), std::end(tensor->ne), event.ne);
+    state.events.push_back(std::move(event));
+    state.pending = nullptr;
+    return true;
+}
+
 struct process_memory_snapshot {
     uint64_t rss_bytes = 0;
     uint64_t hwm_bytes = 0;
@@ -268,12 +719,23 @@ struct pd_handoff {
     bool first_token_is_prompt_tail = false;
     std::vector<uint16_t> kv_fp16;
     std::vector<uint8_t> kv_qnn_u8;
+    std::shared_ptr<void> memory_mapping;
+    const uint8_t * kv_qnn_u8_view = nullptr;
+    size_t kv_qnn_u8_view_size = 0;
     int32_t prompt_len = 0;
     int32_t num_layers = 0;
     int32_t num_kv_heads = 0;
     int32_t head_dim = 0;
     double metadata_read_ms = 0.0;
     double kv_read_ms = 0.0;
+
+    const uint8_t * qnn_u8_data() const {
+        return kv_qnn_u8_view != nullptr ? kv_qnn_u8_view : kv_qnn_u8.data();
+    }
+
+    size_t qnn_u8_size() const {
+        return kv_qnn_u8_view != nullptr ? kv_qnn_u8_view_size : kv_qnn_u8.size();
+    }
 };
 
 class blob_writer {
@@ -393,6 +855,63 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
             out.import_dir = argv[++i];
             continue;
         }
+        if (arg == "--pd-memory-fd") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-memory-fd requires a descriptor");
+            }
+            out.memory_fd = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--pd-memory-size") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-memory-size requires a byte count");
+            }
+            out.memory_size = static_cast<size_t>(std::stoull(argv[++i]));
+            continue;
+        }
+        if (arg == "--pd-prompt-length") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-prompt-length requires a count");
+            }
+            out.prompt_length = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--pd-num-layers") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-num-layers requires a count");
+            }
+            out.num_layers = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--pd-num-kv-heads") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-num-kv-heads requires a count");
+            }
+            out.num_kv_heads = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--pd-head-dim") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-head-dim requires a count");
+            }
+            out.head_dim = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--pd-first-token") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-first-token requires a token");
+            }
+            out.first_token = static_cast<llama_token>(std::stoi(argv[++i]));
+            continue;
+        }
+        if (arg == "--pd-first-token-is-prompt-tail") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(
+                    "--pd-first-token-is-prompt-tail requires 0 or 1");
+            }
+            out.first_token_is_prompt_tail = std::stoi(argv[++i]) != 0;
+            continue;
+        }
         if (arg == "--pd-import-ro") {
             out.import_ro = true;
             continue;
@@ -409,6 +928,21 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
                 throw std::runtime_error("--pd-ppl-output requires a path");
             }
             out.ppl_output_path = argv[++i];
+            continue;
+        }
+        if (arg == "--pd-op-profile") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-op-profile requires a CSV path");
+            }
+            out.op_profile_path = argv[++i];
+            continue;
+        }
+        if (arg == "--pd-disk-embedding") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(
+                    "--pd-disk-embedding requires a SEMB file");
+            }
+            out.disk_embedding_path = argv[++i];
             continue;
         }
         if (arg == "--pd-ppl-max-tokens") {
@@ -435,8 +969,15 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
         }
         forwarded->push_back(argv[i]);
     }
-    if (out.import_dir.empty()) {
-        throw std::runtime_error("--pd-import DIR is required");
+    if (out.import_dir.empty() == (out.memory_fd < 0)) {
+        throw std::runtime_error(
+            "provide exactly one of --pd-import DIR or --pd-memory-fd FD");
+    }
+    if (out.memory_fd >= 0 &&
+        (out.memory_size == 0 || out.prompt_length <= 0 ||
+         out.num_layers <= 0 || out.num_kv_heads <= 0 || out.head_dim <= 0 ||
+         out.first_token < 0)) {
+        throw std::runtime_error("incomplete PD memory handoff metadata");
     }
     return out;
 }
@@ -546,7 +1087,10 @@ llama_token load_first_token(const json & manifest, const std::string & import_d
     return static_cast<llama_token>(token);
 }
 
-pd_handoff load_pd_handoff(const std::string & import_dir) {
+pd_handoff load_pd_handoff(
+        const std::string & import_dir,
+        bool load_fp16_kv,
+        bool load_qnn_u8_kv) {
     pd_handoff out;
     const auto metadata_read_start = steady_clock::now();
     out.manifest = read_json_file(import_dir + "/manifest.json");
@@ -557,9 +1101,11 @@ pd_handoff load_pd_handoff(const std::string & import_dir) {
     out.metadata_read_ms = elapsed_ms(metadata_read_start);
 
     const auto kv_read_start = steady_clock::now();
-    out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
+    if (load_fp16_kv) {
+        out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
+    }
     const std::string qnn_u8_kv_file = out.manifest.value("qnn_u8_kv_file", "");
-    if (!qnn_u8_kv_file.empty()) {
+    if (load_qnn_u8_kv && !qnn_u8_kv_file.empty()) {
         out.kv_qnn_u8 = read_binary_vector<uint8_t>(import_dir + "/" + qnn_u8_kv_file);
     }
     out.kv_read_ms = elapsed_ms(kv_read_start);
@@ -582,19 +1128,80 @@ pd_handoff load_pd_handoff(const std::string & import_dir) {
         out.prompt_len *
         out.head_dim *
         2;
-    if (out.kv_fp16.size() != expected_values) {
+    if (load_fp16_kv && out.kv_fp16.size() != expected_values) {
         std::ostringstream oss;
         oss << "kv.bin element count mismatch: got=" << out.kv_fp16.size()
             << " expected=" << expected_values;
         throw std::runtime_error(oss.str());
     }
-    if (!out.kv_qnn_u8.empty() && out.kv_qnn_u8.size() != expected_values) {
+    if (load_qnn_u8_kv && out.kv_qnn_u8.size() != expected_values) {
         std::ostringstream oss;
         oss << "QNN U8 kv file element count mismatch: got=" << out.kv_qnn_u8.size()
             << " expected=" << expected_values;
         throw std::runtime_error(oss.str());
     }
 
+    return out;
+}
+
+pd_handoff load_pd_memory_handoff(const pd_args & args) {
+    const auto metadata_start = steady_clock::now();
+    struct stat info {};
+    if (fstat(args.memory_fd, &info) != 0) {
+        throw std::runtime_error("unable to stat PD memory handoff");
+    }
+    if (info.st_size < 0 ||
+        static_cast<uint64_t>(info.st_size) != args.memory_size) {
+        throw std::runtime_error("PD memory handoff descriptor size mismatch");
+    }
+
+    const size_t prompt_bytes =
+        static_cast<size_t>(args.prompt_length) * sizeof(uint64_t);
+    const size_t per_kind_values =
+        static_cast<size_t>(args.num_layers) * args.num_kv_heads *
+        args.prompt_length * args.head_dim;
+    const size_t kv_bytes = per_kind_values * 2;
+    if (prompt_bytes > args.memory_size ||
+        kv_bytes != args.memory_size - prompt_bytes) {
+        throw std::runtime_error("PD memory handoff payload size mismatch");
+    }
+
+    void * mapping = mmap(
+        nullptr,
+        args.memory_size,
+        PROT_READ,
+        MAP_SHARED,
+        args.memory_fd,
+        0);
+    if (mapping == MAP_FAILED) {
+        throw std::runtime_error("unable to map PD memory handoff");
+    }
+    close(args.memory_fd);
+
+    pd_handoff out;
+    out.memory_mapping = std::shared_ptr<void>(
+        mapping,
+        [size = args.memory_size](void * ptr) {
+            munmap(ptr, size);
+        });
+    const uint64_t * token_data = static_cast<const uint64_t *>(mapping);
+    out.prompt_tokens.reserve(static_cast<size_t>(args.prompt_length));
+    for (int32_t i = 0; i < args.prompt_length; ++i) {
+        out.prompt_tokens.push_back(
+            static_cast<llama_token>(token_data[static_cast<size_t>(i)]));
+    }
+    out.kv_qnn_u8_view =
+        static_cast<const uint8_t *>(mapping) + prompt_bytes;
+    out.kv_qnn_u8_view_size = kv_bytes;
+    out.prompt_len = args.prompt_length;
+    out.num_layers = args.num_layers;
+    out.num_kv_heads = args.num_kv_heads;
+    out.head_dim = args.head_dim;
+    out.first_token = args.first_token;
+    out.first_token_is_prompt_tail = args.first_token_is_prompt_tail;
+    out.manifest["original_prompt_length"] =
+        out.prompt_len + (out.first_token_is_prompt_tail ? 1 : 0);
+    out.metadata_read_ms = elapsed_ms(metadata_start);
     return out;
 }
 
@@ -673,8 +1280,8 @@ std::vector<uint8_t> build_seq_state_blob(
     if (qnn_u8_layout && v_trans) {
         throw std::runtime_error("QNN U8 KV requires non-transposed V layout");
     }
-    if (qnn_u8_layout && handoff.kv_qnn_u8.empty()) {
-        throw std::runtime_error("QNN U8 KV handoff is missing kv_qnn_u8.bin");
+    if (qnn_u8_layout && handoff.qnn_u8_size() == 0) {
+        throw std::runtime_error("QNN U8 KV handoff is missing");
     }
     const size_t kv_element_size = qnn_u8_layout ? sizeof(uint8_t) : sizeof(uint16_t);
     const uint64_t k_row_size =
@@ -687,8 +1294,8 @@ std::vector<uint8_t> build_seq_state_blob(
         handoff.head_dim;
     const uint16_t * k_base = handoff.kv_fp16.data();
     const uint16_t * v_base = handoff.kv_fp16.data() + per_kind_values;
-    const uint8_t * k_u8_base = handoff.kv_qnn_u8.data();
-    const uint8_t * v_u8_base = handoff.kv_qnn_u8.data() +
+    const uint8_t * k_u8_base = handoff.qnn_u8_data();
+    const uint8_t * v_u8_base = handoff.qnn_u8_data() +
         (qnn_u8_layout ? per_kind_values : 0);
 
     const size_t state_header_size =
@@ -1062,10 +1669,13 @@ void print_usage(int argc, char ** argv) {
     (void) argc;
     LOG("\nexample usage:\n");
     LOG("  %s --pd-import handoff_dir -m model.gguf -n 128 -c 2048 -t 4 -ngl 0\n", argv[0]);
+    LOG("  E2E runners may pass an inherited in-memory handoff with --pd-memory-fd\n");
+    LOG("  separate embedding: add --pd-disk-embedding separate_embed_matrix.bin\n");
     LOG("  diagnostics: add --pd-roundtrip-check to compare imported KV against llama.cpp sequence serialization\n");
     LOG("  diagnostics: add --pd-native-compare to compare imported KV resume logits against native GGUF prefill\n");
     LOG("  quality fallback: add --pd-native-first-token to select the first continuation token with GGUF prompt prefill\n");
     LOG("  PPL: add --pd-ppl-tokens continuation.u64 --pd-ppl-output result.txt for teacher-forced scoring\n");
+    LOG("  profiling: add --pd-op-profile profile.csv for synchronized per-node timing\n");
     LOG("\n");
 }
 
@@ -1098,11 +1708,29 @@ int main(int argc, char ** argv) {
     }
 
     if (!params.prompt.empty()) {
-        LOG_ERR("pd-cli does not accept a prompt; prompt tokens come from --pd-import\n");
+        LOG_ERR("pd-cli does not accept a prompt; prompt tokens come from the PD handoff\n");
         return 1;
     }
 
     pd_capture_state pd_capture;
+    pd_op_profile_state pd_op_profile;
+    pd_op_profile.output_path = pd.op_profile_path;
+    if (pd_op_profile.output_path.empty()) {
+        if (const char * profile_path = std::getenv("LLAMA_QNN_PD_OP_PROFILE");
+                profile_path != nullptr && profile_path[0] != '\0') {
+            pd_op_profile.output_path = profile_path;
+        }
+    }
+    if (const char * profile_mode = std::getenv("LLAMA_QNN_PD_OP_PROFILE_MODE");
+            profile_mode != nullptr && profile_mode[0] != '\0') {
+        if (std::strcmp(profile_mode, "layer") == 0) {
+            pd_op_profile.layer_granularity = true;
+        } else if (std::strcmp(profile_mode, "node") != 0) {
+            LOG_ERR("invalid LLAMA_QNN_PD_OP_PROFILE_MODE=%s (expected node or layer)\n",
+                    profile_mode);
+            return 1;
+        }
+    }
     if (const char * dump_dir = std::getenv("LLAMA_QNN_PD_DUMP_DIR");
             dump_dir != nullptr && dump_dir[0] != '\0') {
         try {
@@ -1118,6 +1746,17 @@ int main(int argc, char ** argv) {
             dump_dir,
             pd_capture.requested.size());
     }
+    if (!pd_op_profile.output_path.empty()) {
+        if (!pd_capture.output_dir.empty()) {
+            LOG_ERR("--pd-op-profile cannot be combined with LLAMA_QNN_PD_DUMP_DIR\n");
+            return 1;
+        }
+        params.cb_eval = pd_op_profile_callback;
+        params.cb_eval_user_data = &pd_op_profile;
+        LOG_INF("PD profiling armed: path=%s mode=%s\n",
+                pd_op_profile.output_path.c_str(),
+                pd_op_profile.layer_granularity ? "layer" : "node");
+    }
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -1130,11 +1769,60 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    pd_persistent_threadpools persistent_threadpools;
+    try {
+        persistent_threadpools.attach(ctx, params);
+    } catch (const std::exception & err) {
+        LOG_ERR("failed to initialize persistent CPU threadpool: %s\n", err.what());
+        return 1;
+    }
+
     const process_memory_snapshot memory_after_model_load = process_memory();
 
+    char external_embedding_kind[32] = {};
+    const bool model_requires_disk_embedding =
+        llama_model_meta_val_str(
+            model,
+            "general.external_token_embedding",
+            external_embedding_kind,
+            sizeof(external_embedding_kind)) > 0;
+    if (model_requires_disk_embedding && pd.disk_embedding_path.empty()) {
+        LOG_ERR(
+            "model requires an external token embedding; "
+            "pass --pd-disk-embedding PATH\n");
+        return 1;
+    }
+
+    pd_disk_embedding disk_embedding;
+    if (!pd.disk_embedding_path.empty()) {
+        try {
+            disk_embedding.open_file(pd.disk_embedding_path);
+            if (disk_embedding.vocab_size() !=
+                    static_cast<uint32_t>(
+                        llama_vocab_n_tokens(llama_model_get_vocab(model))) ||
+                disk_embedding.embedding_dim() !=
+                    static_cast<uint32_t>(llama_model_n_embd_inp(model))) {
+                throw std::runtime_error(
+                    "disk embedding dimensions do not match the GGUF model");
+            }
+            if (pd.native_compare || pd.native_first_token) {
+                throw std::runtime_error(
+                    "native GGUF prompt diagnostics are disabled with disk embedding");
+            }
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to initialize PD disk embedding: %s\n", err.what());
+            return 1;
+        }
+    }
+
+    const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
+    const bool need_fp16_handoff = !qnn_u8_layout;
     pd_handoff handoff;
     try {
-        handoff = load_pd_handoff(pd.import_dir);
+        handoff = pd.memory_fd >= 0
+            ? load_pd_memory_handoff(pd)
+            : load_pd_handoff(
+                  pd.import_dir, need_fp16_handoff, qnn_u8_layout);
         validate_pd_handoff(handoff, model, ctx);
     } catch (const std::exception & err) {
         LOG_ERR("failed to load PD handoff: %s\n", err.what());
@@ -1190,24 +1878,42 @@ int main(int argc, char ** argv) {
     // AUTO and ENABLED both build a non-transposed V cache, while DISABLED
     // builds the legacy transposed layout. Later auto_fa resolution only
     // affects graph selection, not the already-allocated KV tensor layout.
-    const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
     const bool v_trans = qnn_u8_layout
         ? false
         : params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    const auto kv_layout_start = steady_clock::now();
-    const std::vector<uint8_t> seq_blob =
-        build_seq_state_blob(handoff, v_trans, qnn_u8_layout);
-    const double kv_layout_ms = elapsed_ms(kv_layout_start);
+    const bool direct_qnn_u8_import =
+        qnn_u8_layout && !pd.roundtrip_check && !pd.native_compare;
+    std::vector<uint8_t> seq_blob;
+    double kv_layout_ms = 0.0;
+    if (!direct_qnn_u8_import) {
+        const auto kv_layout_start = steady_clock::now();
+        seq_blob = build_seq_state_blob(handoff, v_trans, qnn_u8_layout);
+        kv_layout_ms = elapsed_ms(kv_layout_start);
+    }
 
     const auto kv_import_start = steady_clock::now();
-    const size_t nset =
-        llama_state_seq_set_data(ctx, seq_blob.data(), seq_blob.size(), 0);
+    bool kv_import_ok = false;
+    if (direct_qnn_u8_import) {
+        kv_import_ok = llama_state_seq_set_qnn_u8_kv(
+            ctx, 0, handoff.qnn_u8_data(),
+            static_cast<uint32_t>(handoff.prompt_len),
+            static_cast<uint32_t>(handoff.num_layers),
+            static_cast<uint32_t>(handoff.num_kv_heads),
+            static_cast<uint32_t>(handoff.head_dim));
+    } else {
+        const size_t nset =
+            llama_state_seq_set_data(ctx, seq_blob.data(), seq_blob.size(), 0);
+        kv_import_ok = nset == seq_blob.size();
+        if (!kv_import_ok) {
+            LOG_ERR(
+                "failed to import PD KV state: written=%zu expected=%zu\n",
+                nset, seq_blob.size());
+        }
+    }
     const double kv_import_ms = elapsed_ms(kv_import_start);
-    if (nset != seq_blob.size()) {
-        LOG_ERR(
-            "failed to import PD KV state: written=%zu expected=%zu\n",
-            nset,
-            seq_blob.size());
+    if (!kv_import_ok) {
+        LOG_ERR("failed to import PD KV state directly=%d\n",
+                direct_qnn_u8_import ? 1 : 0);
         return 1;
     }
 
@@ -1222,18 +1928,36 @@ int main(int argc, char ** argv) {
     const double handoff_total_ms =
         handoff.metadata_read_ms + handoff.kv_read_ms +
         kv_layout_ms + kv_import_ms + kv_validation_ms;
+    const size_t handoff_kv_bytes =
+        handoff.kv_fp16.size() * sizeof(uint16_t) +
+        handoff.qnn_u8_size();
+    const size_t imported_seq_blob_size = seq_blob.size();
     LOG_INF(
         "PD handoff timing: metadata_read_ms=%.3f kv_read_ms=%.3f "
         "kv_layout_ms=%.3f kv_import_ms=%.3f validation_ms=%.3f "
-        "total_ms=%.3f kv_bytes=%zu seq_blob_bytes=%zu\n",
+        "total_ms=%.3f kv_bytes=%zu seq_blob_bytes=%zu direct_qnn_u8=%d\n",
         handoff.metadata_read_ms,
         handoff.kv_read_ms,
         kv_layout_ms,
         kv_import_ms,
         kv_validation_ms,
         handoff_total_ms,
-        handoff.kv_fp16.size() * sizeof(uint16_t),
-        seq_blob.size());
+        handoff_kv_bytes,
+        imported_seq_blob_size,
+        direct_qnn_u8_import ? 1 : 0);
+    if (!pd.roundtrip_check && !pd.native_compare) {
+        handoff.kv_qnn_u8.clear();
+        handoff.kv_qnn_u8.shrink_to_fit();
+        handoff.kv_qnn_u8_view = nullptr;
+        handoff.kv_qnn_u8_view_size = 0;
+        handoff.memory_mapping.reset();
+        seq_blob.clear();
+        seq_blob.shrink_to_fit();
+    }
+    if (!pd.native_compare) {
+        handoff.kv_fp16.clear();
+        handoff.kv_fp16.shrink_to_fit();
+    }
     const process_memory_snapshot memory_after_import = process_memory();
 
     if (pd.roundtrip_check) {
@@ -1289,7 +2013,28 @@ int main(int argc, char ** argv) {
         const bool capture_this_decode =
             !pd_capture.output_dir.empty() && !pd_capture.completed;
         pd_capture.active = capture_this_decode;
-        const int result = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        pd_op_profile.begin_decode(token);
+        int result = 0;
+        if (disk_embedding.is_open()) {
+            try {
+                llama_batch batch = {
+                    /*.n_tokens =*/ 1,
+                    /*.token    =*/ nullptr,
+                    /*.embd     =*/ disk_embedding.read_row(token),
+                    /*.pos      =*/ nullptr,
+                    /*.n_seq_id =*/ nullptr,
+                    /*.seq_id   =*/ nullptr,
+                    /*.logits   =*/ nullptr,
+                };
+                result = llama_decode(ctx, batch);
+            } catch (const std::exception & err) {
+                LOG_ERR("PD disk embedding read failed: %s\n", err.what());
+                result = -1;
+            }
+        } else {
+            result = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        }
+        pd_op_profile.end_decode();
         pd_capture.active = false;
         if (capture_this_decode) {
             finish_pd_capture(pd_capture, token);
@@ -1304,10 +2049,6 @@ int main(int argc, char ** argv) {
     };
 
     if (!pd.ppl_tokens_path.empty()) {
-        if (handoff.first_token_is_prompt_tail) {
-            LOG_ERR("PD PPL requires a logits-producing prefill handoff\n");
-            return 1;
-        }
         std::vector<llama_token> continuation;
         try {
             continuation = load_prompt_tokens(pd.ppl_tokens_path);
@@ -1323,12 +2064,16 @@ int main(int argc, char ** argv) {
             continuation.size() > static_cast<size_t>(pd.ppl_max_tokens) + 1) {
             continuation.resize(static_cast<size_t>(pd.ppl_max_tokens) + 1);
         }
+        const int32_t ppl_prompt_tokens = handoff.manifest.value(
+            "original_prompt_length",
+            handoff.prompt_len + (handoff.first_token_is_prompt_tail ? 1 : 0));
         if (static_cast<int64_t>(handoff.prompt_len) +
+                (handoff.first_token_is_prompt_tail ? 1 : 0) +
                 static_cast<int64_t>(continuation.size()) >
             llama_n_ctx(ctx)) {
             LOG_ERR(
                 "PD PPL sequence exceeds context: prompt=%d continuation=%zu context=%u\n",
-                handoff.prompt_len,
+                ppl_prompt_tokens,
                 continuation.size(),
                 llama_n_ctx(ctx));
             return 1;
@@ -1339,6 +2084,11 @@ int main(int argc, char ** argv) {
         double total_nll = 0.0;
         int64_t scored_tokens = 0;
         const auto ppl_start = steady_clock::now();
+        if (handoff.first_token_is_prompt_tail &&
+            decode_one(handoff.first_token) != 0) {
+            LOG_ERR("llama_decode failed for PD PPL prompt-tail bridge token\n");
+            return 1;
+        }
         for (size_t index = 0; index + 1 < continuation.size(); ++index) {
             if (decode_one(continuation[index]) != 0) {
                 LOG_ERR("llama_decode failed during PD PPL at continuation index %zu\n", index);
@@ -1362,7 +2112,7 @@ int main(int argc, char ** argv) {
             ppl,
             total_nll,
             scored_tokens,
-            handoff.prompt_len,
+            ppl_prompt_tokens,
             continuation.size(),
             ppl_ms,
             1000.0 * static_cast<double>(scored_tokens) / ppl_ms);
@@ -1375,7 +2125,7 @@ int main(int argc, char ** argv) {
             output << "wiki_ppl=" << ppl << "\n"
                    << "total_nll=" << total_nll << "\n"
                    << "scored_tokens=" << scored_tokens << "\n"
-                   << "prompt_tokens=" << handoff.prompt_len << "\n"
+                   << "prompt_tokens=" << ppl_prompt_tokens << "\n"
                    << "continuation_tokens=" << continuation.size() << "\n"
                    << "eval_ms=" << ppl_ms << "\n";
         }

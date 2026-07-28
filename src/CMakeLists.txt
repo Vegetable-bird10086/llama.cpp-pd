@@ -32,6 +32,7 @@ add_library(llama
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-qnn-quant-profile.cpp
+            llama-qnn-quant-profile-bin.cpp
             llama-qnn-u16.cpp
             llama-model-saver.cpp
             llama-model.cpp

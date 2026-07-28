@@ -215,6 +215,13 @@ class Qwen3Model(Qwen2Model):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        if (
+            self._gptq2_32_gs32_source
+            and self.hparams.get("tie_word_embeddings", False)
+        ):
+            self.gguf_writer.add_string(
+                "general.external_token_embedding", "semb_v1"
+            )
         if self.is_rerank:
             self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
             self.gguf_writer.add_classifier_output_labels(["yes", "no"])
@@ -245,7 +252,29 @@ class Qwen3Model(Qwen2Model):
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
 
+        if (
+            self._gptq2_32_gs32_source
+            and self.hparams.get("tie_word_embeddings", False)
+            and name.endswith("embed_tokens.weight")
+        ):
+            output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
+            yield output_name, data_torch
+            return
+
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
+        if (
+            self._gptq2_32_gs32_source
+            and self.hparams.get("tie_word_embeddings", False)
+            and new_name == output_name
+        ):
+            # The tied token table is external for input lookup. Keep a
+            # separately selectable LM head for Decode logits. Q8_0 is the
+            # compact default; F16/BF16 are available for fidelity testing.
+            return self._gptq2_32_gs32_lm_head_type
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register("Qwen3MoeForCausalLM")

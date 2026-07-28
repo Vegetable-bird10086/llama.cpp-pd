@@ -641,6 +641,9 @@ size_t llama_qnn_quant_profile::static_aux_bytes() const {
 }
 
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const std::string & path) {
+    if (llama_qnn_quant_profile_is_binary_file(path)) {
+        return llama_qnn_quant_profile_load_binary_file(path);
+    }
     std::ifstream stream(path);
     if (!stream) {
         throw std::runtime_error("cannot open QNN U16 quantization manifest: " + path);

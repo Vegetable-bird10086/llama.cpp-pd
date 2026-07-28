@@ -1232,6 +1232,90 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+bool llama_kv_cache::import_qnn_u8(
+        const uint8_t * kv,
+        uint32_t cell_count,
+        uint32_t num_layers,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        llama_seq_id seq_id) {
+    if (kv == nullptr || !qnn_u8_layout || v_trans ||
+        num_layers != layers.size() || cell_count == 0 ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t n_embd = num_kv_heads * head_dim;
+    const uint32_t strm = seq_to_stream[seq_id];
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+    ubatch.seq_id_unq[0] = seq_id;
+    for (uint32_t pos = 0; pos < cell_count; ++pos) {
+        ubatch.pos[pos] = (llama_pos) pos;
+        ubatch.n_seq_id[pos] = 1;
+        ubatch.seq_id[pos] = &seq_id;
+    }
+    seq_rm(seq_id, -1, -1);
+    slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty() || sinfo.n_stream() != 1 ||
+        static_cast<uint32_t>(sinfo.strm[0]) != strm ||
+        !sinfo.is_contiguous()) {
+        return false;
+    }
+    apply_ubatch(sinfo, ubatch);
+
+    const size_t per_layer =
+        (size_t) num_kv_heads * cell_count * head_dim;
+    const size_t per_kind = (size_t) num_layers * per_layer;
+    const uint8_t * k_source = kv;
+    const uint8_t * v_source = kv + per_kind;
+    const size_t kv_size = v_cells[strm].size();
+    std::vector<uint8_t> column(cell_count);
+    std::vector<uint8_t> row(n_embd);
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        ggml_tensor * k = layer.k_stream[strm];
+        ggml_tensor * v = layer.v_stream[strm];
+        if (k == nullptr || v == nullptr ||
+            k->type != GGML_TYPE_I8 || v->type != GGML_TYPE_I8 ||
+            hparams.n_embd_k_gqa(il) != n_embd ||
+            hparams.n_embd_v_gqa(il) != n_embd) {
+            return false;
+        }
+        for (uint32_t head = 0; head < num_kv_heads; ++head) {
+            for (uint32_t dim = 0; dim < head_dim; ++dim) {
+                const uint32_t embedding = head * head_dim + dim;
+                for (uint32_t pos = 0; pos < cell_count; ++pos) {
+                    const size_t source =
+                        (size_t) il * per_layer +
+                        ((size_t) head * cell_count + pos) * head_dim + dim;
+                    column[pos] = k_source[source];
+                }
+                ggml_backend_tensor_set(
+                    k, column.data(),
+                    (size_t) embedding * kv_size + sinfo.head(),
+                    cell_count);
+            }
+        }
+        for (uint32_t pos = 0; pos < cell_count; ++pos) {
+            for (uint32_t head = 0; head < num_kv_heads; ++head) {
+                const size_t source =
+                    (size_t) il * per_layer +
+                    ((size_t) head * cell_count + pos) * head_dim;
+                memcpy(
+                    row.data() + (size_t) head * head_dim,
+                    v_source + source, head_dim);
+            }
+            ggml_backend_tensor_set(
+                v, row.data(),
+                ((size_t) sinfo.head() + pos) * n_embd,
+                n_embd);
+        }
+    }
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

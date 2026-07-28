@@ -82,13 +82,13 @@ static ggml_tensor * ggml_mul_mat_aux(
 }
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (ubatch->token && tokens) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd) {
+    if (ubatch->embd && embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1838,14 +1838,26 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    cb(inp->embd, "inp_embd", -1);
+    ggml_set_input(inp->embd);
+
+    if (tok_embd == nullptr) {
+        ggml_tensor * cur = inp->embd;
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+        res->t_inp_embd = cur;
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
+
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-    cb(inp->embd, "inp_embd", -1);
-    ggml_set_input(inp->embd);
 
     // select one of the 2 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550

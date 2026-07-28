@@ -115,11 +115,19 @@ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    const bool external_token_embedding =
+        gguf_kv.find("general.external_token_embedding") != gguf_kv.end();
+    tok_embd = create_tensor(
+        tn(LLM_TENSOR_TOKEN_EMBD, "weight"),
+        {n_embd, n_vocab},
+        external_token_embedding ? TENSOR_NOT_REQUIRED : 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    output      = create_tensor(
+        tn(LLM_TENSOR_OUTPUT, "weight"),
+        {n_embd, n_vocab},
+        external_token_embedding ? 0 : TENSOR_NOT_REQUIRED);
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
@@ -350,27 +358,15 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     fx_head(il, "aten_matmul_default", 4 * il + 2,
                         head, "MatMul"));
                 cb_head(score, "qnn_attention_score", il, head);
-                score = llama_qnn_u16_divide_static(
-                    ctx0, score, qnn_profile,
+                score = llama_qnn_u16_attention_softmax(
+                    ctx0, score, mask_condition, qnn_profile,
                     fx_head(il, "aten_div_tensor", il, head,
-                        "ElementWiseDivide"));
-                cb_head(score, "qnn_attention_scaled", il, head);
-                ggml_tensor * minimum = llama_qnn_u16_reduce_min(
-                    ctx0, score, qnn_profile,
-                    fx_head(il, "aten_amin_default", il, head, "ReduceMin"));
-                cb_head(minimum, "qnn_attention_min", il, head);
-                minimum = llama_qnn_u16_add_static(
-                    ctx0, minimum, qnn_profile,
+                        "ElementWiseDivide"),
+                    fx_head(il, "aten_amin_default", il, head, "ReduceMin"),
                     fx_head(il, "aten_add_tensor", 5 * il + 2,
-                        head, "ElementWiseAdd"));
-                cb_head(minimum, "qnn_attention_mask_value", il, head);
-                score = llama_qnn_u16_select(
-                    ctx0, mask_condition, score, minimum, qnn_profile,
+                        head, "ElementWiseAdd"),
                     fx_head(il, "aten_where_self", il, head,
-                        "ElementWiseSelect"));
-                cb_head(score, "qnn_attention_masked", il, head);
-                score = llama_qnn_u16_softmax(
-                    ctx0, score, qnn_profile,
+                        "ElementWiseSelect"),
                     fx_head(il, "aten__softmax_default", il, head, "Softmax"));
                 cb_head(score, "qnn_attention_softmax", il, head);
 
