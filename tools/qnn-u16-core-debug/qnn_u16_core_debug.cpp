@@ -1,17 +1,20 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
 extern "C" {
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu/quants.h"
 #include "gguf.h"
 }
+#include "ggml-cpu/repack.h"
 #include "llama-qnn-quant-profile.h"
 #include "llama-qnn-u16.h"
 #include <cstdio>
@@ -51,6 +54,252 @@ struct fixed_multiplier {
 };
 
 using json = nlohmann::json;
+
+void repack_lm_head_q8_0(
+        const block_q8_0 * source,
+        block_q8_0x4 * destination,
+        int64_t rows,
+        int64_t columns,
+        int interleave) {
+    const int64_t blocks = columns / QK8_0;
+    for (int64_t row = 0; row < rows; row += 4) {
+        for (int64_t block = 0; block < blocks; ++block) {
+            block_q8_0x4 & output = *destination++;
+            for (int lane = 0; lane < 4; ++lane) {
+                output.d[lane] = source[(row + lane) * blocks + block].d;
+            }
+            const int chunks = QK8_0 / interleave;
+            for (int chunk = 0; chunk < chunks; ++chunk) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    const block_q8_0 & input =
+                        source[(row + lane) * blocks + block];
+                    std::memcpy(
+                        output.qs + (chunk * 4 + lane) * interleave,
+                        input.qs + chunk * interleave,
+                        interleave);
+                }
+            }
+        }
+    }
+}
+
+void repack_lm_head_q6_k(
+        const block_q6_K * source,
+        block_q6_Kx8 * destination,
+        int64_t rows,
+        int64_t columns,
+        int interleave) {
+    const int64_t blocks = columns / QK_K;
+    for (int64_t row = 0; row < rows; row += 8) {
+        for (int64_t block = 0; block < blocks; ++block) {
+            block_q6_Kx8 & output = *destination++;
+            for (int lane = 0; lane < 8; ++lane) {
+                output.d[lane] = source[(row + lane) * blocks + block].d;
+            }
+            for (size_t offset = 0; offset < sizeof(block_q6_K::ql);
+                 offset += interleave) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const block_q6_K & input =
+                        source[(row + lane) * blocks + block];
+                    std::memcpy(
+                        output.ql +
+                            (offset / interleave * 8 + lane) * interleave,
+                        input.ql + offset, interleave);
+                }
+            }
+            for (size_t offset = 0; offset < sizeof(block_q6_K::qh);
+                 offset += interleave) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const block_q6_K & input =
+                        source[(row + lane) * blocks + block];
+                    std::memcpy(
+                        output.qh +
+                            (offset / interleave * 8 + lane) * interleave,
+                        input.qh + offset, interleave);
+                }
+            }
+            for (int scale = 0; scale < QK_K / 16; ++scale) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    output.scales[scale * 8 + lane] =
+                        source[(row + lane) * blocks + block].scales[scale];
+                }
+            }
+        }
+    }
+}
+
+int run_lm_head_gemv_test(ggml_type weight_type, int n_threads, int64_t rows) {
+    constexpr int64_t columns = 2048;
+    constexpr int iterations = 4;
+    if ((weight_type != GGML_TYPE_Q8_0 && weight_type != GGML_TYPE_Q6_K) ||
+        n_threads <= 0 || rows <= 0 || rows % 8 != 0) {
+        return 2;
+    }
+
+    ggml_init_params weight_params {
+        /* .mem_size = */ ggml_tensor_overhead() * 8 +
+            ggml_graph_overhead_custom(8, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context * ctx = ggml_init(weight_params);
+    if (ctx == nullptr) {
+        return 3;
+    }
+    ggml_tensor * weights =
+        ggml_new_tensor_2d(ctx, weight_type, columns, rows);
+    ggml_set_name(weights, "output.weight");
+    ggml_backend_buffer_t weight_buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_cpu_repack_buffer_type());
+    if (weight_buffer == nullptr) {
+        ggml_free(ctx);
+        return 4;
+    }
+
+    std::vector<uint8_t> raw_weights(ggml_nbytes(weights));
+    uint32_t random_state = 0x6d2b79f5u;
+    auto next_random = [&random_state]() {
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 17;
+        random_state ^= random_state << 5;
+        return random_state;
+    };
+    if (weight_type == GGML_TYPE_Q8_0) {
+        auto * blocks = reinterpret_cast<block_q8_0 *>(raw_weights.data());
+        const size_t count = raw_weights.size() / sizeof(block_q8_0);
+        for (size_t index = 0; index < count; ++index) {
+            blocks[index].d = GGML_FP32_TO_FP16(1.0f / 127.0f);
+            std::memset(
+                blocks[index].qs,
+                static_cast<int>(index * 37u + 11u), QK8_0);
+        }
+    } else {
+        auto * blocks = reinterpret_cast<block_q6_K *>(raw_weights.data());
+        const size_t count = raw_weights.size() / sizeof(block_q6_K);
+        for (size_t index = 0; index < count; ++index) {
+            blocks[index].d = GGML_FP32_TO_FP16(1.0f / 32.0f);
+            std::memset(
+                blocks[index].ql,
+                static_cast<int>(index * 29u + 7u),
+                sizeof(blocks[index].ql));
+            std::memset(
+                blocks[index].qh,
+                static_cast<int>(index * 43u + 3u),
+                sizeof(blocks[index].qh));
+            for (size_t lane = 0; lane < sizeof(blocks[index].scales); ++lane) {
+                blocks[index].scales[lane] =
+                    static_cast<int8_t>(
+                        ((index + lane * 5u) % 31u) - 15);
+            }
+        }
+    }
+    const int interleave = ggml_cpu_has_matmul_int8() ? 8 : 4;
+    if (weight_type == GGML_TYPE_Q8_0) {
+        repack_lm_head_q8_0(
+            reinterpret_cast<const block_q8_0 *>(raw_weights.data()),
+            reinterpret_cast<block_q8_0x4 *>(weights->data),
+            rows, columns, interleave);
+    } else {
+        repack_lm_head_q6_k(
+            reinterpret_cast<const block_q6_K *>(raw_weights.data()),
+            reinterpret_cast<block_q6_Kx8 *>(weights->data),
+            rows, columns, interleave);
+    }
+    raw_weights.clear();
+    raw_weights.shrink_to_fit();
+
+    ggml_tensor * input =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns, 1);
+    ggml_set_name(input, "lm_head_input");
+    ggml_tensor * output = ggml_mul_mat(ctx, weights, input);
+    ggml_set_name(output, "lm_head_output");
+    ggml_backend_buffer_t compute_buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_cpu_buffer_type());
+    if (compute_buffer == nullptr) {
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        return 5;
+    }
+
+    std::vector<float> input_data(columns);
+    for (int64_t index = 0; index < columns; ++index) {
+        input_data[index] =
+            static_cast<float>(static_cast<int>(next_random() % 2001u) - 1000) /
+            1000.0f;
+    }
+    ggml_backend_tensor_set(
+        input, input_data.data(), 0, input_data.size() * sizeof(float));
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_threadpool_params threadpool_params =
+        ggml_threadpool_params_default(n_threads);
+    ggml_threadpool * threadpool = ggml_threadpool_new(&threadpool_params);
+    if (threadpool == nullptr) {
+        ggml_backend_free(backend);
+        ggml_backend_buffer_free(compute_buffer);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        return 6;
+    }
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    ggml_backend_cpu_set_threadpool(backend, threadpool);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, output);
+
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_backend_free(backend);
+        ggml_threadpool_free(threadpool);
+        ggml_backend_buffer_free(compute_buffer);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        return 7;
+    }
+
+    std::array<double, iterations> elapsed_ms {};
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        const auto start = std::chrono::steady_clock::now();
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        const auto end = std::chrono::steady_clock::now();
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_free(backend);
+            ggml_threadpool_free(threadpool);
+            ggml_backend_buffer_free(compute_buffer);
+            ggml_backend_buffer_free(weight_buffer);
+            ggml_free(ctx);
+            return 8;
+        }
+        elapsed_ms[iteration] =
+            std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    std::vector<float> output_data(rows);
+    ggml_backend_tensor_get(
+        output, output_data.data(), 0, output_data.size() * sizeof(float));
+    double checksum = 0.0;
+    for (int64_t index = 0; index < rows; index += 997) {
+        checksum += output_data[index];
+    }
+    double average_ms = 0.0;
+    for (double value : elapsed_ms) {
+        average_ms += value;
+    }
+    average_ms /= iterations;
+    std::printf(
+        "lm-head-gemv: type=%s rows=%" PRId64 " columns=%" PRId64
+        " threads=%d iterations=%d times_ms=%.6f,%.6f,%.6f,%.6f"
+        " average_ms=%.6f checksum=%.9f dotprod=%d i8mm=%d\n",
+        ggml_type_name(weight_type), rows, columns, n_threads, iterations,
+        elapsed_ms[0], elapsed_ms[1], elapsed_ms[2], elapsed_ms[3],
+        average_ms, checksum, ggml_cpu_has_dotprod(), ggml_cpu_has_matmul_int8());
+
+    ggml_backend_free(backend);
+    ggml_threadpool_free(threadpool);
+    ggml_backend_buffer_free(compute_buffer);
+    ggml_backend_buffer_free(weight_buffer);
+    ggml_free(ctx);
+    return 0;
+}
 
 struct qnn_profile_inspection {
     size_t tensor_count = 0;
@@ -6213,11 +6462,440 @@ int run_profile_ffn_vector_test(
     return 0;
 }
 
+int run_profile_ffn_fused_test(
+        const char * profile_path,
+        int32_t layer_id,
+        int64_t tokens) {
+    constexpr int timed_iterations = 4;
+    if (tokens <= 0) {
+        throw std::runtime_error("fused FFN token count must be positive");
+    }
+    const auto profile = llama_qnn_quant_profile_load_file(profile_path);
+    const auto indexed_fx_name = [](const char * stem, int32_t index) {
+        return index == 0 ? std::string(stem) :
+            std::string(stem) + "_" + std::to_string(index);
+    };
+    const llama_qnn_operation * sigmoid = profile->find_operation_by_fx(
+        layer_id, indexed_fx_name("aten_sigmoid_default", layer_id));
+    const llama_qnn_operation * silu = profile->find_operation_by_fx(
+        layer_id, indexed_fx_name("aten_mul_tensor", 10 * layer_id + 9));
+    const llama_qnn_operation * product = profile->find_operation_by_fx(
+        layer_id, indexed_fx_name("aten_mul_tensor", 10 * layer_id + 10));
+    if (sigmoid == nullptr || sigmoid->type_name != "Sigmoid" ||
+        silu == nullptr || silu->type_name != "ElementWiseMultiply" ||
+        product == nullptr || product->type_name != "ElementWiseMultiply") {
+        throw std::runtime_error(
+            "runtime profile lacks the requested layer FFN operations");
+    }
+    const int64_t width = static_cast<int64_t>(operation_width(*profile, *sigmoid));
+    ggml_init_params init_params {
+        std::max<size_t>(16U * 1024U * 1024U,
+            static_cast<size_t>(width * tokens) * 16U),
+        nullptr,
+        false,
+    };
+    ggml_context * ctx = ggml_init(init_params);
+    if (ctx == nullptr) {
+        throw std::runtime_error("failed to create fused FFN context");
+    }
+    ggml_tensor * gate =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_U16, width, tokens);
+    ggml_tensor * up =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_U16, width, tokens);
+    auto * gate_data = static_cast<uint16_t *>(gate->data);
+    auto * up_data = static_cast<uint16_t *>(up->data);
+    for (int64_t index = 0; index < width * tokens; ++index) {
+        gate_data[index] =
+            static_cast<uint16_t>((32713U + index * 73U + index / 17U) & 0xffffU);
+        up_data[index] =
+            static_cast<uint16_t>((32587U + index * 109U + index / 29U) & 0xffffU);
+    }
+
+    ggml_tensor * reference = llama_qnn_u16_sigmoid(ctx, gate, sigmoid);
+    reference = llama_qnn_u16_mul(ctx, gate, reference, profile.get(), silu);
+    reference = llama_qnn_u16_mul(ctx, reference, up, profile.get(), product);
+    ggml_tensor * fused = llama_qnn_u16_swiglu(
+        ctx, gate, up, profile.get(), sigmoid, silu, product);
+    ggml_cgraph * reference_graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(reference_graph, reference);
+    ggml_cgraph * fused_graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(fused_graph, fused);
+    if (ggml_graph_compute_with_ctx(ctx, reference_graph, 4) != GGML_STATUS_SUCCESS ||
+        ggml_graph_compute_with_ctx(ctx, fused_graph, 4) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        throw std::runtime_error("fused FFN graph execution failed");
+    }
+    size_t mismatches = 0;
+    const auto * expected = static_cast<const uint16_t *>(reference->data);
+    const auto * actual = static_cast<const uint16_t *>(fused->data);
+    for (int64_t index = 0; index < width * tokens; ++index) {
+        mismatches += expected[index] != actual[index];
+    }
+    ggml_threadpool_params threadpool_params = ggml_threadpool_params_default(4);
+    ggml_threadpool * threadpool = ggml_threadpool_new(&threadpool_params);
+    if (threadpool == nullptr) {
+        ggml_free(ctx);
+        throw std::runtime_error("failed to create persistent FFN threadpool");
+    }
+    ggml_cplan reference_plan =
+        ggml_graph_plan(reference_graph, 4, threadpool);
+    ggml_cplan fused_plan =
+        ggml_graph_plan(fused_graph, 4, threadpool);
+    std::vector<uint8_t> reference_work(reference_plan.work_size);
+    std::vector<uint8_t> fused_work(fused_plan.work_size);
+    reference_plan.work_data =
+        reference_work.empty() ? nullptr : reference_work.data();
+    fused_plan.work_data = fused_work.empty() ? nullptr : fused_work.data();
+    if (ggml_graph_compute(reference_graph, &reference_plan) != GGML_STATUS_SUCCESS ||
+        ggml_graph_compute(fused_graph, &fused_plan) != GGML_STATUS_SUCCESS) {
+        ggml_threadpool_free(threadpool);
+        ggml_free(ctx);
+        throw std::runtime_error("persistent FFN graph warmup failed");
+    }
+    const auto time_graph = [&](ggml_cgraph * graph, ggml_cplan * plan) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int iteration = 0; iteration < timed_iterations; ++iteration) {
+            if (ggml_graph_compute(graph, plan) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("timed fused FFN graph failed");
+            }
+        }
+        return std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start).count() / timed_iterations;
+    };
+    const double reference_us = time_graph(reference_graph, &reference_plan);
+    const double fused_us = time_graph(fused_graph, &fused_plan);
+
+    const auto & silu_lhs_q = operation_affine(
+        *profile, *silu, "input", 0);
+    const auto & silu_rhs_q = operation_affine(
+        *profile, *silu, "input", 1);
+    const auto & silu_output_q = operation_affine(
+        *profile, *silu, "output", 0);
+    const auto & product_lhs_q = operation_affine(
+        *profile, *product, "input", 0);
+    const auto & product_rhs_q = operation_affine(
+        *profile, *product, "input", 1);
+    const auto & product_output_q = operation_affine(
+        *profile, *product, "output", 0);
+    const int elements = static_cast<int>(width * tokens);
+    std::vector<uint16_t> direct_sigmoid(elements);
+    std::vector<uint16_t> direct_silu(elements);
+    std::vector<uint16_t> direct_reference(elements);
+    std::vector<uint16_t> direct_fused(elements);
+    const auto reference_kernel = [&]() {
+        int index = 0;
+        for (; index + 8 <= elements; index += 8) {
+            direct_sigmoid[index + 0] = sigmoid->unary_lut[gate_data[index + 0]];
+            direct_sigmoid[index + 1] = sigmoid->unary_lut[gate_data[index + 1]];
+            direct_sigmoid[index + 2] = sigmoid->unary_lut[gate_data[index + 2]];
+            direct_sigmoid[index + 3] = sigmoid->unary_lut[gate_data[index + 3]];
+            direct_sigmoid[index + 4] = sigmoid->unary_lut[gate_data[index + 4]];
+            direct_sigmoid[index + 5] = sigmoid->unary_lut[gate_data[index + 5]];
+            direct_sigmoid[index + 6] = sigmoid->unary_lut[gate_data[index + 6]];
+            direct_sigmoid[index + 7] = sigmoid->unary_lut[gate_data[index + 7]];
+        }
+        for (; index < elements; ++index) {
+            direct_sigmoid[index] = sigmoid->unary_lut[gate_data[index]];
+        }
+        ggml_vec_mul_affine_u16_qnn_q31(
+            elements, direct_silu.data(),
+            gate_data, silu_lhs_q.zero_point,
+            direct_sigmoid.data(), silu_rhs_q.zero_point,
+            silu->product_to_output_q31, silu->product_requant_nudge_q31,
+            silu_output_q.zero_point);
+        ggml_vec_mul_affine_u16_qnn_q31(
+            elements, direct_reference.data(),
+            direct_silu.data(), product_lhs_q.zero_point,
+            up_data, product_rhs_q.zero_point,
+            product->product_to_output_q31,
+            product->product_requant_nudge_q31,
+            product_output_q.zero_point);
+    };
+    const auto fused_kernel = [&]() {
+        ggml_vec_swiglu_u16_qnn_q31(
+            elements, direct_fused.data(), gate_data, up_data,
+            sigmoid->unary_lut.data(),
+            silu_lhs_q.zero_point, silu_rhs_q.zero_point,
+            silu->product_to_output_q31, silu->product_requant_nudge_q31,
+            silu_output_q.zero_point,
+            product_lhs_q.zero_point, product_rhs_q.zero_point,
+            product->product_to_output_q31,
+            product->product_requant_nudge_q31,
+            product_output_q.zero_point);
+    };
+    reference_kernel();
+    fused_kernel();
+    size_t direct_mismatches = 0;
+    for (int index = 0; index < elements; ++index) {
+        direct_mismatches +=
+            direct_reference[index] != direct_fused[index] ||
+            direct_reference[index] != expected[index];
+    }
+    const auto time_kernel = [&](const auto & kernel) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int iteration = 0; iteration < timed_iterations; ++iteration) {
+            kernel();
+        }
+        return std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start).count() / timed_iterations;
+    };
+    const double reference_kernel_us = time_kernel(reference_kernel);
+    const double fused_kernel_us = time_kernel(fused_kernel);
+    uint64_t checksum = 0;
+    for (int64_t index = 0; index < width * tokens; ++index) {
+        checksum += actual[index];
+    }
+    std::printf(
+        "qnn-profile-ffn-fused-test: layer=%d tokens=%lld width=%lld "
+        "iterations=%d reference_nodes=%d fused_nodes=%d "
+        "reference_us=%.3f fused_us=%.3f speedup=%.3fx "
+        "kernel_reference_us=%.3f kernel_fused_us=%.3f kernel_speedup=%.3fx "
+        "exact=%d mismatches=%zu direct_mismatches=%zu checksum=%llu neon=%d\n",
+        layer_id, static_cast<long long>(tokens), static_cast<long long>(width),
+        timed_iterations, ggml_graph_n_nodes(reference_graph),
+        ggml_graph_n_nodes(fused_graph), reference_us, fused_us,
+        reference_us / fused_us,
+        reference_kernel_us, fused_kernel_us,
+        reference_kernel_us / fused_kernel_us,
+        mismatches == 0 && direct_mismatches == 0 ? 1 : 0, mismatches,
+        direct_mismatches,
+        static_cast<unsigned long long>(checksum), QNN_U16_HAVE_NEON);
+    ggml_threadpool_free(threadpool);
+    ggml_free(ctx);
+    return mismatches == 0 && direct_mismatches == 0 ? 0 : 1;
+}
+
+int run_profile_attention_fused_test(
+        const char * profile_path,
+        int32_t layer_id,
+        int32_t n_kv) {
+    constexpr int32_t n_head = 16;
+    constexpr int32_t n_head_kv = 8;
+    constexpr int32_t head_dimension = 128;
+    constexpr int timed_iterations = 4;
+    if (n_kv <= 0) {
+        throw std::runtime_error("fused attention n_kv must be positive");
+    }
+    const auto profile = llama_qnn_quant_profile_load_file(profile_path);
+    const auto fx_name = [](const char * stem, int32_t index, int32_t head) {
+        std::string result(stem);
+        if (index > 0) {
+            result += "_" + std::to_string(index);
+        }
+        return result + "_h_" + std::to_string(head);
+    };
+    const auto require_op = [&](const char * stem, int32_t index, int32_t head,
+                                const char * type) {
+        const auto * operation =
+            profile->find_operation_by_fx(layer_id, fx_name(stem, index, head));
+        if (operation == nullptr || operation->type_name != type) {
+            throw std::runtime_error("missing attention operation " +
+                fx_name(stem, index, head));
+        }
+        return operation;
+    };
+
+    ggml_init_params init_params {
+        std::max<size_t>(64U * 1024U * 1024U,
+            static_cast<size_t>(n_kv) * head_dimension * n_head_kv * 6U),
+        nullptr,
+        false,
+    };
+    ggml_context * ctx = ggml_init(init_params);
+    if (ctx == nullptr) {
+        throw std::runtime_error("failed to create fused attention context");
+    }
+    ggml_tensor * query =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_U16, head_dimension, n_head, 1);
+    ggml_tensor * positions =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * key_reference =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_kv, head_dimension, n_head_kv);
+    ggml_tensor * key =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_I8, head_dimension, n_kv, n_head_kv);
+    ggml_tensor * value =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_I8, head_dimension, n_head_kv, n_kv);
+    ggml_tensor * condition =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n_kv, 1);
+    auto * query_data = static_cast<uint16_t *>(query->data);
+    auto * key_reference_data = static_cast<uint8_t *>(key_reference->data);
+    auto * key_data = static_cast<uint8_t *>(key->data);
+    auto * value_data = static_cast<uint8_t *>(value->data);
+    auto * condition_data = static_cast<uint8_t *>(condition->data);
+    static_cast<int32_t *>(positions->data)[0] = 17;
+    for (int64_t i = 0; i < ggml_nelements(query); ++i) {
+        query_data[i] = static_cast<uint16_t>((32731U + i * 73U) & 0xffffU);
+    }
+    for (int32_t head = 0; head < n_head_kv; ++head) {
+        for (int32_t token = 0; token < n_kv; ++token) {
+            for (int32_t dim = 0; dim < head_dimension; ++dim) {
+                const size_t token_major =
+                    (static_cast<size_t>(head) * n_kv + token) *
+                        head_dimension + dim;
+                const uint8_t value =
+                    static_cast<uint8_t>((token_major * 29U + 113U) & 0xffU);
+                key_data[token_major] = value;
+                key_reference_data[
+                    (static_cast<size_t>(head) * head_dimension + dim) *
+                        n_kv + token] = value;
+            }
+        }
+    }
+    for (int64_t i = 0; i < ggml_nelements(value); ++i) {
+        value_data[i] = static_cast<uint8_t>((i * 47U + 61U) & 0xffU);
+    }
+    for (int32_t i = 0; i < n_kv; ++i) {
+        condition_data[i] = i + 7 < n_kv ? 1 : 0;
+    }
+
+    std::vector<llama_qnn_u16_attention_head_ops> operations(n_head);
+    std::vector<const llama_qnn_operation *> norm_operations(n_head);
+    std::vector<const llama_qnn_operation *> rotate_operations(n_head);
+    std::vector<llama_qnn_u16_rope_head_ops> rope_operations(n_head);
+    std::vector<ggml_tensor *> reference_query(n_head);
+    const llama_qnn_u16_tensor * cos_table =
+        profile->find_u16_tensor("b__frozen_param311@0");
+    const llama_qnn_u16_tensor * sin_table =
+        profile->find_u16_tensor("b__frozen_param312@0");
+    if (cos_table == nullptr || sin_table == nullptr) {
+        ggml_free(ctx);
+        throw std::runtime_error("profile is missing RoPE tables");
+    }
+    for (int32_t head = 0; head < n_head; ++head) {
+        norm_operations[head] = require_op(
+            "aten_rms_norm_default", 4 * layer_id + 1, head, "RmsNorm");
+        rotate_operations[head] = require_op(
+            "aten_matmul_default", 4 * layer_id, head, "MatMul");
+        auto & rope = rope_operations[head];
+        for (int index = 0; index < 4; ++index) {
+            rope.multiply[index] = require_op(
+                "aten_mul_tensor", 10 * layer_id + 1 + index,
+                head, "ElementWiseMultiply");
+        }
+        for (int index = 0; index < 2; ++index) {
+            rope.slices[index] = require_op(
+                "aten_slice_copy_tensor", 4 * layer_id + index,
+                head, "StridedSlice");
+        }
+        rope.subtract = require_op(
+            "aten_sub_tensor", 2 * layer_id, head, "ElementWiseSubtract");
+        rope.add = require_op(
+            "aten_add_tensor", 5 * layer_id, head, "ElementWiseAdd");
+        rope.cos_table = cos_table;
+        rope.sin_table = sin_table;
+        ggml_tensor * query_head = ggml_view_2d(
+            ctx, query, head_dimension, 1, query->nb[2],
+            static_cast<size_t>(head) * query->nb[1]);
+        query_head = llama_qnn_u16_rms_norm(
+            ctx, query_head, profile.get(), norm_operations[head]);
+        query_head = llama_qnn_u16_rope(
+            ctx, query_head, positions, profile.get(), layer_id, head, false);
+        reference_query[head] = llama_qnn_u16_qk_rotate(
+            ctx, query_head, profile.get(), layer_id, head, false);
+    }
+    ggml_tensor * fused_query = llama_qnn_u16_rms_norm_heads(
+        ctx, query, profile.get(), norm_operations.data(), n_head);
+    fused_query = llama_qnn_u16_rope_heads(
+        ctx, fused_query, positions, profile.get(), rope_operations.data(), n_head);
+    fused_query = llama_qnn_u16_qk_rotate_heads(
+        ctx, fused_query, profile.get(), rotate_operations.data(), n_head);
+
+    std::vector<ggml_tensor *> reference;
+    reference.reserve(n_head);
+    for (int32_t head = 0; head < n_head; ++head) {
+        operations[head] = {
+            require_op("aten_matmul_default", 4 * layer_id + 2, head, "MatMul"),
+            require_op("aten_div_tensor", layer_id, head, "ElementWiseDivide"),
+            require_op("aten_amin_default", layer_id, head, "ReduceMin"),
+            require_op("aten_add_tensor", 5 * layer_id + 2, head, "ElementWiseAdd"),
+            require_op("aten_where_self", layer_id, head, "ElementWiseSelect"),
+            require_op("aten__softmax_default", layer_id, head, "Softmax"),
+            require_op("aten_matmul_default", 4 * layer_id + 3, head, "MatMul"),
+        };
+        const int32_t kv_head = head / (n_head / n_head_kv);
+        ggml_tensor * query_head = reference_query[head];
+        ggml_tensor * key_head = ggml_view_2d(
+            ctx, key_reference, n_kv, head_dimension, key_reference->nb[1],
+            static_cast<size_t>(kv_head) * key_reference->nb[2]);
+        ggml_tensor * score = llama_qnn_u16_u8_matmul(
+            ctx, query_head, key_head, profile.get(), operations[head].score);
+        score = llama_qnn_u16_attention_softmax(
+            ctx, score, condition, profile.get(),
+            operations[head].divide, operations[head].minimum,
+            operations[head].floor_add, operations[head].select,
+            operations[head].softmax);
+        ggml_tensor * value_head = ggml_view_2d(
+            ctx, value, head_dimension, n_kv, value->nb[2],
+            static_cast<size_t>(kv_head) * value->nb[1]);
+        reference.push_back(llama_qnn_u16_u8_matmul(
+            ctx, score, value_head, profile.get(), operations[head].value));
+    }
+    ggml_tensor * fused = llama_qnn_u16_attention(
+        ctx, fused_query, key, value, condition, profile.get(), operations.data(),
+        n_head, n_head_kv);
+
+    ggml_cgraph * reference_graph = ggml_new_graph_custom(ctx, 256, false);
+    for (ggml_tensor * output : reference) {
+        ggml_build_forward_expand(reference_graph, output);
+    }
+    ggml_cgraph * fused_graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(fused_graph, fused);
+    if (ggml_graph_compute_with_ctx(ctx, reference_graph, 4) != GGML_STATUS_SUCCESS ||
+        ggml_graph_compute_with_ctx(ctx, fused_graph, 4) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        throw std::runtime_error("fused attention graph execution failed");
+    }
+
+    size_t mismatches = 0;
+    for (int32_t head = 0; head < n_head; ++head) {
+        const auto * expected = static_cast<const uint16_t *>(reference[head]->data);
+        const auto * actual = static_cast<const uint16_t *>(fused->data) +
+            static_cast<size_t>(head) * head_dimension;
+        for (int32_t i = 0; i < head_dimension; ++i) {
+            mismatches += expected[i] != actual[i];
+        }
+    }
+    const auto time_graph = [&](ggml_cgraph * graph) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int iteration = 0; iteration < timed_iterations; ++iteration) {
+            if (ggml_graph_compute_with_ctx(ctx, graph, 4) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("timed attention graph failed");
+            }
+        }
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count() / timed_iterations;
+    };
+    const double reference_ms = time_graph(reference_graph);
+    const double fused_ms = time_graph(fused_graph);
+    const auto * score_weights =
+        profile->find_aux_operand(*operations[0].score, "input", 1);
+    const auto * value_weights =
+        profile->find_aux_operand(*operations[0].value, "input", 1);
+    const int32_t score_weight_zero_point =
+        score_weights->qparams.scale_offsets[0].zero_point;
+    const int32_t value_weight_zero_point =
+        value_weights->qparams.scale_offsets[0].zero_point;
+    std::printf(
+        "qnn-profile-attention-fused-test: layer=%d n_kv=%d iterations=%d "
+        "reference_nodes=%d fused_nodes=%d reference_ms=%.6f fused_ms=%.6f "
+        "speedup=%.3fx exact=%d mismatches=%zu dotprod_enabled=%d "
+        "score_weight_zp=%d value_weight_zp=%d\n",
+        layer_id, n_kv, timed_iterations,
+        ggml_graph_n_nodes(reference_graph), ggml_graph_n_nodes(fused_graph),
+        reference_ms, fused_ms, reference_ms / fused_ms,
+        mismatches == 0 ? 1 : 0, mismatches,
+        ggml_qnn_u16_dotprod_enabled(),
+        score_weight_zero_point, value_weight_zero_point);
+    ggml_free(ctx);
+    return mismatches == 0 ? 0 : 1;
+}
+
 void print_usage(const char * program) {
     std::printf(
         "usage: GGML_QNN_U16_ACTIVATIONS=1 %s --self-test "
         "--backend=scalar|neon|compare\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-test\n"
+        "       %s --lm-head-gemv-test <q8_0|q6_k> [threads] [rows]\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --graph-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gguf-test <model.gguf> "
         "[--tensor=<GPTQ2_{32,64,128} tensor>]\n"
@@ -6245,9 +6923,16 @@ void print_usage(const char * program) {
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-attention-value-vector-test "
         "<runtime-profile.json> <layer> <fx-node> <instances> "
         "<probabilities.u16.bin> <values.u8.bin> <expected.u16.bin>\n"
+        "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-attention-fused-test "
+        "<runtime-profile.bin> <layer> <n-kv>\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-ffn-vector-test "
         "<runtime-profile.json> <layer> <gate.u16.bin> <up.u16.bin> "
-        "<sigmoid.u16.bin> <silu.u16.bin> <product.u16.bin>\n",
+        "<sigmoid.u16.bin> <silu.u16.bin> <product.u16.bin>\n"
+        "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-ffn-fused-test "
+        "<runtime-profile.bin> <layer> <tokens>\n",
+        program,
+        program,
+        program,
         program,
         program,
         program,
@@ -6268,6 +6953,16 @@ void print_usage(const char * program) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc >= 3 && argc <= 5 &&
+        std::string_view(argv[1]) == "--lm-head-gemv-test") {
+        const std::string_view type(argv[2]);
+        const ggml_type weight_type =
+            type == "q8_0" ? GGML_TYPE_Q8_0 :
+            type == "q6_k" ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
+        const int threads = argc >= 4 ? std::stoi(argv[3]) : 1;
+        const int64_t rows = argc >= 5 ? std::stoll(argv[4]) : 151936;
+        return run_lm_head_gemv_test(weight_type, threads, rows);
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--profile-runtime-test") {
         try {
             const auto profile = llama_qnn_quant_profile_load_file(argv[2]);
@@ -6457,6 +7152,20 @@ int main(int argc, char ** argv) {
             return 20;
         }
     }
+    if (argc == 5 &&
+        std::string_view(argv[1]) == "--profile-attention-fused-test") {
+        if (!u16_activations_enabled()) {
+            std::fprintf(stderr, "U16 activation core is disabled; set GGML_QNN_U16_ACTIVATIONS=1 explicitly.\n");
+            return 2;
+        }
+        try {
+            return run_profile_attention_fused_test(
+                argv[2], std::stoi(argv[3]), std::stoi(argv[4]));
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "qnn-profile-attention-fused-test failed: %s\n", error.what());
+            return 24;
+        }
+    }
     if (argc == 9 &&
         std::string_view(argv[1]) == "--profile-attention-value-vector-test") {
         if (!u16_activations_enabled()) {
@@ -6483,6 +7192,19 @@ int main(int argc, char ** argv) {
                 argv[6], argv[7], argv[8]);
         } catch (const std::exception & error) {
             std::fprintf(stderr, "profile FFN vector test failed: %s\n", error.what());
+            return 2;
+        }
+    }
+    if (argc == 5 && std::string_view(argv[1]) == "--profile-ffn-fused-test") {
+        try {
+            if (!llama_qnn_u16_activations_enabled()) {
+                std::fprintf(stderr, "GGML_QNN_U16_ACTIVATIONS=1 is required.\n");
+                return 2;
+            }
+            return run_profile_ffn_fused_test(
+                argv[2], std::stoi(argv[3]), std::stoll(argv[4]));
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "profile fused FFN test failed: %s\n", error.what());
             return 2;
         }
     }

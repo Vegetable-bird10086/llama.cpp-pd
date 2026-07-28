@@ -387,6 +387,29 @@ void ggml_vec_mul_affine_u16_qnn_q31(
         int64_t product_requant_nudge_q31,
         int32_t output_zero_point);
 
+// Exact QNN U16 SwiGLU:
+//   sigmoid = lut[gate]
+//   silu    = requant(gate * sigmoid)
+//   output  = requant(silu * up)
+// The intermediate codes stay local so the fused graph does not materialize
+// the sigmoid and SiLU tensors. ARM builds vectorize the centered products.
+void ggml_vec_swiglu_u16_qnn_q31(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT gate,
+        const uint16_t * GGML_RESTRICT up,
+        const uint16_t * GGML_RESTRICT sigmoid_lut,
+        int32_t silu_lhs_zero_point,
+        int32_t silu_rhs_zero_point,
+        int64_t silu_product_to_output_q31,
+        int64_t silu_product_requant_nudge_q31,
+        int32_t silu_output_zero_point,
+        int32_t product_lhs_zero_point,
+        int32_t product_rhs_zero_point,
+        int64_t product_to_output_q31,
+        int64_t product_requant_nudge_q31,
+        int32_t product_output_zero_point);
+
 void ggml_vec_add_affine_u16_qnn_fixed_scalar(
         int n,
         uint16_t * GGML_RESTRICT output,
@@ -517,19 +540,76 @@ void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
         int64_t product_to_output_q20,
         int32_t output_zero_point);
 
-void ggml_vec_requant_u16_qnn_fixed(
-        int n,
+// Two vectors multiplied by the same U8 matrix. The dot-product path shares
+// every K/V weight load and weight-sum reduction across a GQA query pair.
+void ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
+        int input_dimension,
+        int output_dimension,
+        size_t weight_row_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1);
+
+// Token-major K cache: weights are [output_token, input_dimension].
+void ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
         uint16_t * GGML_RESTRICT output,
         const uint16_t * GGML_RESTRICT input,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point);
+
+void ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1);
+
+// Experimental runtime-gated ARM dot-product path for dense U16 x U8
+// attention matrices. The unchanged row-major cache layout requires an
+// in-register transpose and signed-radix decomposition, so it is opt-in until
+// it beats the portable NEON kernel. Set GGML_QNN_U16_DOTPROD=1 to enable.
+int ggml_qnn_u16_dotprod_enabled(void);
+
+void ggml_vec_requant_u16_qnn_fixed(
+        int n,
+        uint16_t * output,
+        const uint16_t * input,
         int32_t input_zero_point,
         int64_t input_to_output_q20,
         int32_t output_zero_point);
 
+uint16_t ggml_vec_min_u16_qnn(int n, const uint16_t * input);
+
 void ggml_vec_select_affine_u16_qnn_fixed(
         int n,
-        uint16_t * GGML_RESTRICT output,
+        uint16_t * output,
         const uint8_t * GGML_RESTRICT condition,
-        const uint16_t * GGML_RESTRICT when_true,
+        const uint16_t * when_true,
         int32_t true_zero_point,
         int32_t true_multiplier_q15,
         int32_t true_right_shift,
@@ -546,8 +626,8 @@ void ggml_vec_select_affine_u16_qnn_fixed(
 // fallback. Both paths allocate no row buffer.
 void ggml_vec_softmax_u16_qnn_fixed(
         int n,
-        uint16_t * GGML_RESTRICT output,
-        const uint16_t * GGML_RESTRICT input,
+        uint16_t * output,
+        const uint16_t * input,
         int64_t scale_over_ln2_q24,
         int64_t output_unit_code,
         int32_t output_zero_point,

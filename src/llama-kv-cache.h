@@ -162,9 +162,8 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
-    // Import the Prefill handoff's exact U8 [layer, head, seq, dim] payload
-    // directly into the Decode cache, without constructing a serialized
-    // llama sequence-state blob.
+    // Import a Decode-ready compact U8 payload. K is
+    // Both K and V are [layer, head, token, dim].
     bool import_qnn_u8(
         const uint8_t * kv,
         uint32_t cell_count,
@@ -209,6 +208,8 @@ public:
     // input API
     //
 
+    uint32_t get_n_k_idxs(const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
@@ -243,7 +244,7 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
-    bool qnn_u8_layout = false; // K is dim-major, V is token-major, both raw U8
+    bool qnn_u8_layout = false; // K/V [head,token,dim]
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -393,6 +394,8 @@ public:
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
+    uint32_t get_n_k_idxs(const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 

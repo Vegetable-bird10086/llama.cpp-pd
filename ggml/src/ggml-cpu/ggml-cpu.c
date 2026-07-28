@@ -34,6 +34,10 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -3750,7 +3754,9 @@ int ggml_cpu_has_neon(void) {
 }
 
 int ggml_cpu_has_dotprod(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__aarch64__) && defined(__linux__) && defined(HWCAP_ASIMDDP)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#elif defined(__ARM_ARCH) && defined(__ARM_FEATURE_DOTPROD)
     return 1;
 #else
     return 0;
@@ -3766,7 +3772,9 @@ int ggml_cpu_has_sve(void) {
 }
 
 int ggml_cpu_has_matmul_int8(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_MATMUL_INT8)
+#if defined(__aarch64__) && defined(__linux__) && defined(HWCAP2_I8MM)
+    return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+#elif defined(__ARM_ARCH) && defined(__ARM_FEATURE_MATMUL_INT8)
     return 1;
 #else
     return 0;

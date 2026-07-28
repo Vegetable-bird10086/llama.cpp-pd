@@ -32,4 +32,10 @@ if ! "${objdump}" -d "${cpu_library}" |
     exit 1
 fi
 
-echo "Android PD build passed: portable ARMv8 baseline with runtime-gated SDOT"
+if ! "${objdump}" -d "${cpu_library}" |
+        grep -E '[[:space:]](smmla|ummla|usmmla)[[:space:]]' >/dev/null; then
+    echo "I8MM instructions are missing from ${cpu_library}" >&2
+    exit 1
+fi
+
+echo "Android PD build passed: portable ARMv8 baseline with runtime-gated SDOT/I8MM"

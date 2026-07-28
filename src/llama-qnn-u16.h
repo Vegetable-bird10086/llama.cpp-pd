@@ -4,8 +4,36 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct llama_model;
+
+// The graph builder supplies exported operation metadata; the kernels only
+// depend on tensor shape and these descriptors. This keeps multi-head fusion
+// usable by any model/export with the same integer attention contract.
+struct llama_qnn_u16_rope_head_ops {
+    const llama_qnn_operation * multiply[4];
+    const llama_qnn_operation * slices[2];
+    const llama_qnn_operation * subtract;
+    const llama_qnn_operation * add;
+    const llama_qnn_u16_tensor * cos_table;
+    const llama_qnn_u16_tensor * sin_table;
+};
+
+struct llama_qnn_u16_attention_head_ops {
+    const llama_qnn_operation * score;
+    const llama_qnn_operation * divide;
+    const llama_qnn_operation * minimum;
+    const llama_qnn_operation * floor_add;
+    const llama_qnn_operation * select;
+    const llama_qnn_operation * softmax;
+    const llama_qnn_operation * value;
+};
 
 bool llama_qnn_u16_activations_enabled();
+
+// Loads and attaches the environment-selected kernel-ready profile after the
+// GGUF tensors are resident. This is used by PD Decode to defer the large
+// metadata mapping until Prefill has released its rebuild working set.
+bool llama_qnn_u16_attach_profile_from_environment(llama_model * model);
 
 // Quantize/dequantize only at the graph boundary. The decode layers between
 // these two calls stay in QNN's integer activation domains.
@@ -71,10 +99,28 @@ ggml_tensor * llama_qnn_u16_rms_norm(
     const llama_qnn_quant_profile * profile,
     const llama_qnn_operation * operation);
 
+ggml_tensor * llama_qnn_u16_rms_norm_heads(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_operation * const * operations,
+    int32_t n_head);
+
 ggml_tensor * llama_qnn_u16_sigmoid(
     ggml_context * ctx,
     ggml_tensor * input,
     const llama_qnn_operation * operation);
+
+// Fuses sigmoid(gate), gate * sigmoid(gate), and SiLU(gate) * up while
+// preserving both exported QNN multiply requantization boundaries.
+ggml_tensor * llama_qnn_u16_swiglu(
+    ggml_context * ctx,
+    ggml_tensor * gate,
+    ggml_tensor * up,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_operation * sigmoid_operation,
+    const llama_qnn_operation * silu_multiply_operation,
+    const llama_qnn_operation * product_multiply_operation);
 
 // Fuses the QNN split-half RoPE decomposition for one query or key head. The
 // position tensor is I32 and the input/output layout is [head_dim, tokens, ...].
@@ -87,6 +133,14 @@ ggml_tensor * llama_qnn_u16_rope(
     int32_t head_index,
     bool key_head);
 
+ggml_tensor * llama_qnn_u16_rope_heads(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * positions,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_u16_rope_head_ops * head_ops,
+    int32_t n_head);
+
 // Applies the exact static S16 Q/K rotation MatMul used immediately after
 // QNN RoPE. The matrix stays in the loaded profile; execution is U16 x S16
 // integer arithmetic with direct U16 requantization.
@@ -98,6 +152,13 @@ ggml_tensor * llama_qnn_u16_qk_rotate(
     int32_t head_index,
     bool key_head);
 
+ggml_tensor * llama_qnn_u16_qk_rotate_heads(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_operation * const * operations,
+    int32_t n_head);
+
 // Converts one U16 activation tensor to the exact U8 affine domain declared by
 // a QNN Convert operation. GGML_TYPE_I8 is used only as a one-byte container;
 // the kernel and cache consumers interpret its bytes as unsigned codes.
@@ -106,6 +167,13 @@ ggml_tensor * llama_qnn_u16_to_u8(
     ggml_tensor * input,
     const llama_qnn_quant_profile * profile,
     const llama_qnn_operation * operation);
+
+ggml_tensor * llama_qnn_u16_to_u8_heads(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_operation * const * operations,
+    int32_t n_head);
 
 // Applies a QNN MatMul with U16 lhs activations and a raw U8 rhs matrix. The
 // rhs tensor uses GGML_TYPE_I8 as byte storage and has shape [N,K,...].
@@ -156,3 +224,18 @@ ggml_tensor * llama_qnn_u16_attention_softmax(
     const llama_qnn_operation * floor_add_operation,
     const llama_qnn_operation * select_operation,
     const llama_qnn_operation * softmax_operation);
+
+// Executes all query heads for one layer in a single graph node. QK, the
+// exported fixed-point mask/softmax chain, and PV remain bit-compatible with
+// the per-head path; work is scheduled by GQA group so the two query heads
+// sharing one KV head reuse the same K/V cache region.
+ggml_tensor * llama_qnn_u16_attention(
+    ggml_context * ctx,
+    ggml_tensor * query,
+    ggml_tensor * key_cache,
+    ggml_tensor * value_cache,
+    ggml_tensor * condition,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_u16_attention_head_ops * head_ops,
+    int32_t n_head,
+    int32_t n_head_kv);

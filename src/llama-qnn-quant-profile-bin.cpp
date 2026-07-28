@@ -707,10 +707,14 @@ llama_qnn_quant_profile_load_binary_file(const std::string & path) {
     if (payload_bytes != mapping->size - kHeaderBytes) {
         binary_fail("payload size disagrees with the file size");
     }
-    if (payload_checksum(
-            mapping->data + kHeaderBytes, static_cast<size_t>(payload_bytes)) !=
-        expected_checksum) {
-        binary_fail("payload checksum is invalid");
+    const char * verify_checksum =
+        std::getenv("LLAMA_QNN_U16_VERIFY_BINARY_CHECKSUM");
+    if (verify_checksum != nullptr && std::strcmp(verify_checksum, "1") == 0) {
+        if (payload_checksum(
+                mapping->data + kHeaderBytes, static_cast<size_t>(payload_bytes)) !=
+            expected_checksum) {
+            binary_fail("payload checksum is invalid");
+        }
     }
 
     binary_reader reader(

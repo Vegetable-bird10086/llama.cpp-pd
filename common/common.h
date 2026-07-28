@@ -885,6 +885,7 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+    bool init_context(common_params & params);
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();

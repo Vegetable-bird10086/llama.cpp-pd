@@ -504,7 +504,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= self_k_idxs->ne[0] == mctx->get_n_k_idxs(params.ubatch);
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
@@ -983,7 +983,26 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
+            LLAMA_LOG_DEBUG(
+                "%s: parameter mismatch old=(tokens=%u seq_tokens=%u seqs=%u"
+                " outputs=%u token=%d embd=%d gtype=%d)"
+                " new=(tokens=%u seq_tokens=%u seqs=%u outputs=%u"
+                " token=%d embd=%d gtype=%d)\n",
+                __func__,
+                this->params.ubatch.n_tokens,
+                this->params.ubatch.n_seq_tokens,
+                this->params.ubatch.n_seqs,
+                this->params.n_outputs,
+                this->params.ubatch.token != nullptr,
+                this->params.ubatch.embd != nullptr,
+                this->params.gtype,
+                params.ubatch.n_tokens,
+                params.ubatch.n_seq_tokens,
+                params.ubatch.n_seqs,
+                params.n_outputs,
+                params.ubatch.token != nullptr,
+                params.ubatch.embd != nullptr,
+                params.gtype);
         }
 
         return false;
@@ -995,11 +1014,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    for (auto & input : inputs) {
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        auto & input = inputs[index];
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: input[%zu] can_reuse = %d\n", __func__, index, cur);
         }
 
         res = res && cur;

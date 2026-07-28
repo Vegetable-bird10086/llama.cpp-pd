@@ -6,12 +6,43 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
+
+static void llama_qnn_u8_clear_buffer(ggml_backend_buffer_t buffer) {
+    const size_t size = ggml_backend_buffer_get_size(buffer);
+    void * base = ggml_backend_buffer_get_base(buffer);
+    if (!ggml_backend_buffer_is_host(buffer) || base == nullptr ||
+        size < 16 * 1024 * 1024) {
+        ggml_backend_buffer_clear(buffer, 0);
+        return;
+    }
+
+    constexpr size_t n_threads = 4;
+    const size_t chunk =
+        ((size + n_threads - 1) / n_threads + 4095) & ~size_t{4095};
+    std::array<std::thread, n_threads - 1> workers;
+    for (size_t thread = 1; thread < n_threads; ++thread) {
+        workers[thread - 1] = std::thread([base, size, chunk, thread]() {
+            const size_t begin = std::min(size, thread * chunk);
+            const size_t end = std::min(size, begin + chunk);
+            if (end > begin) {
+                std::memset(
+                    static_cast<uint8_t *>(base) + begin, 0, end - begin);
+            }
+        });
+    }
+    std::memset(base, 0, std::min(size, chunk));
+    for (auto & worker : workers) {
+        worker.join();
+    }
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -117,7 +148,7 @@ llama_kv_cache::llama_kv_cache(
     if (qnn_u8_layout) {
         GGML_ASSERT(type_k == GGML_TYPE_I8 && type_v == GGML_TYPE_I8);
         GGML_ASSERT(!v_trans);
-        LLAMA_LOG_INFO("%s: QNN U8 layout enabled (K dim-major, V token-major)\n", __func__);
+        LLAMA_LOG_INFO("%s: QNN U8 layout enabled (K/V head/token/dim)\n", __func__);
     }
 
     const uint32_t n_layer = hparams.n_layer_all;
@@ -309,9 +340,14 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        // Match the QNN prefill cache input: unused U8 cache slots are code 0,
-        // even though the per-tensor affine zero point is 128.
-        ggml_backend_buffer_clear(buf, 0);
+        // Match the QNN prefill cache input: every unused U8 cache slot must
+        // remain deterministic code 0, even though the affine zero point is
+        // 128. Do not defer or omit this full-capacity clear.
+        if (qnn_u8_layout) {
+            llama_qnn_u8_clear_buffer(buf);
+        } else {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -1270,9 +1306,6 @@ bool llama_kv_cache::import_qnn_u8(
     const uint8_t * k_source = kv;
     const uint8_t * v_source = kv + per_kind;
     const size_t kv_size = v_cells[strm].size();
-    std::vector<uint8_t> column(cell_count);
-    std::vector<uint8_t> row(n_embd);
-
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
         ggml_tensor * k = layer.k_stream[strm];
@@ -1284,34 +1317,22 @@ bool llama_kv_cache::import_qnn_u8(
             return false;
         }
         for (uint32_t head = 0; head < num_kv_heads; ++head) {
-            for (uint32_t dim = 0; dim < head_dim; ++dim) {
-                const uint32_t embedding = head * head_dim + dim;
-                for (uint32_t pos = 0; pos < cell_count; ++pos) {
-                    const size_t source =
-                        (size_t) il * per_layer +
-                        ((size_t) head * cell_count + pos) * head_dim + dim;
-                    column[pos] = k_source[source];
-                }
-                ggml_backend_tensor_set(
-                    k, column.data(),
-                    (size_t) embedding * kv_size + sinfo.head(),
-                    cell_count);
-            }
-        }
-        for (uint32_t pos = 0; pos < cell_count; ++pos) {
-            for (uint32_t head = 0; head < num_kv_heads; ++head) {
-                const size_t source =
-                    (size_t) il * per_layer +
-                    ((size_t) head * cell_count + pos) * head_dim;
-                memcpy(
-                    row.data() + (size_t) head * head_dim,
-                    v_source + source, head_dim);
-            }
             ggml_backend_tensor_set(
-                v, row.data(),
-                ((size_t) sinfo.head() + pos) * n_embd,
-                n_embd);
+                k,
+                k_source + (size_t) il * per_layer +
+                    (size_t) head * cell_count * head_dim,
+                ((size_t) head * kv_size + sinfo.head()) * head_dim,
+                (size_t) cell_count * head_dim);
         }
+        for (uint32_t head = 0; head < num_kv_heads; ++head) {
+            ggml_backend_tensor_set(
+                v,
+                v_source + (size_t) il * per_layer +
+                    (size_t) head * cell_count * head_dim,
+                ((size_t) head * kv_size + sinfo.head()) * head_dim,
+                (size_t) cell_count * head_dim);
+        }
+
     }
     return true;
 }
@@ -1345,11 +1366,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (qnn_u8_layout) {
-        // Physical K is [all_head_dims, kv_size]. Expose token as the
-        // contiguous matrix-output dimension expected by QNN MatMul.
+        // Physical K is [head, token, dim].
         return ggml_view_4d(ctx, k,
-                n_kv, hparams.n_embd_head_k(il), hparams.n_head_kv(il), ns,
-                ggml_row_size(k->type, kv_size),
+                hparams.n_embd_head_k(il), n_kv, hparams.n_head_kv(il), ns,
+                ggml_row_size(k->type, hparams.n_embd_head_k(il)),
                 ggml_row_size(k->type, kv_size*hparams.n_embd_head_k(il)),
                 ggml_row_size(k->type, kv_size*n_embd_k_gqa),
                 ggml_row_size(k->type, kv_size*n_embd_k_gqa)*sinfo.s0);
@@ -1375,6 +1395,17 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    if (qnn_u8_layout) {
+        // Physical V is [head, token, dim]. Expose [dim, head, token]
+        // with token rows contiguous inside each head.
+        return ggml_view_4d(ctx, v,
+                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+                ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),
+                ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+                ggml_row_size(v->type, kv_size*n_embd_v_gqa),
+                ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+    }
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
@@ -1416,8 +1447,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         GGML_ASSERT(k_cur->type == GGML_TYPE_I8);
         GGML_ASSERT(n_embd_gqa == k->ne[0]);
         GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_gqa) == k_cur->nb[2]);
-        k_cur = ggml_reshape_2d(ctx, k_cur, 1, n_embd_gqa*n_tokens);
-        ggml_tensor * k_view = ggml_reshape_2d(ctx, k, 1, ggml_nelements(k));
+        k_cur = ggml_reshape_2d(ctx, k_cur, n_embd_head, n_head*n_tokens);
+        ggml_tensor * k_view = ggml_reshape_2d(
+            ctx, k, n_embd_head, ggml_nelements(k)/n_embd_head);
         return ggml_set_rows(ctx, k_view, k_cur, k_idxs);
     }
 
@@ -1454,6 +1486,16 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     // we can merge dims 0 and 1
     GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+
+    if (qnn_u8_layout) {
+        GGML_ASSERT(v_cur->type == GGML_TYPE_I8);
+        GGML_ASSERT(n_embd_gqa == v->ne[0]);
+        GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]);
+        v_cur = ggml_reshape_2d(ctx, v_cur, n_embd_head, n_head*n_tokens);
+        ggml_tensor * v_view = ggml_reshape_2d(
+            ctx, v, n_embd_head, ggml_nelements(v)/n_embd_head);
+        return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+    }
 
     const int64_t n_stream = v->ne[2];
 
@@ -1495,13 +1537,14 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
-ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    const uint32_t n_tokens = ubatch.n_tokens;
+uint32_t llama_kv_cache::get_n_k_idxs(const llama_ubatch & ubatch) const {
+    return qnn_u8_layout
+        ? ubatch.n_tokens*hparams.n_head_kv()
+        : ubatch.n_tokens;
+}
 
-    const uint32_t n_indices = qnn_u8_layout
-        ? n_tokens*hparams.n_embd_k_gqa_max()
-        : n_tokens;
-    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_indices);
+ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, get_n_k_idxs(ubatch));
 
     ggml_set_input(k_idxs);
 
@@ -1513,7 +1556,11 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 
     ggml_tensor * v_idxs;
 
-    if (!v_trans) {
+    if (qnn_u8_layout) {
+        v_idxs = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I64,
+            n_tokens*hparams.n_head_kv());
+    } else if (!v_trans) {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
     } else {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
@@ -1574,13 +1621,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     const int64_t kv_size = get_size();
     if (qnn_u8_layout) {
-        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa_max();
+        const int64_t n_head = hparams.n_head_kv();
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*kv_size*n_embd_k_gqa;
+            const int64_t offs = sinfo.strm[s]*kv_size*n_head;
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                for (int64_t j = 0; j < n_embd_k_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_k_gqa + i*n_embd_k_gqa + j] =
-                        offs + j*kv_size + sinfo.idxs[s][i];
+                for (int64_t head = 0; head < n_head; ++head) {
+                    data[s*sinfo.size()*n_head + i*n_head + head] =
+                        offs + head*kv_size + sinfo.idxs[s][i];
                 }
             }
         }
@@ -1601,7 +1648,19 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
-    if (!v_trans) {
+    if (qnn_u8_layout) {
+        const int64_t kv_size = get_size();
+        const int64_t n_head = hparams.n_head_kv();
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const int64_t offs = sinfo.strm[s]*kv_size*n_head;
+            for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                for (int64_t head = 0; head < n_head; ++head) {
+                    data[s*sinfo.size()*n_head + i*n_head + head] =
+                        offs + head*kv_size + sinfo.idxs[s][i];
+                }
+            }
+        }
+    } else if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
@@ -2257,10 +2316,15 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         if (qnn_u8_layout) {
             GGML_ASSERT(k->type == GGML_TYPE_I8);
             const size_t kv_size = cells.size();
+            const uint32_t head_dim = hparams.n_embd_head_k(il);
+            const uint32_t n_head = hparams.n_head_kv(il);
             for (const auto & range : cr.data) {
                 for (uint32_t cell = range.first; cell < range.second; ++cell) {
-                    for (uint32_t j = 0; j < n_embd_k_gqa; ++j) {
-                        io.write_tensor(k, j*kv_size + cell, 1);
+                    for (uint32_t head = 0; head < n_head; ++head) {
+                        io.write_tensor(
+                            k,
+                            ((size_t) head*kv_size + cell)*head_dim,
+                            head_dim);
                     }
                 }
             }
@@ -2293,11 +2357,28 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             io.write(&v_size_row, sizeof(v_size_row));
 
-            // Read each range of cells of v_size length and write out
-            for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
+            if (qnn_u8_layout) {
+                GGML_ASSERT(v->type == GGML_TYPE_I8);
+                const size_t kv_size = cells.size();
+                const uint32_t head_dim = hparams.n_embd_head_v(il);
+                const uint32_t n_head = hparams.n_head_kv(il);
+                for (const auto & range : cr.data) {
+                    for (uint32_t cell = range.first; cell < range.second; ++cell) {
+                        for (uint32_t head = 0; head < n_head; ++head) {
+                            io.write_tensor(
+                                v,
+                                ((size_t) head*kv_size + cell)*head_dim,
+                                head_dim);
+                        }
+                    }
+                }
+            } else {
+                // Read each range of cells of v_size length and write out
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t buf_size = range_size * v_size_row;
+                    io.write_tensor(v, range.first * v_size_row, buf_size);
+                }
             }
         }
     } else {
@@ -2512,9 +2593,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             if (qnn_u8_layout) {
                 GGML_ASSERT(k->type == GGML_TYPE_I8);
                 const size_t kv_size = cells.size();
+                const uint32_t head_dim = hparams.n_embd_head_k(il);
+                const uint32_t n_head = hparams.n_head_kv(il);
                 for (uint32_t i = 0; i < cell_count; ++i) {
-                    for (uint32_t j = 0; j < n_embd_k_gqa; ++j) {
-                        io.read_tensor(k, j*kv_size + sinfo.idxs[0][i], 1);
+                    for (uint32_t head = 0; head < n_head; ++head) {
+                        io.read_tensor(
+                            k,
+                            ((size_t) head*kv_size + sinfo.idxs[0][i])*head_dim,
+                            head_dim);
                     }
                 }
             } else if (sinfo.is_contiguous()) {
@@ -2560,7 +2646,20 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
 
             if (cell_count) {
-                if (sinfo.is_contiguous()) {
+                if (qnn_u8_layout) {
+                    GGML_ASSERT(v->type == GGML_TYPE_I8);
+                    const size_t kv_size = cells.size();
+                    const uint32_t head_dim = hparams.n_embd_head_v(il);
+                    const uint32_t n_head = hparams.n_head_kv(il);
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        for (uint32_t head = 0; head < n_head; ++head) {
+                            io.read_tensor(
+                                v,
+                                ((size_t) head*kv_size + sinfo.idxs[0][i])*head_dim,
+                                head_dim);
+                        }
+                    }
+                } else if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells, single memcpy
                     io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
                 } else {
@@ -2741,6 +2840,10 @@ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_k_idxs(ctx, ubatch);
+}
+
+uint32_t llama_kv_cache_context::get_n_k_idxs(const llama_ubatch & ubatch) const {
+    return kv->get_n_k_idxs(ubatch);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

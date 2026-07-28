@@ -1306,6 +1306,54 @@ llama_context * common_init_result::context() {
     return pimpl->context.get();
 }
 
+bool common_init_result::init_context(common_params & params) {
+    if (pimpl->context != nullptr) {
+        return true;
+    }
+    llama_model * model = pimpl->model.get();
+    if (model == nullptr) {
+        return false;
+    }
+
+    auto cparams = common_context_params_to_llama(params);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    common_init_sampler_from_model(model, params.sampling);
+    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
+        params.sampling.ignore_eos = false;
+    }
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+    if (params.sampling.ignore_eos) {
+        params.sampling.logit_bias.insert(
+            params.sampling.logit_bias.end(),
+            params.sampling.logit_bias_eog.begin(),
+            params.sampling.logit_bias_eog.end());
+    }
+
+    pimpl->samplers.resize(cparams.n_seq_max);
+    pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+        if (pimpl->samplers[i] == nullptr) {
+            return false;
+        }
+        pimpl->samplers_seq_config[i] = {
+            i, common_sampler_get(pimpl->samplers[i].get()) };
+    }
+    if (params.sampling.backend_sampling) {
+        cparams.samplers = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    pimpl->context.reset(llama_init_from_model(model, cparams));
+    return pimpl->context != nullptr;
+}
+
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
     if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
         return nullptr;

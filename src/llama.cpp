@@ -10,6 +10,7 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-qnn-quant-profile.h"
+#include "llama-qnn-u16.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -218,6 +219,29 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
         __func__, prepared_blocks,
         weights_gs32_source ? "gs32_source_v1" : "row_major",
         scratch_peak);
+}
+
+bool llama_qnn_u16_attach_profile_from_environment(llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+    if (model->qnn_u16_profile != nullptr) {
+        return true;
+    }
+    auto profile = llama_qnn_quant_profile_load_from_environment();
+    if (profile == nullptr) {
+        return false;
+    }
+    model->qnn_u16_profile = std::move(profile);
+    llama_qnn_quant_profile_prepare_kernel_metadata(
+        *model, *model->qnn_u16_profile);
+    LLAMA_LOG_INFO(
+        "%s: attached deferred kernel-ready QNN metadata: tensors=%zu linear_pairs=%zu operations=%zu\n",
+        __func__,
+        model->qnn_u16_profile->u16_tensor_count(),
+        model->qnn_u16_profile->linear_qparams_count(),
+        model->qnn_u16_profile->operation_count());
+    return true;
 }
 
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {

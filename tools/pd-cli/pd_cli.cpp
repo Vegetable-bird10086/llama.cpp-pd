@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <tuple>
 #include <unistd.h>
@@ -41,6 +42,7 @@ namespace {
 
 struct pd_args {
     std::string import_dir;
+    int control_fd = -1;
     int memory_fd = -1;
     size_t memory_size = 0;
     int32_t prompt_length = 0;
@@ -59,6 +61,107 @@ struct pd_args {
     bool native_compare = false;
     bool native_first_token = false;
 };
+
+constexpr uint32_t PD_RESIDENT_READY_MAGIC = 0x50445259U; // "PDRY"
+constexpr uint32_t PD_RESIDENT_PREPARE_MAGIC = 0x50445052U; // "PDPR"
+constexpr uint32_t PD_RESIDENT_REQUEST_MAGIC = 0x50444b56U; // "PDKV"
+// v5 stores both K and V as [layer, head, token, dim].
+constexpr uint32_t PD_RESIDENT_PROTOCOL_VERSION = 5;
+
+struct pd_resident_ready {
+    uint32_t magic = PD_RESIDENT_READY_MAGIC;
+    uint32_t version = PD_RESIDENT_PROTOCOL_VERSION;
+};
+
+struct pd_resident_prepare {
+    uint32_t magic = PD_RESIDENT_PREPARE_MAGIC;
+    uint32_t version = PD_RESIDENT_PROTOCOL_VERSION;
+};
+
+struct pd_resident_request {
+    uint32_t magic = PD_RESIDENT_REQUEST_MAGIC;
+    uint32_t version = PD_RESIDENT_PROTOCOL_VERSION;
+    uint64_t memory_size = 0;
+    int32_t prompt_length = 0;
+    int32_t num_layers = 0;
+    int32_t num_kv_heads = 0;
+    int32_t head_dim = 0;
+    int32_t first_token = -1;
+    uint32_t first_token_is_prompt_tail = 0;
+};
+
+void send_resident_ready(int fd) {
+    const pd_resident_ready ready;
+    ssize_t sent;
+    do {
+        sent = send(fd, &ready, sizeof(ready), MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent != static_cast<ssize_t>(sizeof(ready))) {
+        throw std::runtime_error("unable to signal resident Decode readiness");
+    }
+}
+
+void receive_resident_prepare(int fd) {
+    pd_resident_prepare request;
+    ssize_t received;
+    do {
+        received = recv(fd, &request, sizeof(request), 0);
+    } while (received < 0 && errno == EINTR);
+    if (received != static_cast<ssize_t>(sizeof(request)) ||
+        request.magic != PD_RESIDENT_PREPARE_MAGIC ||
+        request.version != PD_RESIDENT_PROTOCOL_VERSION) {
+        throw std::runtime_error("invalid resident Decode prepare request");
+    }
+}
+
+void receive_resident_handoff(pd_args & args) {
+    pd_resident_request request;
+    iovec iov {};
+    iov.iov_base = &request;
+    iov.iov_len = sizeof(request);
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr message {};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+
+    ssize_t received;
+    do {
+        received = recvmsg(args.control_fd, &message, 0);
+    } while (received < 0 && errno == EINTR);
+    if (received != static_cast<ssize_t>(sizeof(request)) ||
+        request.magic != PD_RESIDENT_REQUEST_MAGIC ||
+        request.version != PD_RESIDENT_PROTOCOL_VERSION) {
+        throw std::runtime_error("invalid resident Decode handoff request");
+    }
+
+    int memory_fd = -1;
+    for (cmsghdr * cmsg = CMSG_FIRSTHDR(&message);
+            cmsg != nullptr;
+            cmsg = CMSG_NXTHDR(&message, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            std::memcpy(&memory_fd, CMSG_DATA(cmsg), sizeof(memory_fd));
+            break;
+        }
+    }
+    if (memory_fd < 0) {
+        throw std::runtime_error("resident Decode request did not contain a KV descriptor");
+    }
+
+    args.memory_fd = memory_fd;
+    args.memory_size = static_cast<size_t>(request.memory_size);
+    args.prompt_length = request.prompt_length;
+    args.num_layers = request.num_layers;
+    args.num_kv_heads = request.num_kv_heads;
+    args.head_dim = request.head_dim;
+    args.first_token = static_cast<llama_token>(request.first_token);
+    args.first_token_is_prompt_tail = request.first_token_is_prompt_tail != 0;
+    close(args.control_fd);
+    args.control_fd = -1;
+}
 
 class pd_disk_embedding {
 public:
@@ -855,6 +958,13 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
             out.import_dir = argv[++i];
             continue;
         }
+        if (arg == "--pd-control-fd") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--pd-control-fd requires a descriptor");
+            }
+            out.control_fd = std::stoi(argv[++i]);
+            continue;
+        }
         if (arg == "--pd-memory-fd") {
             if (i + 1 >= argc) {
                 throw std::runtime_error("--pd-memory-fd requires a descriptor");
@@ -969,9 +1079,14 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
         }
         forwarded->push_back(argv[i]);
     }
-    if (out.import_dir.empty() == (out.memory_fd < 0)) {
+    const int handoff_sources =
+        static_cast<int>(!out.import_dir.empty()) +
+        static_cast<int>(out.memory_fd >= 0) +
+        static_cast<int>(out.control_fd >= 0);
+    if (handoff_sources != 1) {
         throw std::runtime_error(
-            "provide exactly one of --pd-import DIR or --pd-memory-fd FD");
+            "provide exactly one of --pd-import DIR, --pd-memory-fd FD, "
+            "or --pd-control-fd FD");
     }
     if (out.memory_fd >= 0 &&
         (out.memory_size == 0 || out.prompt_length <= 0 ||
@@ -1760,24 +1875,31 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto llama_init = common_init_from_params(params);
-    llama_context * ctx = llama_init->context();
+    // A resident PD child first loads only the GGUF. The QNN profile mapping,
+    // context compute buffers, and full-capacity KV cache are intentionally
+    // deferred until Prefill sends PDPR after releasing its rebuild inputs.
+    std::optional<std::string> deferred_profile_path;
+    if (pd.control_fd >= 0) {
+        if (const char * path = std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+                path != nullptr && path[0] != '\0') {
+            deferred_profile_path = path;
+            unsetenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+        }
+    }
+    auto llama_init = common_init_from_params(params, pd.control_fd >= 0);
+    if (deferred_profile_path.has_value()) {
+        setenv(
+            "LLAMA_QNN_U16_QPARAMS_MANIFEST",
+            deferred_profile_path->c_str(),
+            1);
+    }
     llama_model * model = llama_init->model();
-    common_sampler * smpl = llama_init->sampler(0);
-    if (model == nullptr || ctx == nullptr || smpl == nullptr) {
-        LOG_ERR("failed to initialize model/context/sampler\n");
+    if (model == nullptr) {
+        LOG_ERR("failed to initialize model\n");
         return 1;
     }
 
     pd_persistent_threadpools persistent_threadpools;
-    try {
-        persistent_threadpools.attach(ctx, params);
-    } catch (const std::exception & err) {
-        LOG_ERR("failed to initialize persistent CPU threadpool: %s\n", err.what());
-        return 1;
-    }
-
-    const process_memory_snapshot memory_after_model_load = process_memory();
 
     char external_embedding_kind[32] = {};
     const bool model_requires_disk_embedding =
@@ -1814,6 +1936,65 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+
+    if (pd.control_fd >= 0) {
+        try {
+            LOG_INF(
+                "PD resident Decode ready: control_fd=%d model-only initialized; runtime deferred\n",
+                pd.control_fd);
+            send_resident_ready(pd.control_fd);
+            receive_resident_prepare(pd.control_fd);
+            const auto runtime_prepare_start = steady_clock::now();
+            LOG_INF(
+                "PD resident Decode prepare received: attaching metadata and creating context/KV\n");
+            if (!llama_qnn_u16_attach_profile_from_environment(model)) {
+                throw std::runtime_error(
+                    "unable to attach deferred QNN runtime metadata");
+            }
+            const double metadata_attach_ms =
+                elapsed_ms(runtime_prepare_start);
+            const auto context_prepare_start = steady_clock::now();
+            if (!llama_init->init_context(params)) {
+                throw std::runtime_error(
+                    "unable to create deferred Decode context");
+            }
+            persistent_threadpools.attach(llama_init->context(), params);
+            const double context_threadpool_ms =
+                elapsed_ms(context_prepare_start);
+            const process_memory_snapshot prepared_memory = process_memory();
+            LOG_INF(
+                "PD resident Decode runtime prepared: metadata_ms=%.3f "
+                "context_kv_threadpool_ms=%.3f total_ms=%.3f rss_mib=%.2f hwm_mib=%.2f\n",
+                metadata_attach_ms,
+                context_threadpool_ms,
+                elapsed_ms(runtime_prepare_start),
+                prepared_memory.rss_bytes / (1024.0 * 1024.0),
+                prepared_memory.hwm_bytes / (1024.0 * 1024.0));
+            receive_resident_handoff(pd);
+            LOG_INF(
+                "PD resident Decode received in-memory handoff: bytes=%zu prompt_len=%d\n",
+                pd.memory_size,
+                pd.prompt_length);
+        } catch (const std::exception & err) {
+            LOG_ERR("resident Decode handoff failed: %s\n", err.what());
+            return 1;
+        }
+    } else {
+        try {
+            persistent_threadpools.attach(llama_init->context(), params);
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to initialize persistent CPU threadpool: %s\n", err.what());
+            return 1;
+        }
+    }
+
+    llama_context * ctx = llama_init->context();
+    common_sampler * smpl = llama_init->sampler(0);
+    if (ctx == nullptr || smpl == nullptr) {
+        LOG_ERR("failed to initialize context/sampler\n");
+        return 1;
+    }
+    const process_memory_snapshot memory_after_model_load = process_memory();
 
     const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
     const bool need_fp16_handoff = !qnn_u8_layout;

@@ -79,6 +79,32 @@ int ggml_gptq2_32_gs32_dotprod_enabled(void) {
 #endif
 }
 
+int ggml_qnn_u16_dotprod_enabled(void) {
+#if defined(__aarch64__) && defined(__linux__) && defined(__clang__) && \
+    defined(HWCAP_ASIMDDP)
+    static int enabled = -1;
+    int cached = __atomic_load_n(&enabled, __ATOMIC_ACQUIRE);
+    if (cached >= 0) {
+        return cached;
+    }
+    const char * const value = getenv("GGML_QNN_U16_DOTPROD");
+    const int requested =
+        value != NULL && (strcmp(value, "1") == 0 ||
+            strcmp(value, "on") == 0 || strcmp(value, "true") == 0);
+    const int detected =
+        requested && (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(
+            &enabled, &expected, detected, false,
+            __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return detected;
+#else
+    return 0;
+#endif
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }
@@ -1075,19 +1101,25 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
             vld4q_u16(activations + block * 32);
         int32x4_t dot03;
         int32x4_t dot47;
+        const int16x8_t activation0 = vreinterpretq_s16_u16(vsubq_u16(
+            activation_lanes.val[0], activation_zero));
+        const int16x8_t activation1 = vreinterpretq_s16_u16(vsubq_u16(
+            activation_lanes.val[1], activation_zero));
+        const int16x8_t activation2 = vreinterpretq_s16_u16(vsubq_u16(
+            activation_lanes.val[2], activation_zero));
+        const int16x8_t activation3 = vreinterpretq_s16_u16(vsubq_u16(
+            activation_lanes.val[3], activation_zero));
+        const uint8x16_t packed_pair0 =
+            vld1q_u8(source_group + pair0_offset);
+        const uint8x16_t packed_pair1 =
+            vld1q_u8(source_group + pair1_offset);
+        const uint8x16_t packed_pair2 =
+            vld1q_u8(source_group + pair2_offset);
+        const uint8x16_t packed_pair3 =
+            vld1q_u8(source_group + pair3_offset);
         ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
-            vreinterpretq_s16_u16(vsubq_u16(
-                activation_lanes.val[0], activation_zero)),
-            vreinterpretq_s16_u16(vsubq_u16(
-                activation_lanes.val[1], activation_zero)),
-            vreinterpretq_s16_u16(vsubq_u16(
-                activation_lanes.val[2], activation_zero)),
-            vreinterpretq_s16_u16(vsubq_u16(
-                activation_lanes.val[3], activation_zero)),
-            vld1q_u8(source_group + pair0_offset),
-            vld1q_u8(source_group + pair1_offset),
-            vld1q_u8(source_group + pair2_offset),
-            vld1q_u8(source_group + pair3_offset),
+            activation0, activation1, activation2, activation3,
+            packed_pair0, packed_pair1, packed_pair2, packed_pair3,
             &dot03, &dot47);
 
         const int32_t activation_sum = activation_block_sums[block];
@@ -2258,7 +2290,8 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
             blocks, tensor_source, row_outer, row_middle,
             activations, activation_block_sums,
             prepared_block_codes, prepared_row_stride,
-            activation_zero_point, centered_dots);
+            activation_zero_point,
+            centered_dots);
         first_generic_block = blocks;
     }
 #endif
@@ -2783,6 +2816,33 @@ static inline uint16_t ggml_u16_mul_product_requant_q31(
     return (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
 }
 
+static inline uint16_t ggml_u16_swiglu_qnn_q31_one(
+        uint16_t gate,
+        uint16_t up,
+        const uint16_t * GGML_RESTRICT sigmoid_lut,
+        int32_t silu_lhs_zero_point,
+        int32_t silu_rhs_zero_point,
+        int64_t silu_product_to_output_q31,
+        int64_t silu_product_requant_nudge_q31,
+        int32_t silu_output_zero_point,
+        int32_t product_lhs_zero_point,
+        int32_t product_rhs_zero_point,
+        int64_t product_to_output_q31,
+        int64_t product_requant_nudge_q31,
+        int32_t product_output_zero_point) {
+    const int64_t gate_value = (int32_t) gate - silu_lhs_zero_point;
+    const int64_t sigmoid_value =
+        (int32_t) sigmoid_lut[gate] - silu_rhs_zero_point;
+    const uint16_t silu_code = ggml_u16_mul_product_requant_q31(
+        gate_value * sigmoid_value, silu_product_to_output_q31,
+        silu_product_requant_nudge_q31, silu_output_zero_point);
+    const int64_t silu_value = (int32_t) silu_code - product_lhs_zero_point;
+    const int64_t up_value = (int32_t) up - product_rhs_zero_point;
+    return ggml_u16_mul_product_requant_q31(
+        silu_value * up_value, product_to_output_q31,
+        product_requant_nudge_q31, product_output_zero_point);
+}
+
 static inline uint16_t ggml_u16_mul_requant_q31(
         int64_t lhs,
         int64_t rhs,
@@ -2875,6 +2935,202 @@ void ggml_vec_mul_affine_u16_qnn_q31(
         output[index] = ggml_u16_mul_product_requant_q31(
             lhs_value * rhs_value, product_to_output_q31,
             product_requant_nudge_q31, output_zero_point);
+    }
+}
+
+void ggml_vec_swiglu_u16_qnn_q31(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT gate,
+        const uint16_t * GGML_RESTRICT up,
+        const uint16_t * GGML_RESTRICT sigmoid_lut,
+        int32_t silu_lhs_zero_point,
+        int32_t silu_rhs_zero_point,
+        int64_t silu_product_to_output_q31,
+        int64_t silu_product_requant_nudge_q31,
+        int32_t silu_output_zero_point,
+        int32_t product_lhs_zero_point,
+        int32_t product_rhs_zero_point,
+        int64_t product_to_output_q31,
+        int64_t product_requant_nudge_q31,
+        int32_t product_output_zero_point) {
+    GGML_ASSERT(n >= 0);
+    GGML_ASSERT(output != NULL && gate != NULL && up != NULL && sigmoid_lut != NULL);
+    GGML_ASSERT(silu_product_to_output_q31 >= 0 && product_to_output_q31 >= 0);
+    int index = 0;
+#if defined(__ARM_NEON)
+    const int32x4_t silu_lhs_zero = vdupq_n_s32(silu_lhs_zero_point);
+    const int32x4_t silu_rhs_zero = vdupq_n_s32(silu_rhs_zero_point);
+    const int32x4_t product_lhs_zero = vdupq_n_s32(product_lhs_zero_point);
+    const int32x4_t product_rhs_zero = vdupq_n_s32(product_rhs_zero_point);
+    for (; index + 8 <= n; index += 8) {
+        const uint16x8_t gate_codes = vld1q_u16(gate + index);
+        const uint16_t sigmoid_codes_data[8] = {
+            sigmoid_lut[gate[index + 0]], sigmoid_lut[gate[index + 1]],
+            sigmoid_lut[gate[index + 2]], sigmoid_lut[gate[index + 3]],
+            sigmoid_lut[gate[index + 4]], sigmoid_lut[gate[index + 5]],
+            sigmoid_lut[gate[index + 6]], sigmoid_lut[gate[index + 7]],
+        };
+        const uint16x8_t sigmoid_codes = vld1q_u16(sigmoid_codes_data);
+        const int32x4_t gate_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(gate_codes))),
+            silu_lhs_zero);
+        const int32x4_t gate_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(gate_codes))),
+            silu_lhs_zero);
+        const int32x4_t sigmoid_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(sigmoid_codes))),
+            silu_rhs_zero);
+        const int32x4_t sigmoid_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(sigmoid_codes))),
+            silu_rhs_zero);
+        const int64x2_t silu_product_0 =
+            vmull_s32(vget_low_s32(gate_lo), vget_low_s32(sigmoid_lo));
+        const int64x2_t silu_product_1 =
+            vmull_s32(vget_high_s32(gate_lo), vget_high_s32(sigmoid_lo));
+        const int64x2_t silu_product_2 =
+            vmull_s32(vget_low_s32(gate_hi), vget_low_s32(sigmoid_hi));
+        const int64x2_t silu_product_3 =
+            vmull_s32(vget_high_s32(gate_hi), vget_high_s32(sigmoid_hi));
+        uint16_t silu_codes_data[8];
+        silu_codes_data[0] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_0, 0), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[1] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_0, 1), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[2] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_1, 0), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[3] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_1, 1), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[4] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_2, 0), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[5] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_2, 1), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[6] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_3, 0), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        silu_codes_data[7] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(silu_product_3, 1), silu_product_to_output_q31,
+            silu_product_requant_nudge_q31, silu_output_zero_point);
+        const uint16x8_t silu_codes = vld1q_u16(silu_codes_data);
+        const uint16x8_t up_codes = vld1q_u16(up + index);
+        const int32x4_t silu_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(silu_codes))),
+            product_lhs_zero);
+        const int32x4_t silu_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(silu_codes))),
+            product_lhs_zero);
+        const int32x4_t up_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(up_codes))),
+            product_rhs_zero);
+        const int32x4_t up_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(up_codes))),
+            product_rhs_zero);
+        const int64x2_t output_product_0 =
+            vmull_s32(vget_low_s32(silu_lo), vget_low_s32(up_lo));
+        const int64x2_t output_product_1 =
+            vmull_s32(vget_high_s32(silu_lo), vget_high_s32(up_lo));
+        const int64x2_t output_product_2 =
+            vmull_s32(vget_low_s32(silu_hi), vget_low_s32(up_hi));
+        const int64x2_t output_product_3 =
+            vmull_s32(vget_high_s32(silu_hi), vget_high_s32(up_hi));
+        output[index + 0] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_0, 0), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 1] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_0, 1), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 2] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_1, 0), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 3] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_1, 1), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 4] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_2, 0), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 5] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_2, 1), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 6] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_3, 0), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 7] = ggml_u16_mul_product_requant_q31(
+            vgetq_lane_s64(output_product_3, 1), product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+    }
+#endif
+    for (; index + 8 <= n; index += 8) {
+        output[index + 0] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 0], up[index + 0], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 1] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 1], up[index + 1], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 2] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 2], up[index + 2], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 3] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 3], up[index + 3], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 4] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 4], up[index + 4], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 5] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 5], up[index + 5], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 6] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 6], up[index + 6], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+        output[index + 7] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index + 7], up[index + 7], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
+    }
+    for (; index < n; ++index) {
+        output[index] = ggml_u16_swiglu_qnn_q31_one(
+            gate[index], up[index], sigmoid_lut,
+            silu_lhs_zero_point, silu_rhs_zero_point,
+            silu_product_to_output_q31, silu_product_requant_nudge_q31,
+            silu_output_zero_point, product_lhs_zero_point,
+            product_rhs_zero_point, product_to_output_q31,
+            product_requant_nudge_q31, product_output_zero_point);
     }
 }
 
@@ -3596,6 +3852,287 @@ void ggml_vec_matmul_u16_u8_qnn_fixed(
         product_to_output_q20, output_zero_point);
 }
 
+#if defined(__aarch64__) && defined(__clang__) && defined(__ARM_NEON)
+static inline int32_t ggml_qnn_balanced_radix64_digit(int32_t value) {
+    int32_t digit = value % 64;
+    if (digit > 31) {
+        digit -= 64;
+    } else if (digit < -32) {
+        digit += 64;
+    }
+    return digit;
+}
+
+__attribute__((target("dotprod")))
+static int ggml_vec_matmul_u16_u8_qnn_dotprod_strided(
+        int input_dimension,
+        int output_dimension,
+        size_t weight_row_stride,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    // Four strided rows are transposed entirely in registers into four
+    // 4-byte dot-product groups. Centered U16 activations are represented
+    // exactly as three signed radix-64 digits, so SDOT never needs a U16/U8
+    // materialization buffer and the final S64 accumulator is bit-identical.
+    static const uint8_t transpose_indices_data[16] = {
+        0, 4, 8, 12, 1, 5, 9, 13,
+        2, 6, 10, 14, 3, 7, 11, 15,
+    };
+    const uint8x16_t transpose_indices =
+        vld1q_u8(transpose_indices_data);
+    const uint8x16_t sign_flip = vdupq_n_u8(0x80);
+    const int8x16_t ones = vdupq_n_s8(1);
+    int8_t digit_storage[3 * input_dimension];
+    int8_t * const digits0 = digit_storage;
+    int8_t * const digits1 = digits0 + input_dimension;
+    int8_t * const digits2 = digits1 + input_dimension;
+    const int32x4_t activation_zero = vdupq_n_s32(input_zero_point);
+    const int32x4_t radix_mask = vdupq_n_s32(63);
+    const int32x4_t radix_half = vdupq_n_s32(32);
+    int digit_row = 0;
+    for (; digit_row + 4 <= input_dimension; digit_row += 4) {
+        const int32x4_t centered = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + digit_row))),
+            activation_zero);
+        const int32x4_t d0 = vsubq_s32(
+            vandq_s32(vaddq_s32(centered, radix_half), radix_mask),
+            radix_half);
+        const int32x4_t quotient1 = vshrq_n_s32(vsubq_s32(centered, d0), 6);
+        const int32x4_t d1 = vsubq_s32(
+            vandq_s32(vaddq_s32(quotient1, radix_half), radix_mask),
+            radix_half);
+        const int32x4_t d2 = vshrq_n_s32(vsubq_s32(quotient1, d1), 6);
+#define GGML_QNN_STORE_FOUR_DIGITS(DST, VALUE) do { \
+            const int16x4_t narrowed16 = vmovn_s32((VALUE)); \
+            const int8x8_t narrowed8 = vmovn_s16( \
+                vcombine_s16(narrowed16, vdup_n_s16(0))); \
+            uint32_t packed_digits = vget_lane_u32( \
+                vreinterpret_u32_s8(narrowed8), 0); \
+            memcpy((DST) + digit_row, &packed_digits, 4); \
+        } while (0)
+        GGML_QNN_STORE_FOUR_DIGITS(digits0, d0);
+        GGML_QNN_STORE_FOUR_DIGITS(digits1, d1);
+        GGML_QNN_STORE_FOUR_DIGITS(digits2, d2);
+#undef GGML_QNN_STORE_FOUR_DIGITS
+    }
+    for (; digit_row < input_dimension; ++digit_row) {
+        const int32_t centered = (int32_t) input[digit_row] - input_zero_point;
+        digits0[digit_row] = (int8_t) ggml_qnn_balanced_radix64_digit(centered);
+        const int32_t quotient1 =
+            (centered - digits0[digit_row]) / 64;
+        digits1[digit_row] =
+            (int8_t) ggml_qnn_balanced_radix64_digit(quotient1);
+        digits2[digit_row] =
+            (int8_t) ((quotient1 - digits1[digit_row]) / 64);
+    }
+
+    int column = 0;
+    for (; column + 4 <= output_dimension; column += 4) {
+        int32x4_t digit0_dot = vdupq_n_s32(0);
+        int32x4_t digit1_dot = vdupq_n_s32(0);
+        int32x4_t digit2_dot = vdupq_n_s32(0);
+        int32x4_t weight_sum = vdupq_n_s32(0);
+        int row = 0;
+        for (; row + 4 <= input_dimension; row += 4) {
+            uint32_t words[4];
+            memcpy(&words[0], weights + (size_t) (row + 0) * weight_row_stride + column, 4);
+            memcpy(&words[1], weights + (size_t) (row + 1) * weight_row_stride + column, 4);
+            memcpy(&words[2], weights + (size_t) (row + 2) * weight_row_stride + column, 4);
+            memcpy(&words[3], weights + (size_t) (row + 3) * weight_row_stride + column, 4);
+            uint32x4_t rows = vdupq_n_u32(0);
+            rows = vsetq_lane_u32(words[0], rows, 0);
+            rows = vsetq_lane_u32(words[1], rows, 1);
+            rows = vsetq_lane_u32(words[2], rows, 2);
+            rows = vsetq_lane_u32(words[3], rows, 3);
+            const int8x16_t packed_weights = vreinterpretq_s8_u8(
+                veorq_u8(
+                    vqtbl1q_u8(vreinterpretq_u8_u32(rows), transpose_indices),
+                    sign_flip));
+
+            uint32_t packed_d0;
+            uint32_t packed_d1;
+            uint32_t packed_d2;
+            memcpy(&packed_d0, digits0 + row, 4);
+            memcpy(&packed_d1, digits1 + row, 4);
+            memcpy(&packed_d2, digits2 + row, 4);
+            const int8x16_t digit0 =
+                vreinterpretq_s8_u32(vdupq_n_u32(packed_d0));
+            const int8x16_t digit1 =
+                vreinterpretq_s8_u32(vdupq_n_u32(packed_d1));
+            const int8x16_t digit2 =
+                vreinterpretq_s8_u32(vdupq_n_u32(packed_d2));
+            digit0_dot = vdotq_s32(digit0_dot, packed_weights, digit0);
+            digit1_dot = vdotq_s32(digit1_dot, packed_weights, digit1);
+            digit2_dot = vdotq_s32(digit2_dot, packed_weights, digit2);
+            weight_sum = vdotq_s32(weight_sum, packed_weights, ones);
+        }
+        int32_t dot0_lanes[4];
+        int32_t dot1_lanes[4];
+        int32_t dot2_lanes[4];
+        int32_t sum_lanes[4];
+        vst1q_s32(dot0_lanes, digit0_dot);
+        vst1q_s32(dot1_lanes, digit1_dot);
+        vst1q_s32(dot2_lanes, digit2_dot);
+        vst1q_s32(sum_lanes, weight_sum);
+        for (int lane = 0; lane < 4; ++lane) {
+            int64_t centered_dot =
+                (int64_t) dot0_lanes[lane] +
+                ((int64_t) dot1_lanes[lane] << 6) +
+                ((int64_t) dot2_lanes[lane] << 12);
+            int64_t expanded_weight_sum = sum_lanes[lane];
+            for (int tail = row; tail < input_dimension; ++tail) {
+                const int32_t weight =
+                    (int32_t) weights[(size_t) tail * weight_row_stride +
+                        column + lane] - 128;
+                centered_dot +=
+                    ((int32_t) input[tail] - input_zero_point) * weight;
+                expanded_weight_sum += weight;
+            }
+            const int64_t reduced = ggml_qnn_a16s8_reduce_accumulator(
+                centered_dot, expanded_weight_sum, input_zero_point);
+            output[column + lane] = ggml_u16_matmul_requant_q31(
+                reduced, product_to_output_q20, output_zero_point);
+        }
+    }
+    return column;
+}
+
+__attribute__((target("dotprod")))
+static void ggml_vec_matmul_u16_u8_qnn_dotprod_strided_pair(
+        int input_dimension,
+        int output_dimension,
+        size_t weight_row_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1,
+        bool token_major) {
+    static const uint8_t transpose_indices_data[16] = {
+        0, 4, 8, 12, 1, 5, 9, 13,
+        2, 6, 10, 14, 3, 7, 11, 15,
+    };
+    const uint8x16_t transpose_indices =
+        vld1q_u8(transpose_indices_data);
+    const uint8x16_t sign_flip = vdupq_n_u8(0x80);
+    const int8x16_t ones = vdupq_n_s8(1);
+
+    int8_t digit_storage[6 * input_dimension];
+    int8_t * digits[2][3] = {
+        {
+            digit_storage,
+            digit_storage + input_dimension,
+            digit_storage + 2 * input_dimension,
+        },
+        {
+            digit_storage + 3 * input_dimension,
+            digit_storage + 4 * input_dimension,
+            digit_storage + 5 * input_dimension,
+        },
+    };
+    const uint16_t * inputs[2] = { input0, input1 };
+    const int32_t input_zero_points[2] = {
+        input_zero_point0, input_zero_point1,
+    };
+    for (int pair = 0; pair < 2; ++pair) {
+        for (int row = 0; row < input_dimension; ++row) {
+            const int32_t centered =
+                (int32_t) inputs[pair][row] - input_zero_points[pair];
+            digits[pair][0][row] =
+                (int8_t) ggml_qnn_balanced_radix64_digit(centered);
+            const int32_t quotient1 =
+                (centered - digits[pair][0][row]) / 64;
+            digits[pair][1][row] =
+                (int8_t) ggml_qnn_balanced_radix64_digit(quotient1);
+            digits[pair][2][row] =
+                (int8_t) ((quotient1 - digits[pair][1][row]) / 64);
+        }
+    }
+
+    for (int column = 0; column < output_dimension; column += 4) {
+        int32x4_t dot[2][3] = {
+            { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) },
+            { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) },
+        };
+        int32x4_t weight_sum = vdupq_n_s32(0);
+        for (int row = 0; row < input_dimension; row += 4) {
+            uint32_t words[4];
+            if (token_major) {
+                memcpy(&words[0], weights + (size_t) (column + 0) * weight_row_stride + row, 4);
+                memcpy(&words[1], weights + (size_t) (column + 1) * weight_row_stride + row, 4);
+                memcpy(&words[2], weights + (size_t) (column + 2) * weight_row_stride + row, 4);
+                memcpy(&words[3], weights + (size_t) (column + 3) * weight_row_stride + row, 4);
+            } else {
+                memcpy(&words[0], weights + (size_t) (row + 0) * weight_row_stride + column, 4);
+                memcpy(&words[1], weights + (size_t) (row + 1) * weight_row_stride + column, 4);
+                memcpy(&words[2], weights + (size_t) (row + 2) * weight_row_stride + column, 4);
+                memcpy(&words[3], weights + (size_t) (row + 3) * weight_row_stride + column, 4);
+            }
+            uint32x4_t rows = vdupq_n_u32(0);
+            rows = vsetq_lane_u32(words[0], rows, 0);
+            rows = vsetq_lane_u32(words[1], rows, 1);
+            rows = vsetq_lane_u32(words[2], rows, 2);
+            rows = vsetq_lane_u32(words[3], rows, 3);
+            uint8x16_t packed_u8 = vreinterpretq_u8_u32(rows);
+            if (!token_major) {
+                packed_u8 = vqtbl1q_u8(packed_u8, transpose_indices);
+            }
+            const int8x16_t packed_weights =
+                vreinterpretq_s8_u8(veorq_u8(packed_u8, sign_flip));
+
+            for (int pair = 0; pair < 2; ++pair) {
+                for (int digit = 0; digit < 3; ++digit) {
+                    uint32_t packed_digit;
+                    memcpy(&packed_digit, digits[pair][digit] + row, 4);
+                    dot[pair][digit] = vdotq_s32(
+                        dot[pair][digit],
+                        packed_weights,
+                        vreinterpretq_s8_u32(vdupq_n_u32(packed_digit)));
+                }
+            }
+            weight_sum = vdotq_s32(weight_sum, packed_weights, ones);
+        }
+
+        int32_t sum_lanes[4];
+        vst1q_s32(sum_lanes, weight_sum);
+        for (int pair = 0; pair < 2; ++pair) {
+            int32_t dot_lanes[3][4];
+            for (int digit = 0; digit < 3; ++digit) {
+                vst1q_s32(dot_lanes[digit], dot[pair][digit]);
+            }
+            uint16_t * output = pair == 0 ? output0 : output1;
+            const int64_t multiplier = pair == 0
+                ? product_to_output_q20_0
+                : product_to_output_q20_1;
+            const int32_t output_zero_point = pair == 0
+                ? output_zero_point0
+                : output_zero_point1;
+            for (int lane = 0; lane < 4; ++lane) {
+                const int64_t centered_dot =
+                    (int64_t) dot_lanes[0][lane] +
+                    ((int64_t) dot_lanes[1][lane] << 6) +
+                    ((int64_t) dot_lanes[2][lane] << 12);
+                const int64_t reduced = ggml_qnn_a16s8_reduce_accumulator(
+                    centered_dot, sum_lanes[lane],
+                    input_zero_points[pair]);
+                output[column + lane] = ggml_u16_matmul_requant_q31(
+                    reduced, multiplier, output_zero_point);
+            }
+        }
+    }
+}
+#endif
+
 void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
         int input_dimension,
         int output_dimension,
@@ -3613,6 +4150,15 @@ void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
     GGML_ASSERT(product_to_output_q20 >= 0);
 
     int column = 0;
+#if defined(__aarch64__) && defined(__clang__) && defined(__ARM_NEON)
+    if (weight_zero_point == 128 && input_dimension <= 16384 &&
+            ggml_qnn_u16_dotprod_enabled()) {
+        column = ggml_vec_matmul_u16_u8_qnn_dotprod_strided(
+            input_dimension, output_dimension, weight_row_stride,
+            output, input, weights, input_zero_point,
+            product_to_output_q20, output_zero_point);
+    }
+#endif
 #if defined(__ARM_NEON)
     const uint64_t max_abs_input = (uint64_t) MAX(
         input_zero_point, (int32_t) UINT16_MAX - input_zero_point);
@@ -3756,6 +4302,116 @@ void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
     }
 }
 
+void ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
+        int input_dimension,
+        int output_dimension,
+        size_t weight_row_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1) {
+#if defined(__aarch64__) && defined(__clang__) && defined(__ARM_NEON)
+    if (weight_zero_point == 128 &&
+            input_dimension % 4 == 0 &&
+            output_dimension % 4 == 0 &&
+            ggml_qnn_u16_dotprod_enabled()) {
+        ggml_vec_matmul_u16_u8_qnn_dotprod_strided_pair(
+            input_dimension, output_dimension, weight_row_stride,
+            output0, output1, input0, input1, weights,
+            input_zero_point0, input_zero_point1,
+            product_to_output_q20_0, product_to_output_q20_1,
+            output_zero_point0, output_zero_point1, false);
+        return;
+    }
+#endif
+    ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+        input_dimension, output_dimension, weight_row_stride,
+        output0, input0, weights, input_zero_point0, weight_zero_point,
+        product_to_output_q20_0, output_zero_point0);
+    ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+        input_dimension, output_dimension, weight_row_stride,
+        output1, input1, weights, input_zero_point1, weight_zero_point,
+        product_to_output_q20_1, output_zero_point1);
+}
+
+void ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20,
+        int32_t output_zero_point) {
+    for (int token = 0; token < output_dimension; ++token) {
+        const uint8_t * token_weights =
+            weights + (size_t) token * token_stride;
+        int64_t centered_dot = 0;
+        int64_t expanded_weight_sum = 0;
+        for (int dim = 0; dim < input_dimension; ++dim) {
+            const int32_t weight =
+                (int32_t) token_weights[dim] - weight_zero_point;
+            centered_dot +=
+                ((int32_t) input[dim] - input_zero_point) * weight;
+            expanded_weight_sum += weight;
+        }
+        const int64_t reduced = ggml_qnn_a16s8_reduce_accumulator(
+            centered_dot, expanded_weight_sum, input_zero_point);
+        output[token] = ggml_u16_matmul_requant_q31(
+            reduced, product_to_output_q20, output_zero_point);
+    }
+}
+
+void ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int32_t weight_zero_point,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1) {
+#if defined(__aarch64__) && defined(__clang__) && defined(__ARM_NEON)
+    if (weight_zero_point == 128 &&
+            input_dimension % 4 == 0 &&
+            output_dimension % 4 == 0 &&
+            ggml_qnn_u16_dotprod_enabled()) {
+        ggml_vec_matmul_u16_u8_qnn_dotprod_strided_pair(
+            input_dimension, output_dimension, token_stride,
+            output0, output1, input0, input1, weights,
+            input_zero_point0, input_zero_point1,
+            product_to_output_q20_0, product_to_output_q20_1,
+            output_zero_point0, output_zero_point1, true);
+        return;
+    }
+#endif
+    ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+        input_dimension, output_dimension, token_stride,
+        output0, input0, weights, input_zero_point0, weight_zero_point,
+        product_to_output_q20_0, output_zero_point0);
+    ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+        input_dimension, output_dimension, token_stride,
+        output1, input1, weights, input_zero_point1, weight_zero_point,
+        product_to_output_q20_1, output_zero_point1);
+}
+
 static inline uint16_t ggml_u16_requant_q20(
         int64_t centered,
         int64_t multiplier,
@@ -3767,8 +4423,8 @@ static inline uint16_t ggml_u16_requant_q20(
 
 void ggml_vec_requant_u16_qnn_fixed(
         int n,
-        uint16_t * GGML_RESTRICT output,
-        const uint16_t * GGML_RESTRICT input,
+        uint16_t * output,
+        const uint16_t * input,
         int32_t input_zero_point,
         int64_t input_to_output_q20,
         int32_t output_zero_point) {
@@ -3801,11 +4457,35 @@ void ggml_vec_requant_u16_qnn_fixed(
     }
 }
 
+uint16_t ggml_vec_min_u16_qnn(int n, const uint16_t * input) {
+    GGML_ASSERT(n > 0 && input != NULL);
+    int index = 0;
+    uint16_t result = UINT16_MAX;
+#if defined(__ARM_NEON)
+    uint16x8_t minimum = vdupq_n_u16(UINT16_MAX);
+    for (; index + 8 <= n; index += 8) {
+        minimum = vminq_u16(minimum, vld1q_u16(input + index));
+    }
+#if defined(__aarch64__)
+    result = vminvq_u16(minimum);
+#else
+    const uint16x4_t pair = vmin_u16(vget_low_u16(minimum), vget_high_u16(minimum));
+    const uint16x4_t pair2 = vpmin_u16(pair, pair);
+    const uint16x4_t pair3 = vpmin_u16(pair2, pair2);
+    result = vget_lane_u16(pair3, 0);
+#endif
+#endif
+    for (; index < n; ++index) {
+        result = MIN(result, input[index]);
+    }
+    return result;
+}
+
 void ggml_vec_select_affine_u16_qnn_fixed(
         int n,
-        uint16_t * GGML_RESTRICT output,
+        uint16_t * output,
         const uint8_t * GGML_RESTRICT condition,
-        const uint16_t * GGML_RESTRICT when_true,
+        const uint16_t * when_true,
         int32_t true_zero_point,
         int32_t true_multiplier_q15,
         int32_t true_right_shift,
@@ -4018,8 +4698,8 @@ static inline uint64_t ggml_u64_divide_reciprocal_exact(
 
 void ggml_vec_softmax_u16_qnn_fixed(
         int n,
-        uint16_t * GGML_RESTRICT output,
-        const uint16_t * GGML_RESTRICT input,
+        uint16_t * output,
+        const uint16_t * input,
         int64_t scale_over_ln2_q24,
         int64_t output_unit_code,
         int32_t output_zero_point,

@@ -81,23 +81,6 @@ const llama_qnn_u16_tensor * qnn_require_output_qparams(
     return qparams;
 }
 
-ggml_tensor * qnn_concat_heads(
-        ggml_context * ctx,
-        const std::vector<ggml_tensor *> & heads,
-        int64_t head_dimension,
-        int64_t tokens) {
-    GGML_ASSERT(ctx != nullptr && !heads.empty());
-    ggml_tensor * result = nullptr;
-    for (ggml_tensor * head : heads) {
-        GGML_ASSERT(head != nullptr && head->ne[0] == head_dimension);
-        GGML_ASSERT(head->ne[1] == tokens && head->ne[2] == 1 && head->ne[3] == 1);
-        ggml_tensor * shaped = ggml_reshape_3d(
-            ctx, head, head_dimension, 1, tokens);
-        result = result == nullptr ? shaped : ggml_concat(ctx, result, shaped, 1);
-    }
-    return result;
-}
-
 } // namespace
 
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
@@ -222,20 +205,6 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             return qnn_require_fx_operation(qnn_profile, layer,
                 qnn_indexed_head_fx_name(stem, index, head), type_name);
         };
-        const auto cb_head = [this](
-                ggml_tensor * tensor,
-                const char * stem,
-                int32_t layer,
-                int32_t head) {
-            if (head == 0) {
-                cb(tensor, stem, layer);
-                return;
-            }
-            const std::string head_stem =
-                std::string(stem) + "_h" + std::to_string(head);
-            cb(tensor, head_stem.c_str(), layer);
-        };
-
         for (int32_t il = 0; il < n_layer; ++il) {
             GGML_ASSERT(cvec == nullptr || cvec->tensor_for(il) == nullptr);
             // Layer-input extraction is diagnostic-only. Keep the normal
@@ -268,66 +237,106 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             cb(k_projection, "qnn_k_projection", il);
             cb(v_projection, "qnn_v_projection", il);
 
-            std::vector<ggml_tensor *> queries;
-            std::vector<ggml_tensor *> keys;
-            std::vector<ggml_tensor *> values;
-            queries.reserve(n_head);
-            keys.reserve(n_head_kv);
-            values.reserve(n_head_kv);
-
+            std::vector<const llama_qnn_operation *> q_norm_ops(n_head);
+            std::vector<const llama_qnn_operation *> q_rotate_ops(n_head);
+            std::vector<llama_qnn_u16_rope_head_ops> q_rope_ops(n_head);
+            const llama_qnn_u16_tensor * cos_table =
+                qnn_profile->find_u16_tensor("b__frozen_param311@0");
+            const llama_qnn_u16_tensor * sin_table =
+                qnn_profile->find_u16_tensor("b__frozen_param312@0");
             for (int32_t head = 0; head < n_head; ++head) {
-                ggml_tensor * query = ggml_view_2d(
-                    ctx0, q_projection, n_embd_head, n_tokens,
-                    q_projection->nb[1], head * n_embd_head * q_projection->nb[0]);
-                query = llama_qnn_u16_rms_norm(
-                    ctx0, query, qnn_profile,
-                    fx_head(il, "aten_rms_norm_default", 4 * il + 1,
-                        head, "RmsNorm"));
-                cb_head(query, "qnn_q_head_norm", il, head);
-                query = llama_qnn_u16_rope(
-                    ctx0, query, inp_pos, qnn_profile, il, head, false);
-                cb_head(query, "qnn_q_head_rope", il, head);
-                query = llama_qnn_u16_qk_rotate(
-                    ctx0, query, qnn_profile, il, head, false);
-                cb_head(query, "qnn_q_head_rotate", il, head);
-                queries.push_back(query);
+                q_norm_ops[head] = fx_head(
+                    il, "aten_rms_norm_default", 4 * il + 1, head, "RmsNorm");
+                q_rotate_ops[head] = fx_head(
+                    il, "aten_matmul_default", 4 * il, head, "MatMul");
+                auto & rope = q_rope_ops[head];
+                const int32_t multiply_base = 10 * il + 1;
+                const int32_t slice_base = 4 * il;
+                for (int index = 0; index < 4; ++index) {
+                    rope.multiply[index] = fx_head(
+                        il, "aten_mul_tensor", multiply_base + index,
+                        head, "ElementWiseMultiply");
+                }
+                for (int index = 0; index < 2; ++index) {
+                    rope.slices[index] = fx_head(
+                        il, "aten_slice_copy_tensor", slice_base + index,
+                        head, "StridedSlice");
+                }
+                rope.subtract = fx_head(
+                    il, "aten_sub_tensor", 2 * il, head, "ElementWiseSubtract");
+                rope.add = fx_head(
+                    il, "aten_add_tensor", 5 * il, head, "ElementWiseAdd");
+                rope.cos_table = cos_table;
+                rope.sin_table = sin_table;
             }
+            ggml_tensor * query_heads = ggml_reshape_3d(
+                ctx0, q_projection, n_embd_head, n_head, n_tokens);
+            query_heads = llama_qnn_u16_rms_norm_heads(
+                ctx0, query_heads, qnn_profile, q_norm_ops.data(), n_head);
+            cb(query_heads, "qnn_q_heads_norm", il);
+            query_heads = llama_qnn_u16_rope_heads(
+                ctx0, query_heads, inp_pos, qnn_profile, q_rope_ops.data(), n_head);
+            cb(query_heads, "qnn_q_heads_rope", il);
+            query_heads = llama_qnn_u16_qk_rotate_heads(
+                ctx0, query_heads, qnn_profile, q_rotate_ops.data(), n_head);
+            cb(query_heads, "qnn_q_heads_rotate", il);
 
+            std::vector<const llama_qnn_operation *> k_norm_ops(n_head_kv);
+            std::vector<const llama_qnn_operation *> k_rotate_ops(n_head_kv);
+            std::vector<const llama_qnn_operation *> k_convert_ops(n_head_kv);
+            std::vector<const llama_qnn_operation *> v_convert_ops(n_head_kv);
+            std::vector<llama_qnn_u16_rope_head_ops> k_rope_ops(n_head_kv);
             for (int32_t head = 0; head < n_head_kv; ++head) {
-                ggml_tensor * key = ggml_view_2d(
-                    ctx0, k_projection, n_embd_head, n_tokens,
-                    k_projection->nb[1], head * n_embd_head * k_projection->nb[0]);
-                key = llama_qnn_u16_rms_norm(
-                    ctx0, key, qnn_profile,
-                    fx_head(il, "aten_rms_norm_default", 4 * il + 2,
-                        head, "RmsNorm"));
-                cb_head(key, "qnn_k_head_norm", il, head);
-                key = llama_qnn_u16_rope(
-                    ctx0, key, inp_pos, qnn_profile, il, head, true);
-                cb_head(key, "qnn_k_head_rope", il, head);
-                key = llama_qnn_u16_qk_rotate(
-                    ctx0, key, qnn_profile, il, head, true);
-                cb_head(key, "qnn_k_head_rotate", il, head);
-                key = llama_qnn_u16_to_u8(
-                    ctx0, key, qnn_profile,
-                    qnn_require_kv_convert(qnn_profile, il, head, true));
-                cb_head(key, "qnn_k_head_u8", il, head);
-                keys.push_back(key);
-
-                ggml_tensor * value = ggml_view_2d(
-                    ctx0, v_projection, n_embd_head, n_tokens,
-                    v_projection->nb[1], head * n_embd_head * v_projection->nb[0]);
-                value = llama_qnn_u16_to_u8(
-                    ctx0, value, qnn_profile,
-                    qnn_require_kv_convert(qnn_profile, il, head, false));
-                cb_head(value, "qnn_v_head_u8", il, head);
-                values.push_back(value);
+                k_norm_ops[head] = fx_head(
+                    il, "aten_rms_norm_default", 4 * il + 2, head, "RmsNorm");
+                k_rotate_ops[head] = fx_head(
+                    il, "aten_matmul_default", 4 * il + 1, head, "MatMul");
+                k_convert_ops[head] =
+                    qnn_require_kv_convert(qnn_profile, il, head, true);
+                v_convert_ops[head] =
+                    qnn_require_kv_convert(qnn_profile, il, head, false);
+                auto & rope = k_rope_ops[head];
+                const int32_t multiply_base = 10 * il + 5;
+                const int32_t slice_base = 4 * il + 2;
+                for (int index = 0; index < 4; ++index) {
+                    rope.multiply[index] = fx_head(
+                        il, "aten_mul_tensor", multiply_base + index,
+                        head, "ElementWiseMultiply");
+                }
+                for (int index = 0; index < 2; ++index) {
+                    rope.slices[index] = fx_head(
+                        il, "aten_slice_copy_tensor", slice_base + index,
+                        head, "StridedSlice");
+                }
+                rope.subtract = fx_head(
+                    il, "aten_sub_tensor", 2 * il + 1,
+                    head, "ElementWiseSubtract");
+                rope.add = fx_head(
+                    il, "aten_add_tensor", 5 * il + 1,
+                    head, "ElementWiseAdd");
+                rope.cos_table = cos_table;
+                rope.sin_table = sin_table;
             }
-
-            ggml_tensor * key_current = qnn_concat_heads(
-                ctx0, keys, n_embd_head, n_tokens);
-            ggml_tensor * value_current = qnn_concat_heads(
-                ctx0, values, n_embd_head, n_tokens);
+            ggml_tensor * key_current = ggml_reshape_3d(
+                ctx0, k_projection, n_embd_head, n_head_kv, n_tokens);
+            key_current = llama_qnn_u16_rms_norm_heads(
+                ctx0, key_current, qnn_profile, k_norm_ops.data(), n_head_kv);
+            cb(key_current, "qnn_k_heads_norm", il);
+            key_current = llama_qnn_u16_rope_heads(
+                ctx0, key_current, inp_pos, qnn_profile,
+                k_rope_ops.data(), n_head_kv);
+            cb(key_current, "qnn_k_heads_rope", il);
+            key_current = llama_qnn_u16_qk_rotate_heads(
+                ctx0, key_current, qnn_profile, k_rotate_ops.data(), n_head_kv);
+            cb(key_current, "qnn_k_heads_rotate", il);
+            key_current = llama_qnn_u16_to_u8_heads(
+                ctx0, key_current, qnn_profile, k_convert_ops.data(), n_head_kv);
+            cb(key_current, "qnn_k_heads_u8", il);
+            ggml_tensor * value_current = ggml_reshape_3d(
+                ctx0, v_projection, n_embd_head, n_head_kv, n_tokens);
+            value_current = llama_qnn_u16_to_u8_heads(
+                ctx0, value_current, qnn_profile, v_convert_ops.data(), n_head_kv);
+            cb(value_current, "qnn_v_heads_u8", il);
             ggml_build_forward_expand(gf, key_current);
             ggml_build_forward_expand(gf, value_current);
             ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(
@@ -337,8 +346,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
             ggml_tensor * key_cache = inp_attn->mctx->get_k(ctx0, il);
             ggml_tensor * value_cache = inp_attn->mctx->get_v(ctx0, il);
-            GGML_ASSERT(key_cache->ne[0] == n_kv);
-            GGML_ASSERT(key_cache->ne[1] == n_embd_head);
+            GGML_ASSERT(key_cache->ne[0] == n_embd_head);
+            GGML_ASSERT(key_cache->ne[1] == n_kv);
             GGML_ASSERT(key_cache->ne[2] == n_head_kv);
             GGML_ASSERT(key_cache->ne[3] == 1);
             GGML_ASSERT(value_cache->ne[0] == n_embd_head);
@@ -346,20 +355,11 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             GGML_ASSERT(value_cache->ne[2] == n_kv);
             GGML_ASSERT(value_cache->ne[3] == 1);
 
-            std::vector<ggml_tensor *> attention_heads;
-            attention_heads.reserve(n_head);
+            std::vector<llama_qnn_u16_attention_head_ops> attention_ops(n_head);
             for (int32_t head = 0; head < n_head; ++head) {
-                const int32_t kv_head = head / (n_head / n_head_kv);
-                ggml_tensor * key_matrix = ggml_view_2d(
-                    ctx0, key_cache, n_kv, n_embd_head,
-                    key_cache->nb[1], kv_head * key_cache->nb[2]);
-                ggml_tensor * score = llama_qnn_u16_u8_matmul(
-                    ctx0, queries[head], key_matrix, qnn_profile,
+                attention_ops[head] = {
                     fx_head(il, "aten_matmul_default", 4 * il + 2,
-                        head, "MatMul"));
-                cb_head(score, "qnn_attention_score", il, head);
-                score = llama_qnn_u16_attention_softmax(
-                    ctx0, score, mask_condition, qnn_profile,
+                        head, "MatMul"),
                     fx_head(il, "aten_div_tensor", il, head,
                         "ElementWiseDivide"),
                     fx_head(il, "aten_amin_default", il, head, "ReduceMin"),
@@ -367,22 +367,15 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                         head, "ElementWiseAdd"),
                     fx_head(il, "aten_where_self", il, head,
                         "ElementWiseSelect"),
-                    fx_head(il, "aten__softmax_default", il, head, "Softmax"));
-                cb_head(score, "qnn_attention_softmax", il, head);
-
-                ggml_tensor * value_matrix = ggml_view_2d(
-                    ctx0, value_cache, n_embd_head, n_kv,
-                    value_cache->nb[2], kv_head * value_cache->nb[1]);
-                ggml_tensor * attention = llama_qnn_u16_u8_matmul(
-                    ctx0, score, value_matrix, qnn_profile,
+                    fx_head(il, "aten__softmax_default", il, head, "Softmax"),
                     fx_head(il, "aten_matmul_default", 4 * il + 3,
-                        head, "MatMul"));
-                cb_head(attention, "qnn_attention_value", il, head);
-                attention_heads.push_back(attention);
+                        head, "MatMul"),
+                };
             }
-
-            ggml_tensor * attention = qnn_concat_heads(
-                ctx0, attention_heads, n_embd_head, n_tokens);
+            ggml_tensor * attention = llama_qnn_u16_attention(
+                ctx0, query_heads, key_cache, value_cache, mask_condition,
+                qnn_profile, attention_ops.data(), n_head, n_head_kv);
+            cb(attention, "qnn_attention", il);
             attention = ggml_reshape_2d(
                 ctx0, attention, n_embd_head * n_head, n_tokens);
             cb(attention, "qnn_attention_concat", il);
@@ -407,20 +400,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 ctx0, model.layers[il].ffn_up, ffn_norm,
                 qnn_require_linear(qnn_profile, il, "mlp.up_proj"));
             cb(up, "qnn_ffn_up", il);
-            ggml_tensor * activated = llama_qnn_u16_sigmoid(
-                ctx0, gate,
-                fx(il, "aten_sigmoid_default", il, "Sigmoid"));
-            cb(activated, "qnn_ffn_sigmoid", il);
-            activated = llama_qnn_u16_mul(
-                ctx0, gate, activated, qnn_profile,
+            ggml_tensor * activated = llama_qnn_u16_swiglu(
+                ctx0, gate, up, qnn_profile,
+                fx(il, "aten_sigmoid_default", il, "Sigmoid"),
                 fx(il, "aten_mul_tensor", 10 * il + 9,
-                    "ElementWiseMultiply"));
-            cb(activated, "qnn_ffn_silu", il);
-            activated = llama_qnn_u16_mul(
-                ctx0, activated, up, qnn_profile,
+                    "ElementWiseMultiply"),
                 fx(il, "aten_mul_tensor", 10 * il + 10,
                     "ElementWiseMultiply"));
-            cb(activated, "qnn_ffn_product", il);
+            cb(activated, "qnn_ffn_swiglu", il);
             ggml_tensor * down = llama_qnn_u16_mul_mat(
                 ctx0, model.layers[il].ffn_down, activated,
                 qnn_require_linear(qnn_profile, il, "mlp.down_proj"));
