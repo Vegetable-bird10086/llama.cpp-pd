@@ -1287,29 +1287,20 @@ void qnn_u16_mul_mat_compute(
                 reinterpret_cast<const char *>(input->data) +
                 i1 * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
             if (vector != cached_vector) {
-                activations_fit_i16 = true;
-                for (int64_t block = 0; block < weights->ne[0] / 32; ++block) {
-                    int32_t sum = 0;
-                    for (int64_t lane = 0; lane < 32; ++lane) {
-                        const int32_t centered =
-                            static_cast<int32_t>(activation[block * 32 + lane]) -
-                            qparams->input.zero_point;
-                        sum += centered;
-                        activations_fit_i16 = activations_fit_i16 &&
-                            centered >= std::numeric_limits<int16_t>::min() &&
-                            centered <= std::numeric_limits<int16_t>::max();
-                    }
-                    activation_block_sums[block] = sum;
-                }
-                if (activations_fit_i16 && qparams->weights_gs32_source &&
-                    ggml_gptq2_32_gs32_dotprod_enabled()) {
+                const bool prepare_dotprod =
+                    qparams->weights_gs32_source &&
+                    ggml_gptq2_32_gs32_dotprod_enabled();
+                if (prepare_dotprod) {
                     activation_low.resize(weights->ne[0]);
                     activation_high.resize(weights->ne[0]);
-                    ggml_gptq2_32_prepare_u16_dotprod_activation(
+                }
+                activations_fit_i16 =
+                    ggml_gptq2_32_prepare_u16_activation(
                         static_cast<int>(weights->ne[0]), activation,
                         qparams->input.zero_point,
-                        activation_low.data(), activation_high.data());
-                }
+                        activation_block_sums.data(),
+                        prepare_dotprod ? activation_low.data() : nullptr,
+                        prepare_dotprod ? activation_high.data() : nullptr);
                 cached_vector = vector;
             }
             auto * output = reinterpret_cast<uint16_t *>(

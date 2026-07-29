@@ -291,10 +291,11 @@ void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
 // no row-major tensor or row window is materialized.
 int ggml_gptq2_32_gs32_dotprod_enabled(void);
 
-void ggml_gptq2_32_prepare_u16_dotprod_activation(
+int ggml_gptq2_32_prepare_u16_activation(
         int n,
         const uint16_t * GGML_RESTRICT activations,
         int32_t activation_zero_point,
+        int32_t * GGML_RESTRICT activation_block_sums,
         uint8_t * GGML_RESTRICT activation_low,
         int8_t * GGML_RESTRICT activation_high);
 

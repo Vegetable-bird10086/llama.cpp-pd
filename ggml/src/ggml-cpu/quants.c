@@ -765,9 +765,108 @@ static inline int64_t ggml_gptq2_32_dot_u16_neon(
         ggml_gptq2_32_hsum_s32(accumulator_hi);
 }
 
+static inline void ggml_gptq2_32_dot_s32_neon_4rows_regs(
+        const int32x4_t activation_lo[4],
+        const int32x4_t activation_hi[4],
+        int32_t activation_sum,
+        uint8x8_t packed0,
+        uint8x8_t packed1,
+        uint8x8_t packed2,
+        uint8x8_t packed3,
+        int32_t weight_zero_point0,
+        int32_t weight_zero_point1,
+        int32_t weight_zero_point2,
+        int32_t weight_zero_point3,
+        int64_t * dot0,
+        int64_t * dot1,
+        int64_t * dot2,
+        int64_t * dot3) {
+    const uint8x8_t mask = vdup_n_u8(0x3);
+    int32x4_t accumulator0_lo = vdupq_n_s32(0);
+    int32x4_t accumulator0_hi = vdupq_n_s32(0);
+    int32x4_t accumulator1_lo = vdupq_n_s32(0);
+    int32x4_t accumulator1_hi = vdupq_n_s32(0);
+    int32x4_t accumulator2_lo = vdupq_n_s32(0);
+    int32x4_t accumulator2_hi = vdupq_n_s32(0);
+    int32x4_t accumulator3_lo = vdupq_n_s32(0);
+    int32x4_t accumulator3_hi = vdupq_n_s32(0);
+#define GGML_GPTQ2_WIDE_ACCUMULATE(LANE, CODES0, CODES1, CODES2, CODES3) do { \
+            const int16x8_t weight0 = vreinterpretq_s16_u16( \
+                vmovl_u8((CODES0))); \
+            const int16x8_t weight1 = vreinterpretq_s16_u16( \
+                vmovl_u8((CODES1))); \
+            const int16x8_t weight2 = vreinterpretq_s16_u16( \
+                vmovl_u8((CODES2))); \
+            const int16x8_t weight3 = vreinterpretq_s16_u16( \
+                vmovl_u8((CODES3))); \
+            accumulator0_lo = vmlaq_s32( \
+                accumulator0_lo, activation_lo[(LANE)], \
+                vmovl_s16(vget_low_s16(weight0))); \
+            accumulator0_hi = vmlaq_s32( \
+                accumulator0_hi, activation_hi[(LANE)], \
+                vmovl_s16(vget_high_s16(weight0))); \
+            accumulator1_lo = vmlaq_s32( \
+                accumulator1_lo, activation_lo[(LANE)], \
+                vmovl_s16(vget_low_s16(weight1))); \
+            accumulator1_hi = vmlaq_s32( \
+                accumulator1_hi, activation_hi[(LANE)], \
+                vmovl_s16(vget_high_s16(weight1))); \
+            accumulator2_lo = vmlaq_s32( \
+                accumulator2_lo, activation_lo[(LANE)], \
+                vmovl_s16(vget_low_s16(weight2))); \
+            accumulator2_hi = vmlaq_s32( \
+                accumulator2_hi, activation_hi[(LANE)], \
+                vmovl_s16(vget_high_s16(weight2))); \
+            accumulator3_lo = vmlaq_s32( \
+                accumulator3_lo, activation_lo[(LANE)], \
+                vmovl_s16(vget_low_s16(weight3))); \
+            accumulator3_hi = vmlaq_s32( \
+                accumulator3_hi, activation_hi[(LANE)], \
+                vmovl_s16(vget_high_s16(weight3))); \
+        } while (0)
+    GGML_GPTQ2_WIDE_ACCUMULATE(
+        0,
+        vand_u8(packed0, mask), vand_u8(packed1, mask),
+        vand_u8(packed2, mask), vand_u8(packed3, mask));
+    GGML_GPTQ2_WIDE_ACCUMULATE(
+        1,
+        vand_u8(vshr_n_u8(packed0, 2), mask),
+        vand_u8(vshr_n_u8(packed1, 2), mask),
+        vand_u8(vshr_n_u8(packed2, 2), mask),
+        vand_u8(vshr_n_u8(packed3, 2), mask));
+    GGML_GPTQ2_WIDE_ACCUMULATE(
+        2,
+        vand_u8(vshr_n_u8(packed0, 4), mask),
+        vand_u8(vshr_n_u8(packed1, 4), mask),
+        vand_u8(vshr_n_u8(packed2, 4), mask),
+        vand_u8(vshr_n_u8(packed3, 4), mask));
+    GGML_GPTQ2_WIDE_ACCUMULATE(
+        3,
+        vshr_n_u8(packed0, 6), vshr_n_u8(packed1, 6),
+        vshr_n_u8(packed2, 6), vshr_n_u8(packed3, 6));
+#undef GGML_GPTQ2_WIDE_ACCUMULATE
+    *dot0 =
+        (int64_t) ggml_gptq2_32_hsum_pair_s32(
+            accumulator0_lo, accumulator0_hi) -
+        (int64_t) weight_zero_point0 * activation_sum;
+    *dot1 =
+        (int64_t) ggml_gptq2_32_hsum_pair_s32(
+            accumulator1_lo, accumulator1_hi) -
+        (int64_t) weight_zero_point1 * activation_sum;
+    *dot2 =
+        (int64_t) ggml_gptq2_32_hsum_pair_s32(
+            accumulator2_lo, accumulator2_hi) -
+        (int64_t) weight_zero_point2 * activation_sum;
+    *dot3 =
+        (int64_t) ggml_gptq2_32_hsum_pair_s32(
+            accumulator3_lo, accumulator3_hi) -
+        (int64_t) weight_zero_point3 * activation_sum;
+}
+
 static __attribute__((noinline)) void ggml_gptq2_32_dot_u16_neon_4rows_wide(
         const uint16_t * GGML_RESTRICT activations,
         int32_t activation_zero_point,
+        int32_t activation_sum,
         const uint8_t * packed_codes0,
         const uint8_t * packed_codes1,
         const uint8_t * packed_codes2,
@@ -780,14 +879,25 @@ static __attribute__((noinline)) void ggml_gptq2_32_dot_u16_neon_4rows_wide(
         int64_t * dot1,
         int64_t * dot2,
         int64_t * dot3) {
-    *dot0 = ggml_gptq2_32_dot_u16_neon(
-        activations, activation_zero_point, packed_codes0, weight_zero_point0);
-    *dot1 = ggml_gptq2_32_dot_u16_neon(
-        activations, activation_zero_point, packed_codes1, weight_zero_point1);
-    *dot2 = ggml_gptq2_32_dot_u16_neon(
-        activations, activation_zero_point, packed_codes2, weight_zero_point2);
-    *dot3 = ggml_gptq2_32_dot_u16_neon(
-        activations, activation_zero_point, packed_codes3, weight_zero_point3);
+    const uint16x8x4_t lanes = vld4q_u16(activations);
+    const int32x4_t zero = vdupq_n_s32(activation_zero_point);
+    int32x4_t activation_lo[4];
+    int32x4_t activation_hi[4];
+    for (int lane = 0; lane < 4; ++lane) {
+        activation_lo[lane] = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lanes.val[lane]))),
+            zero);
+        activation_hi[lane] = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lanes.val[lane]))),
+            zero);
+    }
+    ggml_gptq2_32_dot_s32_neon_4rows_regs(
+        activation_lo, activation_hi, activation_sum,
+        vld1_u8(packed_codes0), vld1_u8(packed_codes1),
+        vld1_u8(packed_codes2), vld1_u8(packed_codes3),
+        weight_zero_point0, weight_zero_point1,
+        weight_zero_point2, weight_zero_point3,
+        dot0, dot1, dot2, dot3);
 }
 
 #if defined(__aarch64__)
@@ -1189,7 +1299,7 @@ static inline void ggml_gptq2_32_dot_u16_neon_4rows(
     }
 #endif
     ggml_gptq2_32_dot_u16_neon_4rows_wide(
-        activations, activation_zero_point,
+        activations, activation_zero_point, activation_sum,
         packed_codes0, packed_codes1, packed_codes2, packed_codes3,
         weight_zero_point0, weight_zero_point1,
         weight_zero_point2, weight_zero_point3,
@@ -1197,45 +1307,77 @@ static inline void ggml_gptq2_32_dot_u16_neon_4rows(
 }
 #endif
 
-void ggml_gptq2_32_prepare_u16_dotprod_activation(
+int ggml_gptq2_32_prepare_u16_activation(
         int n,
         const uint16_t * GGML_RESTRICT activations,
         int32_t activation_zero_point,
+        int32_t * GGML_RESTRICT activation_block_sums,
         uint8_t * GGML_RESTRICT activation_low,
         int8_t * GGML_RESTRICT activation_high) {
     GGML_ASSERT(n > 0 && n % 32 == 0);
     GGML_ASSERT(activations != NULL);
-    GGML_ASSERT(activation_low != NULL && activation_high != NULL);
+    GGML_ASSERT(activation_block_sums != NULL);
+    GGML_ASSERT((activation_low == NULL) == (activation_high == NULL));
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    uint16x8_t activation_min = vdupq_n_u16(UINT16_MAX);
+    uint16x8_t activation_max = vdupq_n_u16(0);
+    const uint16x8_t zero =
+        vdupq_n_u16((uint16_t) activation_zero_point);
     for (int block = 0; block < n / 32; ++block) {
-#if defined(__ARM_NEON)
         const uint16x8x4_t lanes = vld4q_u16(activations + block * 32);
-        const uint16x8_t zero =
-            vdupq_n_u16((uint16_t) activation_zero_point);
+        uint32_t raw_sum = 0;
         for (int group = 0; group < 4; ++group) {
-            const int16x8_t centered = vreinterpretq_s16_u16(
-                vsubq_u16(lanes.val[group], zero));
-            vst1_u8(
-                activation_low + block * 32 + group * 8,
-                vmovn_u16(vreinterpretq_u16_s16(centered)));
-            vst1_s8(
-                activation_high + block * 32 + group * 8,
-                vshrn_n_s16(centered, 8));
-        }
-#else
-        for (int group = 0; group < 4; ++group) {
-            for (int lane = 0; lane < 8; ++lane) {
-                const int16_t centered = (int16_t) (
-                    (int32_t) activations[block * 32 + lane * 4 + group] -
-                    activation_zero_point);
-                activation_low[block * 32 + group * 8 + lane] =
-                    (uint8_t) centered;
-                activation_high[block * 32 + group * 8 + lane] =
-                    (int8_t) (centered >> 8);
+            activation_min = vminq_u16(activation_min, lanes.val[group]);
+            activation_max = vmaxq_u16(activation_max, lanes.val[group]);
+            raw_sum += vaddlvq_u16(lanes.val[group]);
+            if (activation_low != NULL) {
+                const int16x8_t centered = vreinterpretq_s16_u16(
+                    vsubq_u16(lanes.val[group], zero));
+                vst1_u8(
+                    activation_low + block * 32 + group * 8,
+                    vmovn_u16(vreinterpretq_u16_s16(centered)));
+                vst1_s8(
+                    activation_high + block * 32 + group * 8,
+                    vshrn_n_s16(centered, 8));
             }
         }
-#endif
+        activation_block_sums[block] =
+            (int32_t) raw_sum - activation_zero_point * 32;
     }
+    const uint16_t lower = activation_zero_point > 32768
+        ? (uint16_t) (activation_zero_point - 32768)
+        : 0;
+    const uint16_t upper = activation_zero_point < 32768
+        ? (uint16_t) (activation_zero_point + 32767)
+        : UINT16_MAX;
+    return vminvq_u16(activation_min) >= lower &&
+        vmaxvq_u16(activation_max) <= upper;
+#else
+    int activations_fit_i16 = 1;
+    for (int block = 0; block < n / 32; ++block) {
+        int32_t sum = 0;
+        for (int lane = 0; lane < 32; ++lane) {
+            const int32_t centered =
+                (int32_t) activations[block * 32 + lane] -
+                activation_zero_point;
+            sum += centered;
+            activations_fit_i16 = activations_fit_i16 &&
+                centered >= INT16_MIN && centered <= INT16_MAX;
+            if (activation_low != NULL) {
+                const int16_t centered_i16 = (int16_t) centered;
+                const int group = lane % 4;
+                const int group_lane = lane / 4;
+                activation_low[block * 32 + group * 8 + group_lane] =
+                    (uint8_t) centered_i16;
+                activation_high[block * 32 + group * 8 + group_lane] =
+                    (int8_t) (centered_i16 >> 8);
+            }
+        }
+        activation_block_sums[block] = sum;
+    }
+    return activations_fit_i16;
+#endif
 }
 
 static void ggml_vec_dot_gptq2_u16_qnn(
@@ -2439,11 +2581,51 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
             const uint32x4x2_t rows47 = vzipq_u32(
                 vreinterpretq_u32_u16(zip01.val[1]),
                 vreinterpretq_u32_u16(zip23.val[1]));
+            const uint8x16_t row01 =
+                vreinterpretq_u8_u32(rows03.val[0]);
+            const uint8x16_t row23 =
+                vreinterpretq_u8_u32(rows03.val[1]);
+            const uint8x16_t row45 =
+                vreinterpretq_u8_u32(rows47.val[0]);
+            const uint8x16_t row67 =
+                vreinterpretq_u8_u32(rows47.val[1]);
+#if defined(__aarch64__)
+            const uint16x8x4_t activation_lanes =
+                vld4q_u16(activations + block * 32);
+            const int32x4_t activation_zero =
+                vdupq_n_s32(activation_zero_point);
+            int32x4_t activation_lo[4];
+            int32x4_t activation_hi[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                activation_lo[lane] = vsubq_s32(
+                    vreinterpretq_s32_u32(vmovl_u16(
+                        vget_low_u16(activation_lanes.val[lane]))),
+                    activation_zero);
+                activation_hi[lane] = vsubq_s32(
+                    vreinterpretq_s32_u32(vmovl_u16(
+                        vget_high_u16(activation_lanes.val[lane]))),
+                    activation_zero);
+            }
+            ggml_gptq2_32_dot_s32_neon_4rows_regs(
+                activation_lo, activation_hi, activation_block_sums[block],
+                vget_low_u8(row01), vget_high_u8(row01),
+                vget_low_u8(row23), vget_high_u8(row23),
+                (prepared0 >> 5) & 0x3, (prepared1 >> 5) & 0x3,
+                (prepared2 >> 5) & 0x3, (prepared3 >> 5) & 0x3,
+                &dots[0], &dots[1], &dots[2], &dots[3]);
+            ggml_gptq2_32_dot_s32_neon_4rows_regs(
+                activation_lo, activation_hi, activation_block_sums[block],
+                vget_low_u8(row45), vget_high_u8(row45),
+                vget_low_u8(row67), vget_high_u8(row67),
+                (prepared4 >> 5) & 0x3, (prepared5 >> 5) & 0x3,
+                (prepared6 >> 5) & 0x3, (prepared7 >> 5) & 0x3,
+                &dots[4], &dots[5], &dots[6], &dots[7]);
+#else
             uint8_t row_codes[8][8];
-            vst1q_u8(row_codes[0], vreinterpretq_u8_u32(rows03.val[0]));
-            vst1q_u8(row_codes[2], vreinterpretq_u8_u32(rows03.val[1]));
-            vst1q_u8(row_codes[4], vreinterpretq_u8_u32(rows47.val[0]));
-            vst1q_u8(row_codes[6], vreinterpretq_u8_u32(rows47.val[1]));
+            vst1q_u8(row_codes[0], row01);
+            vst1q_u8(row_codes[2], row23);
+            vst1q_u8(row_codes[4], row45);
+            vst1q_u8(row_codes[6], row67);
             ggml_gptq2_32_dot_u16_neon_4rows(
                 activations + block * 32, activation_block_sums[block],
                 activations_fit_i16, activation_zero_point,
@@ -2458,6 +2640,7 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                 (prepared4 >> 5) & 0x3, (prepared5 >> 5) & 0x3,
                 (prepared6 >> 5) & 0x3, (prepared7 >> 5) & 0x3,
                 &dots[4], &dots[5], &dots[6], &dots[7]);
+#endif
         }
 #else
         const uint8_t prepared_scalar[8] = {
