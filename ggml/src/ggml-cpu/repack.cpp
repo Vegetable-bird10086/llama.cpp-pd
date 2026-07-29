@@ -4730,6 +4730,20 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
     return GGML_STATUS_SUCCESS;
 }
 
+static enum ggml_status ggml_backend_cpu_repack_q8_0_4x8_buffer_init_tensor(
+        ggml_backend_buffer_t buffer,
+        struct ggml_tensor * tensor) {
+    static const ggml::cpu::repack::tensor_traits<
+        block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(tensor->ne[0] % QK8_0 == 0);
+    GGML_ASSERT(tensor->ne[1] % 4 == 0);
+    tensor->extra = const_cast<ggml::cpu::tensor_traits *>(
+        static_cast<const ggml::cpu::tensor_traits *>(&q8_0_4x8_q8_0));
+    GGML_UNUSED(buffer);
+    return GGML_STATUS_SUCCESS;
+}
+
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset == 0);
@@ -4833,4 +4847,53 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+ggml_backend_buffer_t ggml_backend_cpu_repack_q8_0_4x8_buffer_from_ptr(
+        void * ptr,
+        size_t size) {
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    buffer->buft = ggml_backend_cpu_repack_buffer_type();
+    buffer->iface.init_tensor =
+        ggml_backend_cpu_repack_q8_0_4x8_buffer_init_tensor;
+    // The source bytes are already packed. Keep the ordinary CPU set_tensor
+    // callback so any explicit write remains a byte-for-byte copy.
+    return buffer;
+}
+
+void ggml_backend_cpu_unpack_q8_0_4x8_to_row(
+        void * dst,
+        const void * src,
+        int64_t ne0,
+        int64_t nrows) {
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(dst != src);
+    GGML_ASSERT(ne0 % QK8_0 == 0);
+    GGML_ASSERT(nrows % 4 == 0);
+
+    const int64_t nblocks = ne0 / QK8_0;
+    const block_q8_0x4 * packed =
+        static_cast<const block_q8_0x4 *>(src);
+    block_q8_0 * rows = static_cast<block_q8_0 *>(dst);
+
+    for (int64_t row0 = 0; row0 < nrows; row0 += 4) {
+        for (int64_t block = 0; block < nblocks; ++block) {
+            const block_q8_0x4 & in =
+                packed[(row0 / 4) * nblocks + block];
+            for (int64_t row = 0; row < 4; ++row) {
+                block_q8_0 & out = rows[(row0 + row) * nblocks + block];
+                out.d = in.d[row];
+                for (int64_t chunk = 0; chunk < 4; ++chunk) {
+                    memcpy(
+                        out.qs + chunk * 8,
+                        in.qs + chunk * 32 + row * 8,
+                        8);
+                }
+            }
+        }
+    }
 }

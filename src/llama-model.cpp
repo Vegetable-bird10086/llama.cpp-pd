@@ -20,6 +20,8 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
+#include "ggml-cpu/repack.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1498,7 +1500,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
-    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+    const size_t n_model_sources =
+        ml.external_buffer_data != nullptr ? 1 : ml.files.size();
+    const size_t n_max_backend_buffer = ml.ctx_map.size() * n_model_sources;
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
@@ -1525,11 +1529,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
-
+        bool contains_prepacked_q8_0_lm_head = false;
+        if (ml.q8_0_lm_head_4x8_source) {
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+                 tensor != nullptr;
+                 tensor = ggml_get_next_tensor(ctx, tensor)) {
+                if (tensor->type == GGML_TYPE_Q8_0 &&
+                    strcmp(ggml_get_name(tensor), "output.weight") == 0) {
+                    contains_prepacked_q8_0_lm_head = true;
+                    break;
+                }
+            }
+        }
+        const bool is_prepacked_q8_0_lm_head =
+            contains_prepacked_q8_0_lm_head &&
+            buft == ggml_backend_cpu_repack_buffer_type();
+        const bool unpack_prepacked_q8_0_lm_head =
+            contains_prepacked_q8_0_lm_head && !ggml_cpu_has_dotprod();
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer &&
+            !unpack_prepacked_q8_0_lm_head &&
+            ((buffer_from_host_ptr_supported && is_default_buft) ||
+             is_prepacked_q8_0_lm_head)) {
             GGML_ASSERT(!ml.no_alloc);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+            for (uint32_t idx = 0; idx < n_model_sources; idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
@@ -1541,7 +1564,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                ggml_backend_buffer_t buf = is_prepacked_q8_0_lm_head
+                    ? ggml_backend_cpu_repack_q8_0_4x8_buffer_from_ptr(
+                        (char *) addr + first, last - first)
+                    : ggml_backend_dev_buffer_from_host_ptr(
+                        dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
@@ -1549,6 +1576,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf_map.emplace(idx, buf);
             }
         } else {
+            if (ml.external_buffer_data != nullptr) {
+                LLAMA_LOG_INFO(
+                    "%s: materializing only external tensors selected for %s; "
+                    "default CPU tensors remain zero-copy\n",
+                    __func__, ggml_backend_buft_name(buft));
+            }
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

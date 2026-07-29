@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-cpu/repack.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -519,13 +520,19 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
+        const void * external_buffer,
+        size_t external_buffer_size,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        : external_buffer_data(static_cast<const uint8_t *>(external_buffer)),
+          external_buffer_size(external_buffer_size),
+          metadata(meta),
+          set_tensor_data(set_tensor_data),
+          set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -696,6 +703,42 @@ llama_model_loader::llama_model_loader(
             n_bytes    += ggml_nbytes(cur);
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
+    } else if (external_buffer_data != nullptr) {
+        struct ggml_context * ctx = nullptr;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        metadata_ptr.reset(
+            gguf_init_from_buffer(external_buffer_data, external_buffer_size, params));
+        metadata = metadata_ptr.get();
+        if (metadata == nullptr) {
+            throw std::runtime_error(
+                format("%s: failed to load model from external buffer", __func__));
+        }
+
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        contexts.emplace_back(ctx);
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur;
+             cur = ggml_get_next_tensor(ctx, cur)) {
+            const int tensor_idx =
+                gguf_find_tensor(metadata, ggml_get_name(cur));
+            GGML_ASSERT(tensor_idx >= 0);
+            const size_t offs =
+                gguf_get_data_offset(metadata) +
+                gguf_get_tensor_offset(metadata, tensor_idx);
+            if (offs + ggml_nbytes(cur) < offs ||
+                offs + ggml_nbytes(cur) > external_buffer_size) {
+                throw std::runtime_error(format(
+                    "tensor '%s' is outside the external GGUF buffer",
+                    ggml_get_name(cur)));
+            }
+            n_elements += ggml_nelements(cur);
+            n_bytes += ggml_nbytes(cur);
+            weights_map.emplace(
+                ggml_get_name(cur), llama_tensor_weight(0, offs, cur));
+        }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -830,6 +873,22 @@ llama_model_loader::llama_model_loader(
         gptq2_32_gs32_source = true;
         LLAMA_LOG_INFO(
             "%s: keeping gs32_source_v1 GPTQ2_32 tensors in their shared file-backed layout\n",
+            __func__);
+    }
+
+    std::string q8_0_lm_head_layout;
+    if (get_key(
+            "general.q8_0_lm_head.layout",
+            q8_0_lm_head_layout,
+            false)) {
+        if (q8_0_lm_head_layout != "q8_0_4x8_bl8_v1") {
+            throw std::runtime_error(format(
+                "unsupported general.q8_0_lm_head.layout: %s",
+                q8_0_lm_head_layout.c_str()));
+        }
+        q8_0_lm_head_4x8_source = true;
+        LLAMA_LOG_INFO(
+            "%s: using kernel-ready q8_0_4x8_bl8_v1 LM head\n",
             __func__);
     }
 
@@ -1231,7 +1290,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    if (files.empty()) {
+    if (files.empty() && external_buffer_data == nullptr) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
@@ -1385,12 +1444,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
-    GGML_ASSERT(!mappings.empty());
-    const auto & mapping = mappings.at(idx);
-
-    *first = mapping->size();
+    GGML_ASSERT(idx == 0 || external_buffer_data == nullptr);
+    const auto * mapping = external_buffer_data == nullptr ? mappings.at(idx).get() : nullptr;
+    *first = mapping != nullptr ? mapping->size() : external_buffer_size;
     *last  = 0;
-    *addr = mapping->addr();
+    *addr = mapping != nullptr
+        ? mapping->addr()
+        : const_cast<uint8_t *>(external_buffer_data);
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
         if (!weight || weight->idx != idx) {
@@ -1431,7 +1491,7 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
-    if (files.empty()) {
+    if (files.empty() && external_buffer_data == nullptr) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
         }
@@ -1556,15 +1616,22 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         if (use_mmap) {
-            const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
                 buf_mmap = bufs.at(weight->idx);
             }
-            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            uint8_t * data = external_buffer_data != nullptr
+                ? const_cast<uint8_t *>(external_buffer_data) + weight->offs
+                : static_cast<uint8_t *>(mappings.at(weight->idx)->addr()) +
+                    weight->offs;
 
-            if (check_tensors &&
-                !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32)) {
+            const bool kernel_ready_layout =
+                (gptq2_32_gs32_source &&
+                 cur->type == GGML_TYPE_GPTQ2_32) ||
+                (q8_0_lm_head_4x8_source &&
+                 cur->type == GGML_TYPE_Q8_0 &&
+                 strcmp(ggml_get_name(cur), "output.weight") == 0);
+            if (check_tensors && !kernel_ready_layout) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -1573,23 +1640,58 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
-                if (lmlocks) {
+                if (lmlocks && external_buffer_data == nullptr) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }
 
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                if (external_buffer_data == nullptr) {
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                }
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                const bool unpack_q8_0_lm_head =
+                    q8_0_lm_head_4x8_source &&
+                    cur->type == GGML_TYPE_Q8_0 &&
+                    strcmp(ggml_get_name(cur), "output.weight") == 0 &&
+                    cur->buffer->buft !=
+                        ggml_backend_cpu_repack_buffer_type();
+                if (unpack_q8_0_lm_head) {
+                    GGML_ASSERT(
+                        ggml_backend_buffer_is_host(cur->buffer) &&
+                        cur->data != nullptr);
+                    ggml_backend_cpu_unpack_q8_0_4x8_to_row(
+                        cur->data, data, cur->ne[0], ggml_nrows(cur));
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                const bool unpack_q8_0_lm_head =
+                    q8_0_lm_head_4x8_source &&
+                    cur->type == GGML_TYPE_Q8_0 &&
+                    strcmp(ggml_get_name(cur), "output.weight") == 0;
+                if (unpack_q8_0_lm_head) {
+                    const size_t row_bytes =
+                        ggml_row_size(cur->type, cur->ne[0]);
+                    const size_t group_bytes = 4 * row_bytes;
+                    read_buf.resize(group_bytes);
+                    for (int64_t row0 = 0; row0 < ggml_nrows(cur);
+                         row0 += 4) {
+                        file->read_raw(read_buf.data(), group_bytes);
+                        ggml_backend_cpu_unpack_q8_0_4x8_to_row(
+                            static_cast<uint8_t *>(cur->data) +
+                                row0 * row_bytes,
+                            read_buf.data(), cur->ne[0], 4);
+                    }
+                } else {
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors &&
                     !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32)) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {

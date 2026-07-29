@@ -36,6 +36,9 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor)
+            : idx(idx), offs(offs), tensor(tensor) {}
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -80,12 +83,15 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool gptq2_32_gs32_source = false;
+    bool q8_0_lm_head_4x8_source = false;
 
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
 
     llama_mmaps mappings;
+    const uint8_t * external_buffer_data = nullptr;
+    size_t external_buffer_size = 0;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
@@ -127,6 +133,8 @@ struct llama_model_loader {
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
+        const void * external_buffer,
+        size_t external_buffer_size,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,

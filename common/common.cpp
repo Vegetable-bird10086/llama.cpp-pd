@@ -1195,7 +1195,11 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(
+        common_params & params,
+        bool model_only,
+        const void * model_buffer,
+        size_t model_buffer_size) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1212,6 +1216,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     llama_model * model = nullptr;
+    if (model_buffer != nullptr) {
+        model = llama_model_load_from_buffer(
+            model_buffer, model_buffer_size, mparams);
+    } else {
 #if !defined(_WIN32)
     if (params.model.path.rfind("fd:", 0) == 0) {
         const char * value = params.model.path.c_str() + 3;
@@ -1242,6 +1250,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 #endif
     {
         model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     }
     if (model == NULL) {
         return;
@@ -1517,6 +1526,24 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
+    return res;
+}
+
+common_init_result_ptr common_init_from_params_buffer(
+        common_params & params,
+        const void * model_buffer,
+        size_t model_buffer_size,
+        bool model_only) {
+    common_init_result_ptr res(new common_init_result(
+        params, model_only, model_buffer, model_buffer_size));
+    llama_model * model = res->model();
+    if (model == nullptr) {
+        COM_ERR("%s", "failed to load model from in-process GGUF buffer\n");
+        return res;
+    }
+    if (!model_only && res->context() == nullptr) {
+        COM_ERR("%s", "failed to create context with model from in-process GGUF buffer\n");
+    }
     return res;
 }
 

@@ -113,6 +113,31 @@ class ModelBase:
     mtp_only: bool = False
     no_mtp: bool = False
 
+    @staticmethod
+    def _repack_q8_0_4x8_bl8(data: np.ndarray) -> np.ndarray:
+        """Convert row-major Q8_0 blocks to GGML's ARM 4-row, blocklen-8 layout."""
+        if data.dtype != np.uint8 or data.ndim != 2:
+            raise ValueError("Q8_0 4x8 repack expects a 2D uint8 tensor")
+        rows, row_bytes = data.shape
+        block_bytes = 34
+        if rows % 4 != 0 or row_bytes % block_bytes != 0:
+            raise ValueError(
+                f"Q8_0 4x8 repack requires rows divisible by 4 and "
+                f"{block_bytes}-byte blocks, got {data.shape}"
+            )
+
+        n_blocks = row_bytes // block_bytes
+        groups = data.reshape(rows // 4, 4, n_blocks, block_bytes)
+        scales = groups[:, :, :, :2].transpose(0, 2, 1, 3).reshape(
+            rows // 4, n_blocks, 8
+        )
+        quants = groups[:, :, :, 2:].reshape(
+            rows // 4, 4, n_blocks, 4, 8
+        ).transpose(0, 2, 3, 1, 4).reshape(
+            rows // 4, n_blocks, 128
+        )
+        return np.concatenate((scales, quants), axis=2).reshape(data.shape)
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
@@ -1083,6 +1108,20 @@ class ModelBase:
                     data_qtype = gguf.GGMLQuantizationType.F16
                     data = gguf.quants.quantize(data, data_qtype)
 
+                output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
+                if (
+                    self._gptq2_32_gs32_source
+                    and new_name == output_name
+                    and data_qtype == gguf.GGMLQuantizationType.Q8_0
+                ):
+                    if isinstance(data, gguf.LazyNumpyTensor):
+                        data = gguf.LazyNumpyTensor._wrap_fn(
+                            self._repack_q8_0_4x8_bl8,
+                            meta_noop=True,
+                        )(data)
+                    else:
+                        data = self._repack_q8_0_4x8_bl8(data)
+
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
                 # reverse shape to make it similar to the internal ggml dimension order
@@ -1132,6 +1171,13 @@ class ModelBase:
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
         if self._gptq2_32_gs32_source:
             self.gguf_writer.add_string("general.gptq2_32.layout", "gs32_source_v1")
+            if (
+                self._gptq2_32_gs32_lm_head_type
+                == gguf.GGMLQuantizationType.Q8_0
+            ):
+                self.gguf_writer.add_string(
+                    "general.q8_0_lm_head.layout", "q8_0_4x8_bl8_v1"
+                )
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")

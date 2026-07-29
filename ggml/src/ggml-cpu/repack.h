@@ -9,6 +9,13 @@
 // GGML internal header
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
+ggml_backend_buffer_t ggml_backend_cpu_repack_q8_0_4x8_buffer_from_ptr(
+        void * ptr, size_t size);
+void ggml_backend_cpu_unpack_q8_0_4x8_to_row(
+        void * dst,
+        const void * src,
+        int64_t ne0,
+        int64_t nrows);
 
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {

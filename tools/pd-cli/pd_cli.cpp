@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "pd_cli_inprocess.h"
 #include "json.hpp"
 #include "llama.h"
 #include "llama-qnn-u16.h"
@@ -44,6 +45,7 @@ struct pd_args {
     std::string import_dir;
     int control_fd = -1;
     int memory_fd = -1;
+    const uint8_t * memory_ptr = nullptr;
     size_t memory_size = 0;
     int32_t prompt_length = 0;
     int32_t num_layers = 0;
@@ -61,6 +63,10 @@ struct pd_args {
     bool native_compare = false;
     bool native_first_token = false;
 };
+
+thread_local const llama_pd_inprocess_request * g_inprocess_request = nullptr;
+thread_local llama_pd_inprocess_runtime * g_inprocess_runtime = nullptr;
+thread_local bool g_inprocess_preparing = false;
 
 constexpr uint32_t PD_RESIDENT_READY_MAGIC = 0x50445259U; // "PDRY"
 constexpr uint32_t PD_RESIDENT_PREPARE_MAGIC = 0x50445052U; // "PDPR"
@@ -1082,11 +1088,13 @@ pd_args parse_pd_args(int argc, char ** argv, std::vector<char *> * forwarded) {
     const int handoff_sources =
         static_cast<int>(!out.import_dir.empty()) +
         static_cast<int>(out.memory_fd >= 0) +
-        static_cast<int>(out.control_fd >= 0);
+        static_cast<int>(out.control_fd >= 0) +
+        static_cast<int>(
+            g_inprocess_request != nullptr || g_inprocess_preparing);
     if (handoff_sources != 1) {
         throw std::runtime_error(
             "provide exactly one of --pd-import DIR, --pd-memory-fd FD, "
-            "or --pd-control-fd FD");
+            "--pd-control-fd FD, or an in-process handoff");
     }
     if (out.memory_fd >= 0 &&
         (out.memory_size == 0 || out.prompt_length <= 0 ||
@@ -1261,13 +1269,15 @@ pd_handoff load_pd_handoff(
 
 pd_handoff load_pd_memory_handoff(const pd_args & args) {
     const auto metadata_start = steady_clock::now();
-    struct stat info {};
-    if (fstat(args.memory_fd, &info) != 0) {
-        throw std::runtime_error("unable to stat PD memory handoff");
-    }
-    if (info.st_size < 0 ||
-        static_cast<uint64_t>(info.st_size) != args.memory_size) {
-        throw std::runtime_error("PD memory handoff descriptor size mismatch");
+    if (args.memory_ptr == nullptr) {
+        struct stat info {};
+        if (fstat(args.memory_fd, &info) != 0) {
+            throw std::runtime_error("unable to stat PD memory handoff");
+        }
+        if (info.st_size < 0 ||
+            static_cast<uint64_t>(info.st_size) != args.memory_size) {
+            throw std::runtime_error("PD memory handoff descriptor size mismatch");
+        }
     }
 
     const size_t prompt_bytes =
@@ -1281,32 +1291,40 @@ pd_handoff load_pd_memory_handoff(const pd_args & args) {
         throw std::runtime_error("PD memory handoff payload size mismatch");
     }
 
-    void * mapping = mmap(
-        nullptr,
-        args.memory_size,
-        PROT_READ,
-        MAP_SHARED,
-        args.memory_fd,
-        0);
-    if (mapping == MAP_FAILED) {
-        throw std::runtime_error("unable to map PD memory handoff");
+    const uint8_t * bytes = args.memory_ptr;
+    void * mapping = MAP_FAILED;
+    if (bytes == nullptr) {
+        mapping = mmap(
+            nullptr,
+            args.memory_size,
+            PROT_READ,
+            MAP_SHARED,
+            args.memory_fd,
+            0);
+        if (mapping == MAP_FAILED) {
+            throw std::runtime_error("unable to map PD memory handoff");
+        }
+        close(args.memory_fd);
+        bytes = static_cast<const uint8_t *>(mapping);
     }
-    close(args.memory_fd);
 
     pd_handoff out;
-    out.memory_mapping = std::shared_ptr<void>(
-        mapping,
-        [size = args.memory_size](void * ptr) {
-            munmap(ptr, size);
-        });
-    const uint64_t * token_data = static_cast<const uint64_t *>(mapping);
+    if (mapping != MAP_FAILED) {
+        out.memory_mapping = std::shared_ptr<void>(
+            mapping,
+            [size = args.memory_size](void * ptr) {
+                munmap(ptr, size);
+            });
+    }
+    const uint64_t * token_data =
+        reinterpret_cast<const uint64_t *>(bytes);
     out.prompt_tokens.reserve(static_cast<size_t>(args.prompt_length));
     for (int32_t i = 0; i < args.prompt_length; ++i) {
         out.prompt_tokens.push_back(
             static_cast<llama_token>(token_data[static_cast<size_t>(i)]));
     }
     out.kv_qnn_u8_view =
-        static_cast<const uint8_t *>(mapping) + prompt_bytes;
+        bytes + prompt_bytes;
     out.kv_qnn_u8_view_size = kv_bytes;
     out.prompt_len = args.prompt_length;
     out.num_layers = args.num_layers;
@@ -1796,7 +1814,17 @@ void print_usage(int argc, char ** argv) {
 
 } // namespace
 
-int main(int argc, char ** argv) {
+struct llama_pd_inprocess_runtime {
+    std::vector<std::string> args;
+    common_init_result_ptr llama_init;
+    pd_disk_embedding disk_embedding;
+    pd_persistent_threadpools threadpools;
+    bool threadpools_attached = false;
+    bool has_run = false;
+    double initialization_ms = 0.0;
+};
+
+static int llama_pd_cli_main_impl(int argc, char ** argv) {
     const auto process_start = steady_clock::now();
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1807,6 +1835,17 @@ int main(int argc, char ** argv) {
     } catch (const std::exception & err) {
         LOG_ERR("%s\n", err.what());
         return 1;
+    }
+    if (g_inprocess_request != nullptr) {
+        const auto & request = *g_inprocess_request;
+        pd.memory_ptr = static_cast<const uint8_t *>(request.handoff_data);
+        pd.memory_size = request.handoff_size;
+        pd.prompt_length = request.prompt_length;
+        pd.num_layers = request.num_layers;
+        pd.num_kv_heads = request.num_kv_heads;
+        pd.head_dim = request.head_dim;
+        pd.first_token = static_cast<llama_token>(request.first_token);
+        pd.first_token_is_prompt_tail = request.first_token_is_prompt_tail;
     }
 
     common_params params;
@@ -1872,8 +1911,10 @@ int main(int argc, char ** argv) {
                 pd_op_profile.output_path.c_str(),
                 pd_op_profile.layer_granularity ? "layer" : "node");
     }
-    llama_backend_init();
-    llama_numa_init(params.numa);
+    if (g_inprocess_runtime == nullptr) {
+        llama_backend_init();
+        llama_numa_init(params.numa);
+    }
 
     // A resident PD child first loads only the GGUF. The QNN profile mapping,
     // context compute buffers, and full-capacity KV cache are intentionally
@@ -1886,7 +1927,20 @@ int main(int argc, char ** argv) {
             unsetenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
         }
     }
-    auto llama_init = common_init_from_params(params, pd.control_fd >= 0);
+    common_init_result_ptr local_llama_init;
+    common_init_result * llama_init = nullptr;
+    if (g_inprocess_runtime != nullptr) {
+        llama_init = g_inprocess_runtime->llama_init.get();
+    } else {
+        local_llama_init = g_inprocess_request != nullptr
+            ? common_init_from_params_buffer(
+                  params,
+                  g_inprocess_request->model_data,
+                  g_inprocess_request->model_size,
+                  pd.control_fd >= 0)
+            : common_init_from_params(params, pd.control_fd >= 0);
+        llama_init = local_llama_init.get();
+    }
     if (deferred_profile_path.has_value()) {
         setenv(
             "LLAMA_QNN_U16_QPARAMS_MANIFEST",
@@ -1899,7 +1953,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    pd_persistent_threadpools persistent_threadpools;
+    pd_persistent_threadpools local_threadpools;
+    pd_persistent_threadpools & persistent_threadpools =
+        g_inprocess_runtime != nullptr
+        ? g_inprocess_runtime->threadpools
+        : local_threadpools;
 
     char external_embedding_kind[32] = {};
     const bool model_requires_disk_embedding =
@@ -1915,8 +1973,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    pd_disk_embedding disk_embedding;
-    if (!pd.disk_embedding_path.empty()) {
+    pd_disk_embedding local_disk_embedding;
+    pd_disk_embedding & disk_embedding = g_inprocess_runtime != nullptr
+        ? g_inprocess_runtime->disk_embedding
+        : local_disk_embedding;
+    if (g_inprocess_runtime == nullptr && !pd.disk_embedding_path.empty()) {
         try {
             disk_embedding.open_file(pd.disk_embedding_path);
             if (disk_embedding.vocab_size() !=
@@ -1937,6 +1998,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    const auto persistent_boundary_start = steady_clock::now();
     if (pd.control_fd >= 0) {
         try {
             LOG_INF(
@@ -1979,9 +2041,17 @@ int main(int argc, char ** argv) {
             LOG_ERR("resident Decode handoff failed: %s\n", err.what());
             return 1;
         }
-    } else {
+    } else if (g_inprocess_runtime == nullptr) {
         try {
             persistent_threadpools.attach(llama_init->context(), params);
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to initialize persistent CPU threadpool: %s\n", err.what());
+            return 1;
+        }
+    } else if (!g_inprocess_runtime->threadpools_attached) {
+        try {
+            persistent_threadpools.attach(llama_init->context(), params);
+            g_inprocess_runtime->threadpools_attached = true;
         } catch (const std::exception & err) {
             LOG_ERR("failed to initialize persistent CPU threadpool: %s\n", err.what());
             return 1;
@@ -1996,11 +2066,25 @@ int main(int argc, char ** argv) {
     }
     const process_memory_snapshot memory_after_model_load = process_memory();
 
+    const double initialization_ms = g_inprocess_runtime != nullptr
+        ? g_inprocess_runtime->initialization_ms
+        : elapsed_ms(process_start);
+    const auto boundary_start = g_inprocess_runtime != nullptr
+        ? persistent_boundary_start
+        : steady_clock::now();
+    if (g_inprocess_runtime != nullptr) {
+        // A reused context keeps model/metadata/KV/scheduler allocation stable.
+        // Clear only per-conversation state before importing the next Prefill KV.
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_synchronize(ctx);
+        llama_init->reset_samplers();
+        llama_perf_context_reset(ctx);
+    }
     const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
     const bool need_fp16_handoff = !qnn_u8_layout;
     pd_handoff handoff;
     try {
-        handoff = pd.memory_fd >= 0
+        handoff = (pd.memory_fd >= 0 || pd.memory_ptr != nullptr)
             ? load_pd_memory_handoff(pd)
             : load_pd_handoff(
                   pd.import_dir, need_fp16_handoff, qnn_u8_layout);
@@ -2189,6 +2273,7 @@ int main(int argc, char ** argv) {
     const bool infinite = n_remain < 0;
 
     int32_t generated_tokens = 0;
+    const double boundary_ms = elapsed_ms(boundary_start);
     const auto decode_start = steady_clock::now();
     const auto decode_one = [&](llama_token token) {
         const bool capture_this_decode =
@@ -2360,6 +2445,18 @@ int main(int argc, char ** argv) {
 
     LOG("\n");
     const double decode_ms = elapsed_ms(decode_start);
+    if (g_inprocess_request != nullptr &&
+        g_inprocess_request->result != nullptr) {
+        *g_inprocess_request->result = {
+            initialization_ms,
+            boundary_ms,
+            decode_ms,
+            generated_tokens,
+        };
+    }
+    if (g_inprocess_runtime != nullptr) {
+        g_inprocess_runtime->has_run = true;
+    }
     const process_memory_snapshot memory_after_decode = process_memory();
     LOG_INF(
         "PD decode runtime summary: generated_tokens=%d handoff_ms=%.3f "
@@ -2378,3 +2475,166 @@ int main(int argc, char ** argv) {
     common_perf_print(ctx, smpl);
     return 0;
 }
+
+llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
+        int argc,
+        char ** argv,
+        const void * model_data,
+        size_t model_size,
+        double * initialization_ms) {
+    if (model_data == nullptr || model_size == 0) {
+        return nullptr;
+    }
+
+    const auto init_start = steady_clock::now();
+    std::unique_ptr<llama_pd_inprocess_runtime> runtime(
+        new llama_pd_inprocess_runtime());
+    try {
+        runtime->args.reserve(static_cast<size_t>(std::max(argc, 0)));
+        for (int i = 0; i < argc; ++i) {
+            runtime->args.emplace_back(argv[i] != nullptr ? argv[i] : "");
+        }
+        std::vector<char *> forwarded;
+        g_inprocess_preparing = true;
+        pd_args pd;
+        try {
+            pd = parse_pd_args(argc, argv, &forwarded);
+        } catch (...) {
+            g_inprocess_preparing = false;
+            throw;
+        }
+        g_inprocess_preparing = false;
+
+        common_params params;
+        common_init();
+        if (!common_params_parse(
+                static_cast<int>(forwarded.size()),
+                forwarded.data(),
+                params,
+                LLAMA_EXAMPLE_COMPLETION,
+                print_usage)) {
+            throw std::runtime_error(
+                "failed to parse persistent Decode parameters");
+        }
+        if (!params.prompt.empty()) {
+            throw std::runtime_error(
+                "persistent Decode does not accept a prompt");
+        }
+
+        llama_backend_init();
+        llama_numa_init(params.numa);
+        runtime->llama_init = common_init_from_params_buffer(
+            params, model_data, model_size, false);
+        llama_model * model = runtime->llama_init
+            ? runtime->llama_init->model()
+            : nullptr;
+        if (model == nullptr || runtime->llama_init->context() == nullptr ||
+            runtime->llama_init->sampler(0) == nullptr) {
+            throw std::runtime_error(
+                "failed to create persistent Decode model/context");
+        }
+
+        char external_embedding_kind[32] = {};
+        const bool model_requires_disk_embedding =
+            llama_model_meta_val_str(
+                model,
+                "general.external_token_embedding",
+                external_embedding_kind,
+                sizeof(external_embedding_kind)) > 0;
+        if (model_requires_disk_embedding && pd.disk_embedding_path.empty()) {
+            throw std::runtime_error(
+                "persistent Decode model requires --pd-disk-embedding");
+        }
+        if (!pd.disk_embedding_path.empty()) {
+            runtime->disk_embedding.open_file(pd.disk_embedding_path);
+            if (runtime->disk_embedding.vocab_size() !=
+                    static_cast<uint32_t>(
+                        llama_vocab_n_tokens(llama_model_get_vocab(model))) ||
+                runtime->disk_embedding.embedding_dim() !=
+                    static_cast<uint32_t>(llama_model_n_embd_inp(model))) {
+                throw std::runtime_error(
+                    "disk embedding dimensions do not match the persistent Decode model");
+            }
+        }
+
+        runtime->initialization_ms = elapsed_ms(init_start);
+        if (initialization_ms != nullptr) {
+            *initialization_ms = runtime->initialization_ms;
+        }
+        LOG_INF(
+            "PD persistent in-process runtime ready: model_ptr=%p "
+            "model_bytes=%zu initialization_ms=%.3f threadpool_deferred=1\n",
+            model_data,
+            model_size,
+            runtime->initialization_ms);
+        return runtime.release();
+    } catch (const std::exception & err) {
+        g_inprocess_preparing = false;
+        LOG_ERR("failed to create persistent in-process Decode runtime: %s\n",
+                err.what());
+        return nullptr;
+    }
+}
+
+int llama_pd_inprocess_runtime_run(
+        llama_pd_inprocess_runtime * runtime,
+        const llama_pd_inprocess_request * request) {
+    if (runtime == nullptr || request == nullptr ||
+        request->handoff_data == nullptr || request->handoff_size == 0) {
+        return 1;
+    }
+    if (request->result != nullptr) {
+        *request->result = {};
+    }
+    g_inprocess_runtime = runtime;
+    g_inprocess_request = request;
+    // The runtime was created with the same argv; parsing it again only
+    // constructs per-turn sampling/profiling state and does not reload model,
+    // metadata, context, KV allocation, or scheduler buffers.
+    std::vector<char *> argv;
+    argv.reserve(runtime->args.size() + 1);
+    for (std::string & arg : runtime->args) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+    const int result = llama_pd_cli_main_impl(
+        static_cast<int>(runtime->args.size()), argv.data());
+    g_inprocess_request = nullptr;
+    g_inprocess_runtime = nullptr;
+    return result;
+}
+
+void llama_pd_inprocess_runtime_destroy(
+        llama_pd_inprocess_runtime * runtime) {
+    delete runtime;
+}
+
+int llama_pd_cli_run_inprocess(
+        int argc,
+        char ** argv,
+        const llama_pd_inprocess_request * request) {
+    if (request == nullptr || request->model_data == nullptr ||
+        request->model_size == 0) {
+        return 1;
+    }
+    double initialization_ms = 0.0;
+    llama_pd_inprocess_runtime * runtime =
+        llama_pd_inprocess_runtime_create(
+            argc,
+            argv,
+            request->model_data,
+            request->model_size,
+            &initialization_ms);
+    if (runtime == nullptr) {
+        return 1;
+    }
+    const int result = llama_pd_inprocess_runtime_run(runtime, request);
+    llama_pd_inprocess_runtime_destroy(runtime);
+    return result;
+}
+
+#ifndef LLAMA_PD_CLI_NO_MAIN
+int main(int argc, char ** argv) {
+    return llama_pd_cli_main_impl(argc, argv);
+}
+#endif

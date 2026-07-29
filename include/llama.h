@@ -498,6 +498,14 @@ extern "C" {
                                    FILE * file,
               struct llama_model_params   params);
 
+    // Load a model directly from an immutable GGUF buffer without copying its
+    // tensor payload. The caller must keep [data, data + size) alive and
+    // unchanged until llama_model_free(model) returns.
+    LLAMA_API struct llama_model * llama_model_load_from_buffer(
+                         const void * data,
+                              size_t   size,
+            struct llama_model_params   params);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(
