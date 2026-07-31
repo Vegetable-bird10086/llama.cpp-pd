@@ -1615,7 +1615,8 @@ void log_prompt_seq_blob_comparison(
         const std::vector<uint8_t> & imported_blob,
         const std::vector<uint8_t> & native_blob,
         const pd_handoff & handoff,
-        bool v_trans) {
+        bool v_trans,
+        bool qnn_u8_layout) {
     if (imported_blob.size() != native_blob.size()) {
         LOG_INF(
             "PD native compare prompt-KV blob size mismatch: imported=%zu native=%zu\n",
@@ -1646,9 +1647,17 @@ void log_prompt_seq_blob_comparison(
         sizeof(uint32_t) * 2;
     size_t offset = meta_prefix;
     const uint32_t n_embd_gqa = static_cast<uint32_t>(handoff.num_kv_heads * handoff.head_dim);
-    const size_t row_size = static_cast<size_t>(n_embd_gqa) * sizeof(uint16_t);
+    const size_t element_size = qnn_u8_layout ? sizeof(uint8_t) : sizeof(uint16_t);
+    const size_t row_size = static_cast<size_t>(n_embd_gqa) * element_size;
     const size_t rows = static_cast<size_t>(handoff.prompt_len);
     const size_t sample_values = std::min<size_t>(8, n_embd_gqa);
+
+    auto block_in_bounds = [&](size_t block_offset, size_t data_size) {
+        return block_offset <= imported_blob.size() &&
+            data_size <= imported_blob.size() - block_offset &&
+            block_offset <= native_blob.size() &&
+            data_size <= native_blob.size() - block_offset;
+    };
 
     auto log_row_sample = [&](const char * kind, int32_t layer, size_t block_offset) {
         if (rows == 0 || sample_values == 0) {
@@ -1657,14 +1666,21 @@ void log_prompt_seq_blob_comparison(
         std::ostringstream oss;
         oss << "PD native compare " << kind << " layer=" << layer << " row0 imported/native:";
         for (size_t elem = 0; elem < sample_values; ++elem) {
-            uint16_t imported_bits = 0;
-            uint16_t native_bits = 0;
-            std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
-            std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
-            oss << " [" << elem
-                << ":i=" << fp16_bits_to_float(imported_bits)
-                << ",n=" << fp16_bits_to_float(native_bits)
-                << "]";
+            if (qnn_u8_layout) {
+                oss << " [" << elem
+                    << ":i=" << static_cast<unsigned>(imported_blob[block_offset + elem])
+                    << ",n=" << static_cast<unsigned>(native_blob[block_offset + elem])
+                    << "]";
+            } else {
+                uint16_t imported_bits = 0;
+                uint16_t native_bits = 0;
+                std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+                std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+                oss << " [" << elem
+                    << ":i=" << fp16_bits_to_float(imported_bits)
+                    << ",n=" << fp16_bits_to_float(native_bits)
+                    << "]";
+            }
         }
         LOG_INF("%s\n", oss.str().c_str());
     };
@@ -1676,38 +1692,74 @@ void log_prompt_seq_blob_comparison(
         oss << "PD native compare " << kind << " layer=" << layer
             << " around maxdiff elem=" << elem_index << ":";
         for (size_t elem = start_elem; elem < end_elem; ++elem) {
-            uint16_t imported_bits = 0;
-            uint16_t native_bits = 0;
-            std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
-            std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
-            oss << " [" << elem
-                << ":i=" << fp16_bits_to_float(imported_bits)
-                << ",n=" << fp16_bits_to_float(native_bits)
-                << "]";
+            if (qnn_u8_layout) {
+                oss << " [" << elem
+                    << ":i=" << static_cast<unsigned>(imported_blob[block_offset + elem])
+                    << ",n=" << static_cast<unsigned>(native_blob[block_offset + elem])
+                    << "]";
+            } else {
+                uint16_t imported_bits = 0;
+                uint16_t native_bits = 0;
+                std::memcpy(&imported_bits, imported_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+                std::memcpy(&native_bits, native_blob.data() + block_offset + elem*sizeof(uint16_t), sizeof(uint16_t));
+                oss << " [" << elem
+                    << ":i=" << fp16_bits_to_float(imported_bits)
+                    << ",n=" << fp16_bits_to_float(native_bits)
+                    << "]";
+            }
         }
         LOG_INF("%s\n", oss.str().c_str());
     };
 
     auto compare_layer_block = [&](const char * kind, int32_t layer, size_t block_offset, size_t data_size) {
+        if (!block_in_bounds(block_offset, data_size)) {
+            LOG_INF(
+                "PD native compare %s layer=%d block out of bounds: offset=%zu size=%zu blob=%zu\n",
+                kind,
+                layer,
+                block_offset,
+                data_size,
+                imported_blob.size());
+            return false;
+        }
+
         float max_abs_diff = 0.0f;
+        double mean_abs_diff = 0.0;
+        size_t exact_values = 0;
         size_t max_idx = 0;
-        for (size_t i = 0; i < data_size; i += sizeof(uint16_t)) {
-            uint16_t imported_bits = 0;
-            uint16_t native_bits = 0;
-            std::memcpy(&imported_bits, imported_blob.data() + block_offset + i, sizeof(uint16_t));
-            std::memcpy(&native_bits, native_blob.data() + block_offset + i, sizeof(uint16_t));
-            const float diff = std::fabs(
-                fp16_bits_to_float(imported_bits) - fp16_bits_to_float(native_bits));
+        const size_t value_count = data_size / element_size;
+        for (size_t elem = 0; elem < value_count; ++elem) {
+            float diff = 0.0f;
+            if (qnn_u8_layout) {
+                const uint8_t imported_value = imported_blob[block_offset + elem];
+                const uint8_t native_value = native_blob[block_offset + elem];
+                diff = static_cast<float>(std::abs(
+                    static_cast<int>(imported_value) - static_cast<int>(native_value)));
+                exact_values += imported_value == native_value;
+            } else {
+                uint16_t imported_bits = 0;
+                uint16_t native_bits = 0;
+                const size_t byte_offset = block_offset + elem * sizeof(uint16_t);
+                std::memcpy(&imported_bits, imported_blob.data() + byte_offset, sizeof(uint16_t));
+                std::memcpy(&native_bits, native_blob.data() + byte_offset, sizeof(uint16_t));
+                diff = std::fabs(
+                    fp16_bits_to_float(imported_bits) - fp16_bits_to_float(native_bits));
+                exact_values += imported_bits == native_bits;
+            }
+            mean_abs_diff += diff;
             if (diff > max_abs_diff) {
                 max_abs_diff = diff;
-                max_idx = i / sizeof(uint16_t);
+                max_idx = elem;
             }
         }
+        mean_abs_diff /= static_cast<double>(value_count);
         LOG_INF(
-            "PD native compare %s layer=%d max_abs_diff=%f elem_index=%zu\n",
+            "PD native compare %s layer=%d max_abs_diff=%f mean_abs_diff=%f exact_pct=%.3f elem_index=%zu\n",
             kind,
             layer,
             max_abs_diff,
+            mean_abs_diff,
+            100.0 * static_cast<double>(exact_values) / static_cast<double>(value_count),
             max_idx);
         if (layer == 0) {
             log_row_sample(kind, layer, block_offset);
@@ -1715,22 +1767,29 @@ void log_prompt_seq_blob_comparison(
         if (max_abs_diff > 8.0f || layer == 0) {
             log_maxdiff_sample(kind, layer, block_offset, max_idx);
         }
+        return true;
     };
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
         offset += sizeof(int32_t) + sizeof(uint64_t);
-        compare_layer_block("K", layer, offset, rows * row_size);
+        if (!compare_layer_block("K", layer, offset, rows * row_size)) {
+            return;
+        }
         offset += rows * row_size;
     }
 
     for (int32_t layer = 0; layer < handoff.num_layers; ++layer) {
         if (!v_trans) {
             offset += sizeof(int32_t) + sizeof(uint64_t);
-            compare_layer_block("V", layer, offset, rows * row_size);
+            if (!compare_layer_block("V", layer, offset, rows * row_size)) {
+                return;
+            }
             offset += rows * row_size;
         } else {
             offset += sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint32_t);
-            compare_layer_block("V", layer, offset, rows * row_size);
+            if (!compare_layer_block("V", layer, offset, rows * row_size)) {
+                return;
+            }
             offset += rows * row_size;
         }
     }
@@ -1795,7 +1854,8 @@ void log_native_comparison(
         imported_prompt_seq_blob,
         native.prompt_seq_blob,
         handoff,
-        v_trans);
+        v_trans,
+        llama_qnn_u16_activations_enabled());
 }
 
 void print_usage(int argc, char ** argv) {
