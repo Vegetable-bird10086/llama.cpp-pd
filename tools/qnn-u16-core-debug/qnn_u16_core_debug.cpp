@@ -3596,6 +3596,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
     std::vector<uint16_t> row4_outputs(output_size);
     std::vector<uint16_t> row8_outputs(output_size);
     std::vector<uint16_t> row16_outputs(output_size);
+    std::vector<uint16_t> gs32_row16_outputs(output_size);
     std::vector<float> f32_outputs(output_size);
     constexpr int q2_k_blocks_per_row = input_size / QK_K;
     std::vector<block_q2_K> q2_k_weights(
@@ -3693,7 +3694,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                     static_cast<size_t>(row) * metadata_row_stride + block];
         }
     }
-    bool activations_fit_i16 = true;
+    int activation_range = 1;
     for (int block = 0; block < blocks; ++block) {
         int32_t sum = 0;
         for (int lane = 0; lane < 32; ++lane) {
@@ -3701,7 +3702,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                 static_cast<int32_t>(activations[block * 32 + lane]) -
                 activation_zero_point;
             sum += centered;
-            activations_fit_i16 = activations_fit_i16 &&
+            activation_range = activation_range &&
                 centered >= std::numeric_limits<int16_t>::min() &&
                 centered <= std::numeric_limits<int16_t>::max();
         }
@@ -3727,7 +3728,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                 input_size, row4_outputs.data() + row,
                 weights.data() + row * weight_row_stride,
                 weight_row_stride, activations.data(),
-                activation_block_sums.data(), activations_fit_i16,
+                activation_block_sums.data(), activation_range,
                 metadata.data() + row * metadata_row_stride,
                 metadata_row_stride, channel_scales.data() + row,
                 prepared_weight_sums.data() + row,
@@ -3741,7 +3742,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                 input_size, row8_outputs.data() + row,
                 weights.data() + row * weight_row_stride,
                 weight_row_stride, activations.data(),
-                activation_block_sums.data(), activations_fit_i16,
+                activation_block_sums.data(), activation_range,
                 metadata.data() + row * metadata_row_stride,
                 metadata_row_stride, channel_scales.data() + row,
                 prepared_weight_sums.data() + row,
@@ -3750,7 +3751,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         }
     };
     const auto run_gs32_8rows = [&]() {
-        activations_fit_i16 = ggml_gptq2_32_prepare_u16_activation(
+        activation_range = ggml_gptq2_32_prepare_u16_activation(
             input_size, activations.data(), activation_zero_point,
             activation_block_sums.data(),
             activation_low.data(), activation_high.data());
@@ -3758,8 +3759,32 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
             ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
                 input_size, row8_outputs.data() + row,
                 gs32_weights.data(), row, activations.data(),
-                activation_low.data(), activation_high.data(),
-                activation_block_sums.data(), activations_fit_i16,
+                activation_low.data(),
+                activation_range == GGML_GPTQ2_U16_ACTIVATION_I16
+                    ? activation_high.data()
+                    : nullptr,
+                activation_block_sums.data(), activation_range,
+                tiled_metadata.data() + row * metadata_row_stride,
+                0, channel_scales.data() + row,
+                prepared_weight_sums.data() + row,
+                activation_zero_point, output_zero_point,
+                fractional_constant, 0, 0);
+        }
+    };
+    const auto run_gs32_16rows = [&]() {
+        activation_range = ggml_gptq2_32_prepare_u16_activation(
+            input_size, activations.data(), activation_zero_point,
+            activation_block_sums.data(),
+            activation_low.data(), activation_high.data());
+        for (int row = 0; row < output_size; row += 16) {
+            ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
+                input_size, gs32_row16_outputs.data() + row,
+                gs32_weights.data(), row, activations.data(),
+                activation_low.data(),
+                activation_range == GGML_GPTQ2_U16_ACTIVATION_I16
+                    ? activation_high.data()
+                    : nullptr,
+                activation_block_sums.data(), activation_range,
                 tiled_metadata.data() + row * metadata_row_stride,
                 0, channel_scales.data() + row,
                 prepared_weight_sums.data() + row,
@@ -3773,7 +3798,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                 input_size, row16_outputs.data() + row,
                 weights.data() + row * weight_row_stride,
                 weight_row_stride, activations.data(),
-                activation_block_sums.data(), activations_fit_i16,
+                activation_block_sums.data(), activation_range,
                 metadata.data() + row * metadata_row_stride,
                 metadata_row_stride, channel_scales.data() + row,
                 prepared_weight_sums.data() + row,
@@ -3912,13 +3937,33 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
     run_4rows();
     run_8rows();
     run_gs32_8rows();
+    run_gs32_16rows();
     run_16rows();
     run_f32();
     run_q2_k();
     const bool fast_exact =
         scalar_outputs == row4_outputs &&
         scalar_outputs == row8_outputs &&
-        scalar_outputs == row16_outputs;
+        scalar_outputs == row16_outputs &&
+        scalar_outputs == gs32_row16_outputs;
+    for (int index = 0; index < input_size; ++index) {
+        const int32_t centered = (index * 73 + 19) % 255 - 127;
+        activations[index] =
+            static_cast<uint16_t>(activation_zero_point + centered);
+    }
+    run_scalar();
+    run_gs32_8rows();
+    run_gs32_16rows();
+    const bool i8_exact =
+        activation_range == GGML_GPTQ2_U16_ACTIVATION_I8 &&
+        scalar_outputs == row8_outputs &&
+        scalar_outputs == gs32_row16_outputs;
+    for (int index = 0; index < input_size; ++index) {
+        const int32_t centered = (index * 1229 + 811) % 8191 - 4095;
+        activations[index] =
+            static_cast<uint16_t>(activation_zero_point + centered);
+    }
+    run_gs32_8rows();
     constexpr int warmup = 1;
     constexpr int iterations = 4;
     for (int iteration = 0; iteration < warmup; ++iteration) {
@@ -3926,6 +3971,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         run_4rows();
         run_8rows();
         run_gs32_8rows();
+        run_gs32_16rows();
         run_16rows();
         run_f32();
         run_q2_k();
@@ -3955,6 +4001,12 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         checksum += row8_outputs[iteration % output_size];
     }
     const auto gs32_row8_end = std::chrono::steady_clock::now();
+    const auto gs32_row16_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_gs32_16rows();
+        checksum += gs32_row16_outputs[iteration % output_size];
+    }
+    const auto gs32_row16_end = std::chrono::steady_clock::now();
     const auto row16_start = std::chrono::steady_clock::now();
     for (int iteration = 0; iteration < iterations; ++iteration) {
         run_16rows();
@@ -3989,11 +4041,12 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
     activations[0] = UINT16_MAX;
     activation_block_sums[0] +=
         static_cast<int32_t>(activations[0]) - static_cast<int32_t>(old_activation0);
-    activations_fit_i16 = false;
+    activation_range = 0;
     run_scalar();
     run_4rows();
     run_8rows();
     run_gs32_8rows();
+    run_gs32_16rows();
     run_16rows();
     std::array<double, iterations> gs32_wide_times_ms {};
     for (int iteration = 0; iteration < iterations; ++iteration) {
@@ -4007,8 +4060,9 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
     const bool wide_exact =
         scalar_outputs == row4_outputs &&
         scalar_outputs == row8_outputs &&
-        scalar_outputs == row16_outputs;
-    const bool exact = fast_exact && wide_exact;
+        scalar_outputs == row16_outputs &&
+        scalar_outputs == gs32_row16_outputs;
+    const bool exact = fast_exact && i8_exact && wide_exact;
     const double scalar_ms = std::chrono::duration<double, std::milli>(
         scalar_end - scalar_start).count() / iterations;
     const double row4_ms = std::chrono::duration<double, std::milli>(
@@ -4017,6 +4071,8 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         row8_end - row8_start).count() / iterations;
     const double gs32_row8_ms = std::chrono::duration<double, std::milli>(
         gs32_row8_end - gs32_row8_start).count() / iterations;
+    const double gs32_row16_ms = std::chrono::duration<double, std::milli>(
+        gs32_row16_end - gs32_row16_start).count() / iterations;
     const double gs32_wide_ms =
         (gs32_wide_times_ms[0] + gs32_wide_times_ms[1] +
          gs32_wide_times_ms[2] + gs32_wide_times_ms[3]) / iterations;
@@ -4030,9 +4086,10 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         q8_k_quant_end - q8_k_quant_start).count() / q8_k_quant_iterations;
     std::printf(
         "qnn-gptq2-u16-gemv-4row-test: input=%d output=%d exact=%d "
-        "fast_exact=%d wide_exact=%d gs32_dotprod=%d "
+        "fast_exact=%d i8_exact=%d wide_exact=%d gs32_dotprod=%d "
         "scalar_ms=%.6f row4_ms=%.6f row8_ms=%.6f row16_ms=%.6f "
-        "gs32_row8_ms=%.6f gs32_vs_row_major=%.3f "
+        "gs32_row8_ms=%.6f gs32_row16_ms=%.6f gs32_16_vs_8_speedup=%.3f "
+        "gs32_vs_row_major=%.3f "
         "gs32_wide_times_ms=%.6f,%.6f,%.6f,%.6f gs32_wide_ms=%.6f "
         "row8_vs_row4_speedup=%.3f row16_vs_row8_speedup=%.3f "
         "speedup=%.3f ggml_f32_ms=%.6f "
@@ -4042,10 +4099,11 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         "gptq2_bpw=%.3f q2_k_bpw=%.3f checksum=%llu "
         "activation_dequant_buffers=0 packed_int4_buffers=0\n",
         input_size, output_size, exact ? 1 : 0,
-        fast_exact ? 1 : 0, wide_exact ? 1 : 0,
+        fast_exact ? 1 : 0, i8_exact ? 1 : 0, wide_exact ? 1 : 0,
         ggml_gptq2_32_gs32_dotprod_enabled(),
         scalar_ms, row4_ms, row8_ms, row16_ms,
-        gs32_row8_ms, row8_ms / gs32_row8_ms,
+        gs32_row8_ms, gs32_row16_ms, gs32_row8_ms / gs32_row16_ms,
+        row8_ms / gs32_row8_ms,
         gs32_wide_times_ms[0], gs32_wide_times_ms[1],
         gs32_wide_times_ms[2], gs32_wide_times_ms[3], gs32_wide_ms,
         row4_ms / row8_ms, row8_ms / row16_ms,

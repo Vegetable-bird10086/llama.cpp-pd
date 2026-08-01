@@ -291,6 +291,12 @@ void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
 // no row-major tensor or row window is materialized.
 int ggml_gptq2_32_gs32_dotprod_enabled(void);
 
+enum ggml_gptq2_u16_activation_range {
+    GGML_GPTQ2_U16_ACTIVATION_WIDE = 0,
+    GGML_GPTQ2_U16_ACTIVATION_I16 = 1,
+    GGML_GPTQ2_U16_ACTIVATION_I8 = 2,
+};
+
 int ggml_gptq2_32_prepare_u16_activation(
         int n,
         const uint16_t * GGML_RESTRICT activations,
@@ -300,6 +306,29 @@ int ggml_gptq2_32_prepare_u16_activation(
         int8_t * GGML_RESTRICT activation_high);
 
 void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
+        int n,
+        uint16_t * GGML_RESTRICT outputs,
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        const uint16_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT activation_low,
+        const int8_t * GGML_RESTRICT activation_high,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        int activations_fit_i16,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        size_t prepared_row_stride,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point,
+        int32_t output_zero_point,
+        int fractional_constant,
+        int final_round_to_nearest,
+        int32_t output_bias_q7);
+
+// Sixteen-row Decode GEMV for two adjacent gs32_source_v1 tiles. The two
+// tiles share activation loads and one block loop; the 8-row path remains the
+// fallback for unsupported alignment/range cases.
+void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
         int n,
         uint16_t * GGML_RESTRICT outputs,
         const void * GGML_RESTRICT gs32_weights,
