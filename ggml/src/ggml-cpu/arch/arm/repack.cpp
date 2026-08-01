@@ -1790,7 +1790,7 @@ void ggml_gemv_q8_0_4x4_q8_0(int                        n,
     ggml_gemv_q8_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-GGML_ARM_TARGET_DOTPROD
+GGML_ARM_TARGET_I8MM
 void ggml_gemv_q8_0_4x8_q8_0(int                        n,
                              float * GGML_RESTRICT      s,
                              size_t                     bs,
@@ -1810,7 +1810,7 @@ void ggml_gemv_q8_0_4x8_q8_0(int                        n,
     UNUSED(ncols_interleaved);
     UNUSED(blocklen);
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && GGML_ARM_COMPILE_DOTPROD
+#if defined(__aarch64__) && defined(__ARM_NEON) && GGML_ARM_COMPILE_I8MM
     const block_q8_0x4 * b_ptr = (const block_q8_0x4 *) vx;
 
     for (int c = 0; c < nc; c += ncols_interleaved) {
@@ -1818,36 +1818,37 @@ void ggml_gemv_q8_0_4x8_q8_0(int                        n,
         float32x4_t acc = vdupq_n_f32(0);
 
         for (int b = 0; b < nb; b++) {
-            int8x16x4_t b_low =
+            int8x16x4_t b_chunks =
                 vld1q_s8_x4((const int8_t *) b_ptr->qs);
-            int8x16x4_t b_high =
+            int8x16x4_t b_chunks_high =
                 vld1q_s8_x4((const int8_t *) b_ptr->qs + 64);
             float16x4_t bd = vld1_f16((const __fp16 *) b_ptr->d);
 
             int8x8x4_t a_chunks = vld1_s8_x4(a_ptr->qs);
-            int8x16_t a0 =
-                vcombine_s8(a_chunks.val[0], a_chunks.val[0]);
-            int8x16_t a1 =
-                vcombine_s8(a_chunks.val[1], a_chunks.val[1]);
-            int8x16_t a2 =
-                vcombine_s8(a_chunks.val[2], a_chunks.val[2]);
-            int8x16_t a3 =
-                vcombine_s8(a_chunks.val[3], a_chunks.val[3]);
             float16x4_t ad =
                 vld1_dup_f16((const __fp16 *) &a_ptr->d);
 
-            int32x4_t ret0 = vdupq_n_s32(0);
-            int32x4_t ret1 = vdupq_n_s32(0);
-            ret0 = vdotq_s32(ret0, b_low.val[0], a0);
-            ret1 = vdotq_s32(ret1, b_low.val[1], a0);
-            ret0 = vdotq_s32(ret0, b_low.val[2], a1);
-            ret1 = vdotq_s32(ret1, b_low.val[3], a1);
-            ret0 = vdotq_s32(ret0, b_high.val[0], a2);
-            ret1 = vdotq_s32(ret1, b_high.val[1], a2);
-            ret0 = vdotq_s32(ret0, b_high.val[2], a3);
-            ret1 = vdotq_s32(ret1, b_high.val[3], a3);
+            int32x4_t ret01 = vdupq_n_s32(0);
+            int32x4_t ret23 = vdupq_n_s32(0);
+            const int8x16_t a0 =
+                vcombine_s8(a_chunks.val[0], a_chunks.val[0]);
+            const int8x16_t a1 =
+                vcombine_s8(a_chunks.val[1], a_chunks.val[1]);
+            const int8x16_t a2 =
+                vcombine_s8(a_chunks.val[2], a_chunks.val[2]);
+            const int8x16_t a3 =
+                vcombine_s8(a_chunks.val[3], a_chunks.val[3]);
+            ret01 = vmmlaq_s32(ret01, a0, b_chunks.val[0]);
+            ret23 = vmmlaq_s32(ret23, a0, b_chunks.val[1]);
+            ret01 = vmmlaq_s32(ret01, a1, b_chunks.val[2]);
+            ret23 = vmmlaq_s32(ret23, a1, b_chunks.val[3]);
+            ret01 = vmmlaq_s32(ret01, a2, b_chunks_high.val[0]);
+            ret23 = vmmlaq_s32(ret23, a2, b_chunks_high.val[1]);
+            ret01 = vmmlaq_s32(ret01, a3, b_chunks_high.val[2]);
+            ret23 = vmmlaq_s32(ret23, a3, b_chunks_high.val[3]);
 
-            const int32x4_t ret = vpaddq_s32(ret0, ret1);
+            const int32x4_t ret = vcombine_s32(
+                vget_low_s32(ret01), vget_low_s32(ret23));
             acc = vfmaq_f32(
                 acc, vcvtq_f32_s32(ret),
                 vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
@@ -1859,7 +1860,7 @@ void ggml_gemv_q8_0_4x8_q8_0(int                        n,
     }
     return;
 
-#endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     ggml_gemv_q8_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
