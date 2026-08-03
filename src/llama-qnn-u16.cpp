@@ -1268,6 +1268,7 @@ void qnn_u16_mul_mat_compute(
         }
         int64_t cached_vector = -1;
         int activation_range = 0;
+        int32_t activation_abs_sum = 0;
         const bool tiled_block_codes =
             qparams->qnn_weight_block_code_layout ==
                 LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR;
@@ -1306,7 +1307,8 @@ void qnn_u16_mul_mat_compute(
                         qparams->input.zero_point,
                         activation_block_sums.data(),
                         prepare_dotprod ? activation_low.data() : nullptr,
-                        prepare_dotprod ? activation_high.data() : nullptr);
+                        prepare_dotprod ? activation_high.data() : nullptr,
+                        &activation_abs_sum);
                 cached_vector = vector;
             }
             auto * output = reinterpret_cast<uint16_t *>(
@@ -1314,6 +1316,9 @@ void qnn_u16_mul_mat_compute(
                 row * dst->nb[0] + i1 * dst->nb[1] +
                 i2 * dst->nb[2] + i3 * dst->nb[3]);
             if (qparams->weights_gs32_source && rows_per_group == 16) {
+                const bool accumulation_fits_i32 =
+                    static_cast<int64_t>(activation_abs_sum) * 7 * 31 <=
+                        INT32_MAX;
                 ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
                     static_cast<int>(weights->ne[0]), output,
                     weights->data, row, activation,
@@ -1322,6 +1327,7 @@ void qnn_u16_mul_mat_compute(
                         ? activation_high.data()
                         : nullptr,
                     activation_block_sums.data(), activation_range,
+                    accumulation_fits_i32,
                     qparams->qnn_weight_block_scale_codes.data() +
                         row * qparams->qnn_weight_blocks_per_row,
                     tiled_block_codes ? 0 :

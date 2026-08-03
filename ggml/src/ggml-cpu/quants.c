@@ -105,6 +105,25 @@ int ggml_qnn_u16_dotprod_enabled(void) {
 #endif
 }
 
+static int ggml_qnn_attention_s16_enabled(void) {
+    static int enabled = -1;
+    int cached = __atomic_load_n(&enabled, __ATOMIC_ACQUIRE);
+    if (cached >= 0) {
+        return cached;
+    }
+    const char * const value = getenv("GGML_QNN_ATTN_S16");
+    const int detected = value == NULL ||
+        (strcmp(value, "0") != 0 && strcmp(value, "off") != 0 &&
+         strcmp(value, "false") != 0);
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(
+            &enabled, &expected, detected, false,
+            __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return detected;
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }
@@ -1376,7 +1395,6 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows(
     int64x2_t accum1415 = vdupq_n_s64(0);
     const uint8_t * const prepared_block_codes1 =
         prepared_block_codes + (size_t) blocks * 8;
-
 #pragma clang loop unroll_count(1)
     for (int block = 0; block < blocks; ++block) {
         const uint8_t * source_group =
@@ -1486,6 +1504,234 @@ static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows(
     vst1q_s64(centered_dots + 12, accum1213);
     vst1q_s64(centered_dots + 14, accum1415);
 }
+
+// The caller proves that every complete projection accumulator fits in int32.
+// Keep all sixteen rows in four SIMD registers and widen only after the final
+// block; this avoids the register pressure of eight int64 accumulator vectors.
+__attribute__((target("dotprod")))
+static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows_i32(
+        int blocks,
+        const uint8_t * GGML_RESTRICT tensor_source,
+        size_t row_outer,
+        size_t row_middle,
+        const uint8_t * GGML_RESTRICT activation_low,
+        const int8_t * GGML_RESTRICT activation_high,
+        const int32_t * GGML_RESTRICT activation_block_sums,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        int64_t centered_dots[16]) {
+    const size_t pair0_offset =
+        (((row_outer * 4 + 0) * 4 + row_middle) * 8) * 2;
+    const size_t pair1_offset =
+        (((row_outer * 4 + 1) * 4 + row_middle) * 8) * 2;
+    const size_t pair2_offset =
+        (((row_outer * 4 + 2) * 4 + row_middle) * 8) * 2;
+    const size_t pair3_offset =
+        (((row_outer * 4 + 3) * 4 + row_middle) * 8) * 2;
+    const uint8x8_t scale_mask = vdup_n_u8(0x1f);
+    int32x4_t accum03 = vdupq_n_s32(0);
+    int32x4_t accum47 = vdupq_n_s32(0);
+    int32x4_t accum811 = vdupq_n_s32(0);
+    int32x4_t accum1215 = vdupq_n_s32(0);
+    const uint8_t * const prepared_block_codes1 =
+        prepared_block_codes + (size_t) blocks * 8;
+#pragma clang loop unroll_count(1)
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t * source_group = tensor_source + (size_t) block * 768;
+        const uint8_t * const activation_low_block = activation_low + block * 32;
+        int32x4_t dot03;
+        int32x4_t dot47;
+        int32x4_t dot811;
+        int32x4_t dot1215;
+        if (activation_high == NULL) {
+            const int8x8_t activation0 =
+                vld1_s8((const int8_t *) activation_low_block + 0);
+            const int8x8_t activation1 =
+                vld1_s8((const int8_t *) activation_low_block + 8);
+            const int8x8_t activation2 =
+                vld1_s8((const int8_t *) activation_low_block + 16);
+            const int8x8_t activation3 =
+                vld1_s8((const int8_t *) activation_low_block + 24);
+            ggml_gptq2_32_dot_s8_dotprod_gs32_8rows(
+                activation0, activation1, activation2, activation3,
+                vld1q_u8(source_group + pair0_offset),
+                vld1q_u8(source_group + pair1_offset),
+                vld1q_u8(source_group + pair2_offset),
+                vld1q_u8(source_group + pair3_offset),
+                &dot03, &dot47);
+            ggml_gptq2_32_dot_s8_dotprod_gs32_8rows(
+                activation0, activation1, activation2, activation3,
+                vld1q_u8(source_group + pair0_offset + 16),
+                vld1q_u8(source_group + pair1_offset + 16),
+                vld1q_u8(source_group + pair2_offset + 16),
+                vld1q_u8(source_group + pair3_offset + 16),
+                &dot811, &dot1215);
+        } else {
+            const int8_t * const activation_high_block =
+                activation_high + block * 32;
+            const uint8x8_t activation_low0 = vld1_u8(activation_low_block + 0);
+            const uint8x8_t activation_low1 = vld1_u8(activation_low_block + 8);
+            const uint8x8_t activation_low2 = vld1_u8(activation_low_block + 16);
+            const uint8x8_t activation_low3 = vld1_u8(activation_low_block + 24);
+            const int8x8_t activation_high0 = vld1_s8(activation_high_block + 0);
+            const int8x8_t activation_high1 = vld1_s8(activation_high_block + 8);
+            const int8x8_t activation_high2 = vld1_s8(activation_high_block + 16);
+            const int8x8_t activation_high3 = vld1_s8(activation_high_block + 24);
+            ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
+                activation_low0, activation_low1,
+                activation_low2, activation_low3,
+                activation_high0, activation_high1,
+                activation_high2, activation_high3,
+                vld1q_u8(source_group + pair0_offset),
+                vld1q_u8(source_group + pair1_offset),
+                vld1q_u8(source_group + pair2_offset),
+                vld1q_u8(source_group + pair3_offset),
+                &dot03, &dot47);
+            ggml_gptq2_32_dot_s16_dotprod_gs32_8rows(
+                activation_low0, activation_low1,
+                activation_low2, activation_low3,
+                activation_high0, activation_high1,
+                activation_high2, activation_high3,
+                vld1q_u8(source_group + pair0_offset + 16),
+                vld1q_u8(source_group + pair1_offset + 16),
+                vld1q_u8(source_group + pair2_offset + 16),
+                vld1q_u8(source_group + pair3_offset + 16),
+                &dot811, &dot1215);
+        }
+
+#define GGML_GPTQ2_GS32_ACCUMULATE_TILE_I32(PREPARED, DOT03, DOT47, ACCUM03, ACCUM47) do { \
+            const uint16x8_t zero_points_u16 = \
+                vmovl_u8(vshr_n_u8((PREPARED), 5)); \
+            const uint16x8_t scales_u16 = \
+                vmovl_u8(vand_u8((PREPARED), scale_mask)); \
+            const int32x4_t zero_points03 = vreinterpretq_s32_u32( \
+                vmovl_u16(vget_low_u16(zero_points_u16))); \
+            const int32x4_t zero_points47 = vreinterpretq_s32_u32( \
+                vmovl_u16(vget_high_u16(zero_points_u16))); \
+            const int32x4_t scales03 = vreinterpretq_s32_u32( \
+                vmovl_u16(vget_low_u16(scales_u16))); \
+            const int32x4_t scales47 = vreinterpretq_s32_u32( \
+                vmovl_u16(vget_high_u16(scales_u16))); \
+            (DOT03) = vmlsq_n_s32( \
+                (DOT03), zero_points03, activation_block_sums[block]); \
+            (DOT47) = vmlsq_n_s32( \
+                (DOT47), zero_points47, activation_block_sums[block]); \
+            (ACCUM03) = vmlaq_s32((ACCUM03), (DOT03), scales03); \
+            (ACCUM47) = vmlaq_s32((ACCUM47), (DOT47), scales47); \
+        } while (0)
+        GGML_GPTQ2_GS32_ACCUMULATE_TILE_I32(
+            vld1_u8(prepared_block_codes + (size_t) block * 8),
+            dot03, dot47, accum03, accum47);
+        GGML_GPTQ2_GS32_ACCUMULATE_TILE_I32(
+            vld1_u8(prepared_block_codes1 + (size_t) block * 8),
+            dot811, dot1215, accum811, accum1215);
+#undef GGML_GPTQ2_GS32_ACCUMULATE_TILE_I32
+    }
+
+    vst1q_s64(centered_dots + 0, vmovl_s32(vget_low_s32(accum03)));
+    vst1q_s64(centered_dots + 2, vmovl_high_s32(accum03));
+    vst1q_s64(centered_dots + 4, vmovl_s32(vget_low_s32(accum47)));
+    vst1q_s64(centered_dots + 6, vmovl_high_s32(accum47));
+    vst1q_s64(centered_dots + 8, vmovl_s32(vget_low_s32(accum811)));
+    vst1q_s64(centered_dots + 10, vmovl_high_s32(accum811));
+    vst1q_s64(centered_dots + 12, vmovl_s32(vget_low_s32(accum1215)));
+    vst1q_s64(centered_dots + 14, vmovl_high_s32(accum1215));
+}
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+static inline int ggml_gptq2_i64x4_fits_s32(
+        int64x2_t values01,
+        int64x2_t values23) {
+    uint64x2_t fits = vceqq_s64(
+        values01, vmovl_s32(vqmovn_s64(values01)));
+    fits = vandq_u64(fits, vceqq_s64(
+        values23, vmovl_s32(vqmovn_s64(values23))));
+    return vminvq_u32(vreinterpretq_u32_u64(fits)) == UINT32_MAX;
+}
+
+// This is the exact AArch64 form of the QNN reduction and Q31 requant used
+// below.  It is selected only when every multiply operand fits in int32, so
+// SMULL produces the same int64 products as the scalar path.
+__attribute__((noinline))
+static int ggml_gptq2_32_requantize_16rows_neon(
+        uint16_t * GGML_RESTRICT outputs,
+        const int64_t * GGML_RESTRICT centered_dots,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
+        int32_t activation_zero_point,
+        int32_t output_zero_point) {
+    const int32x2_t activation_zero =
+        vdup_n_s32(activation_zero_point);
+    const int64x2_t reduction_nudge = vdupq_n_s64(INT64_C(128));
+    const int64x2_t requant_nudge =
+        vdupq_n_s64(INT64_C(1) << 30);
+    const int64x2_t output_zero = vdupq_n_s64(output_zero_point);
+    const int64x2_t output_min = vdupq_n_s64(0);
+    const int64x2_t output_max = vdupq_n_s64(UINT16_MAX);
+
+#pragma clang loop unroll(disable)
+    for (int row = 0; row < 16; row += 4) {
+        const int64x2_t weight_sums01 =
+            vld1q_s64(prepared_weight_sums + row);
+        const int64x2_t weight_sums23 =
+            vld1q_s64(prepared_weight_sums + row + 2);
+        const int64x2_t multipliers01 =
+            vld1q_s64(channel_scale_to_output_q31 + row);
+        const int64x2_t multipliers23 =
+            vld1q_s64(channel_scale_to_output_q31 + row + 2);
+        if (!ggml_gptq2_i64x4_fits_s32(weight_sums01, weight_sums23) ||
+            !ggml_gptq2_i64x4_fits_s32(multipliers01, multipliers23)) {
+            return 0;
+        }
+
+        const int32x4_t weight_sums = vcombine_s32(
+            vmovn_s64(weight_sums01), vmovn_s64(weight_sums23));
+        const int64x2_t correction01 = vmull_s32(
+            vget_low_s32(weight_sums), activation_zero);
+        const int64x2_t correction23 = vmull_s32(
+            vget_high_s32(weight_sums), activation_zero);
+        const int64x2_t centered01 = vld1q_s64(centered_dots + row);
+        const int64x2_t centered23 = vld1q_s64(centered_dots + row + 2);
+        const int64x2_t reduced01 = vshlq_n_s64(vsubq_s64(
+            vshrq_n_s64(vaddq_s64(centered01, correction01), 8),
+            vshrq_n_s64(vaddq_s64(correction01, reduction_nudge), 8)), 8);
+        const int64x2_t reduced23 = vshlq_n_s64(vsubq_s64(
+            vshrq_n_s64(vaddq_s64(centered23, correction23), 8),
+            vshrq_n_s64(vaddq_s64(correction23, reduction_nudge), 8)), 8);
+        if (!ggml_gptq2_i64x4_fits_s32(reduced01, reduced23)) {
+            return 0;
+        }
+
+        const int32x4_t reduced = vcombine_s32(
+            vmovn_s64(reduced01), vmovn_s64(reduced23));
+        const int32x4_t multipliers = vcombine_s32(
+            vmovn_s64(multipliers01), vmovn_s64(multipliers23));
+        int64x2_t quantized01 = vaddq_s64(
+            vshrq_n_s64(vaddq_s64(
+                vmull_s32(vget_low_s32(reduced),
+                          vget_low_s32(multipliers)),
+                requant_nudge), 31),
+            output_zero);
+        int64x2_t quantized23 = vaddq_s64(
+            vshrq_n_s64(vaddq_s64(
+                vmull_s32(vget_high_s32(reduced),
+                          vget_high_s32(multipliers)),
+                requant_nudge), 31),
+            output_zero);
+        quantized01 = vbslq_s64(
+            vcltq_s64(quantized01, output_min), output_min, quantized01);
+        quantized23 = vbslq_s64(
+            vcltq_s64(quantized23, output_min), output_min, quantized23);
+        quantized01 = vbslq_s64(
+            vcgtq_s64(quantized01, output_max), output_max, quantized01);
+        quantized23 = vbslq_s64(
+            vcgtq_s64(quantized23, output_max), output_max, quantized23);
+        vst1_u16(outputs + row, vmovn_u32(vcombine_u32(
+            vmovn_u64(vreinterpretq_u64_s64(quantized01)),
+            vmovn_u64(vreinterpretq_u64_s64(quantized23)))));
+    }
+    return 1;
+}
+#endif
 
 __attribute__((target("dotprod")))
 static void ggml_gptq2_32_gs32_dotprod_accumulate_blocks(
@@ -1627,7 +1873,8 @@ int ggml_gptq2_32_prepare_u16_activation(
         int32_t activation_zero_point,
         int32_t * GGML_RESTRICT activation_block_sums,
         uint8_t * GGML_RESTRICT activation_low,
-        int8_t * GGML_RESTRICT activation_high) {
+        int8_t * GGML_RESTRICT activation_high,
+        int32_t * GGML_RESTRICT sum_abs_centered) {
     GGML_ASSERT(n > 0 && n % 32 == 0);
     GGML_ASSERT(activations != NULL);
     GGML_ASSERT(activation_block_sums != NULL);
@@ -1638,16 +1885,25 @@ int ggml_gptq2_32_prepare_u16_activation(
     uint16x8_t activation_max = vdupq_n_u16(0);
     const uint16x8_t zero =
         vdupq_n_u16((uint16_t) activation_zero_point);
+    uint32_t absolute_sum = 0;
     for (int block = 0; block < n / 32; ++block) {
         const uint16x8x4_t lanes = vld4q_u16(activations + block * 32);
-        uint32_t raw_sum = 0;
+        uint32x4_t raw_sum_lanes = vpaddlq_u16(lanes.val[0]);
+        raw_sum_lanes = vpadalq_u16(raw_sum_lanes, lanes.val[1]);
+        raw_sum_lanes = vpadalq_u16(raw_sum_lanes, lanes.val[2]);
+        raw_sum_lanes = vpadalq_u16(raw_sum_lanes, lanes.val[3]);
+        uint32x4_t absolute_sum_lanes = vdupq_n_u32(0);
         for (int group = 0; group < 4; ++group) {
             activation_min = vminq_u16(activation_min, lanes.val[group]);
             activation_max = vmaxq_u16(activation_max, lanes.val[group]);
-            raw_sum += vaddlvq_u16(lanes.val[group]);
+            const int16x8_t centered = vreinterpretq_s16_u16(
+                vsubq_u16(lanes.val[group], zero));
+            absolute_sum_lanes = vabal_u16(
+                absolute_sum_lanes,
+                vget_low_u16(lanes.val[group]), vget_low_u16(zero));
+            absolute_sum_lanes = vabal_high_u16(
+                absolute_sum_lanes, lanes.val[group], zero);
             if (activation_low != NULL) {
-                const int16x8_t centered = vreinterpretq_s16_u16(
-                    vsubq_u16(lanes.val[group], zero));
                 vst1_u8(
                     activation_low + block * 32 + group * 8,
                     vmovn_u16(vreinterpretq_u16_s16(centered)));
@@ -1657,7 +1913,13 @@ int ggml_gptq2_32_prepare_u16_activation(
             }
         }
         activation_block_sums[block] =
-            (int32_t) raw_sum - activation_zero_point * 32;
+            (int32_t) vaddvq_u32(raw_sum_lanes) -
+            activation_zero_point * 32;
+        const uint32_t block_absolute_sum = vaddvq_u32(absolute_sum_lanes);
+        absolute_sum = absolute_sum > (uint32_t) INT32_MAX -
+                MIN(block_absolute_sum, (uint32_t) INT32_MAX)
+            ? (uint32_t) INT32_MAX
+            : absolute_sum + block_absolute_sum;
     }
     const uint16_t lower = activation_zero_point > 32768
         ? (uint16_t) (activation_zero_point - 32768)
@@ -1667,6 +1929,9 @@ int ggml_gptq2_32_prepare_u16_activation(
         : UINT16_MAX;
     const uint16_t minimum = vminvq_u16(activation_min);
     const uint16_t maximum = vmaxvq_u16(activation_max);
+    if (sum_abs_centered != NULL) {
+        *sum_abs_centered = (int32_t) absolute_sum;
+    }
     const uint16_t lower_i8 = activation_zero_point > 128
         ? (uint16_t) (activation_zero_point - 128)
         : 0;
@@ -1676,12 +1941,14 @@ int ggml_gptq2_32_prepare_u16_activation(
     if (minimum >= lower_i8 && maximum <= upper_i8) {
         return GGML_GPTQ2_U16_ACTIVATION_I8;
     }
-    return minimum >= lower && maximum <= upper
-        ? GGML_GPTQ2_U16_ACTIVATION_I16
-        : GGML_GPTQ2_U16_ACTIVATION_WIDE;
+    if (minimum >= lower && maximum <= upper) {
+        return GGML_GPTQ2_U16_ACTIVATION_I16;
+    }
+    return GGML_GPTQ2_U16_ACTIVATION_WIDE;
 #else
     int activations_fit_i16 = 1;
     int activations_fit_i8 = 1;
+    int32_t absolute_sum = 0;
     for (int block = 0; block < n / 32; ++block) {
         int32_t sum = 0;
         for (int lane = 0; lane < 32; ++lane) {
@@ -1693,6 +1960,12 @@ int ggml_gptq2_32_prepare_u16_activation(
                 centered >= INT16_MIN && centered <= INT16_MAX;
             activations_fit_i8 = activations_fit_i8 &&
                 centered >= INT8_MIN && centered <= INT8_MAX;
+            const int32_t absolute_centered = centered < 0
+                ? (int32_t) -(int64_t) centered
+                : centered;
+            absolute_sum = absolute_sum > INT32_MAX - absolute_centered
+                ? INT32_MAX
+                : absolute_sum + absolute_centered;
             if (activation_low != NULL) {
                 const int16_t centered_i16 = (int16_t) centered;
                 const int group = lane % 4;
@@ -1705,11 +1978,16 @@ int ggml_gptq2_32_prepare_u16_activation(
         }
         activation_block_sums[block] = sum;
     }
-    return activations_fit_i8
-        ? GGML_GPTQ2_U16_ACTIVATION_I8
-        : (activations_fit_i16
-            ? GGML_GPTQ2_U16_ACTIVATION_I16
-            : GGML_GPTQ2_U16_ACTIVATION_WIDE);
+    if (sum_abs_centered != NULL) {
+        *sum_abs_centered = absolute_sum;
+    }
+    if (activations_fit_i8) {
+        return GGML_GPTQ2_U16_ACTIVATION_I8;
+    }
+    if (activations_fit_i16) {
+        return GGML_GPTQ2_U16_ACTIVATION_I16;
+    }
+    return GGML_GPTQ2_U16_ACTIVATION_WIDE;
 #endif
 }
 
@@ -3019,6 +3297,7 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
         const int8_t * GGML_RESTRICT activation_high,
         const int32_t * GGML_RESTRICT activation_block_sums,
         int activations_fit_i16,
+        int accumulation_fits_i32,
         const uint8_t * GGML_RESTRICT prepared_block_codes,
         size_t prepared_row_stride,
         const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
@@ -3052,10 +3331,25 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
         int64_t centered_dots[16] = {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         };
-        ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows(
-            blocks, tensor_source, row_outer, row_middle,
-            activation_low, activation_high, activation_block_sums,
-            prepared_block_codes, centered_dots);
+        if (accumulation_fits_i32) {
+            ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows_i32(
+                blocks, tensor_source, row_outer, row_middle,
+                activation_low, activation_high, activation_block_sums,
+                prepared_block_codes, centered_dots);
+        } else {
+            ggml_gptq2_32_gs32_dotprod_accumulate_blocks_tiled_16rows(
+                blocks, tensor_source, row_outer, row_middle,
+                activation_low, activation_high, activation_block_sums,
+                prepared_block_codes, centered_dots);
+        }
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (ggml_gptq2_32_requantize_16rows_neon(
+                outputs, centered_dots, prepared_weight_sums,
+                channel_scale_to_output_q31, activation_zero_point,
+                output_zero_point)) {
+            return;
+        }
+#endif
         for (int row = 0; row < 16; ++row) {
             const int64_t reduced_dot = ggml_qnn_a16s8_reduce_accumulator(
                 centered_dots[row], prepared_weight_sums[row],
@@ -3298,7 +3592,7 @@ void ggml_vec_add_affine_u16_qnn_fixed(
     }
 }
 
-void ggml_vec_add_affine_u16_qnn_q15(
+static __attribute__((noinline)) void ggml_vec_add_affine_u16_qnn_q15_scalar(
         int n,
         uint16_t * GGML_RESTRICT output,
         const uint16_t * GGML_RESTRICT lhs,
@@ -3318,6 +3612,82 @@ void ggml_vec_add_affine_u16_qnn_q15(
             ggml_u16_htp_round_shift(scaled_sum, 15) + output_zero_point;
         output[index] = (uint16_t) MAX(0, MIN(UINT16_MAX, quantized));
     }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static __attribute__((noinline)) void ggml_vec_add_affine_u16_qnn_q15_neon(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int32_t lhs_multiplier,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int32_t rhs_multiplier,
+        int32_t rhs_zero_point,
+        int32_t output_zero_point) {
+    GGML_ASSERT(n >= 0 && n % 8 == 0);
+    const int32x4_t lhs_zero = vdupq_n_s32(lhs_zero_point);
+    const int32x4_t rhs_zero = vdupq_n_s32(rhs_zero_point);
+    const int32x2_t lhs_mul = vdup_n_s32(lhs_multiplier);
+    const int32x2_t rhs_mul = vdup_n_s32(rhs_multiplier);
+    const int64x2_t output_zero = vdupq_n_s64(output_zero_point);
+    for (int index = 0; index < n; index += 8) {
+        const uint16x8_t lhs_codes = vld1q_u16(lhs + index);
+        const uint16x8_t rhs_codes = vld1q_u16(rhs + index);
+        const int32x4_t lhs_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lhs_codes))),
+            lhs_zero);
+        const int32x4_t lhs_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lhs_codes))),
+            lhs_zero);
+        const int32x4_t rhs_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(rhs_codes))),
+            rhs_zero);
+        const int32x4_t rhs_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(rhs_codes))),
+            rhs_zero);
+#define GGML_U16_ADD_Q15_PAIR(LHS, RHS, HALF) \
+        const int64x2_t sum_##HALF = vaddq_s64( \
+            vmull_s32((LHS), lhs_mul), vmull_s32((RHS), rhs_mul)); \
+        const uint32x2_t quantized_##HALF = vqmovun_s64(vaddq_s64( \
+            vrshrq_n_s64(sum_##HALF, 15), output_zero))
+        GGML_U16_ADD_Q15_PAIR(vget_low_s32(lhs_lo),  vget_low_s32(rhs_lo),  0);
+        GGML_U16_ADD_Q15_PAIR(vget_high_s32(lhs_lo), vget_high_s32(rhs_lo), 1);
+        GGML_U16_ADD_Q15_PAIR(vget_low_s32(lhs_hi),  vget_low_s32(rhs_hi),  2);
+        GGML_U16_ADD_Q15_PAIR(vget_high_s32(lhs_hi), vget_high_s32(rhs_hi), 3);
+#undef GGML_U16_ADD_Q15_PAIR
+        const uint16x4_t output_lo = vqmovn_u32(
+            vcombine_u32(quantized_0, quantized_1));
+        const uint16x4_t output_hi = vqmovn_u32(
+            vcombine_u32(quantized_2, quantized_3));
+        vst1q_u16(output + index, vcombine_u16(output_lo, output_hi));
+    }
+}
+#endif
+
+void ggml_vec_add_affine_u16_qnn_q15(
+        int n,
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT lhs,
+        int64_t lhs_multiplier,
+        int32_t lhs_zero_point,
+        const uint16_t * GGML_RESTRICT rhs,
+        int64_t rhs_multiplier,
+        int32_t rhs_zero_point,
+        int32_t output_zero_point) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (n >= 0 && n % 8 == 0 &&
+        lhs_multiplier >= INT32_MIN && lhs_multiplier <= INT32_MAX &&
+        rhs_multiplier >= INT32_MIN && rhs_multiplier <= INT32_MAX) {
+        ggml_vec_add_affine_u16_qnn_q15_neon(
+            n, output, lhs, (int32_t) lhs_multiplier, lhs_zero_point,
+            rhs, (int32_t) rhs_multiplier, rhs_zero_point, output_zero_point);
+        return;
+    }
+#endif
+    ggml_vec_add_affine_u16_qnn_q15_scalar(
+        n, output, lhs, lhs_multiplier, lhs_zero_point,
+        rhs, rhs_multiplier, rhs_zero_point, output_zero_point);
 }
 
 static inline uint16_t ggml_u16_mul_requant_fixed(
@@ -4531,6 +4901,23 @@ static inline uint8_t ggml_u16_to_u8_requant_q31(
     return (uint8_t) MAX(0, MIN(UINT8_MAX, quantized));
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline int32x4_t ggml_u16_to_u8_round_products_q31(
+        int64x2_t product_lo,
+        int64x2_t product_hi) {
+    const int64x2_t zero = vdupq_n_s64(0);
+    const int64x2_t rounded_abs_lo = vreinterpretq_s64_u64(vrshrq_n_u64(
+        vreinterpretq_u64_s64(vabsq_s64(product_lo)), 31));
+    const int64x2_t rounded_abs_hi = vreinterpretq_s64_u64(vrshrq_n_u64(
+        vreinterpretq_u64_s64(vabsq_s64(product_hi)), 31));
+    const int64x2_t rounded_lo = vbslq_s64(
+        vcltq_s64(product_lo, zero), vnegq_s64(rounded_abs_lo), rounded_abs_lo);
+    const int64x2_t rounded_hi = vbslq_s64(
+        vcltq_s64(product_hi, zero), vnegq_s64(rounded_abs_hi), rounded_abs_hi);
+    return vcombine_s32(vmovn_s64(rounded_lo), vmovn_s64(rounded_hi));
+}
+#endif
+
 void ggml_vec_convert_u16_u8_qnn_fixed(
         int n,
         uint8_t * GGML_RESTRICT output,
@@ -4541,25 +4928,30 @@ void ggml_vec_convert_u16_u8_qnn_fixed(
     GGML_ASSERT(n >= 0 && output != NULL && input != NULL);
     GGML_ASSERT(input_to_output_q31 >= 0 && input_to_output_q31 <= INT32_MAX);
     int index = 0;
-#if defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__ARM_NEON)
     const int32x4_t input_zero = vdupq_n_s32(input_zero_point);
     const int32x2_t multiplier = vdup_n_s32((int32_t) input_to_output_q31);
-    for (; index + 4 <= n; index += 4) {
-        const int32x4_t centered = vsubq_s32(
-            vreinterpretq_s32_u32(vmovl_u16(vld1_u16(input + index))),
+    const int32x4_t output_zero = vdupq_n_s32(output_zero_point);
+    for (; index + 8 <= n; index += 8) {
+        const uint16x8_t input_values = vld1q_u16(input + index);
+        const int32x4_t centered_lo = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(input_values))),
             input_zero);
-        const int64x2_t product_lo = vmull_s32(
-            vget_low_s32(centered), multiplier);
-        const int64x2_t product_hi = vmull_s32(
-            vget_high_s32(centered), multiplier);
-        output[index + 0] = ggml_u16_to_u8_requant_q31(
-            vgetq_lane_s64(product_lo, 0), 1, output_zero_point);
-        output[index + 1] = ggml_u16_to_u8_requant_q31(
-            vgetq_lane_s64(product_lo, 1), 1, output_zero_point);
-        output[index + 2] = ggml_u16_to_u8_requant_q31(
-            vgetq_lane_s64(product_hi, 0), 1, output_zero_point);
-        output[index + 3] = ggml_u16_to_u8_requant_q31(
-            vgetq_lane_s64(product_hi, 1), 1, output_zero_point);
+        const int32x4_t centered_hi = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(input_values))),
+            input_zero);
+        const int32x4_t quantized_lo = vqaddq_s32(
+            ggml_u16_to_u8_round_products_q31(
+                vmull_s32(vget_low_s32(centered_lo), multiplier),
+                vmull_s32(vget_high_s32(centered_lo), multiplier)),
+            output_zero);
+        const int32x4_t quantized_hi = vqaddq_s32(
+            ggml_u16_to_u8_round_products_q31(
+                vmull_s32(vget_low_s32(centered_hi), multiplier),
+                vmull_s32(vget_high_s32(centered_hi), multiplier)),
+            output_zero);
+        vst1_u8(output + index, vqmovn_u16(vcombine_u16(
+            vqmovun_s32(quantized_lo), vqmovun_s32(quantized_hi))));
     }
 #endif
     for (; index < n; ++index) {
@@ -5035,6 +5427,211 @@ void ggml_vec_matmul_u16_u8_qnn_fixed_strided(
     }
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+__attribute__((noinline))
+static void ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair_s16(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1) {
+    const uint16x8_t input_zero0 = vdupq_n_u16((uint16_t) input_zero_point0);
+    const uint16x8_t input_zero1 = vdupq_n_u16((uint16_t) input_zero_point1);
+    const uint8x8_t weight_sign = vdup_n_u8(0x80);
+    for (int token = 0; token < output_dimension; ++token) {
+        int32x4_t accum0_lo = vdupq_n_s32(0);
+        int32x4_t accum0_hi = vdupq_n_s32(0);
+        int32x4_t accum1_lo = vdupq_n_s32(0);
+        int32x4_t accum1_hi = vdupq_n_s32(0);
+        int32x4_t weight_sum = vdupq_n_s32(0);
+        const uint8_t * token_weights = weights + (size_t) token * token_stride;
+        int dimension = 0;
+        for (; dimension + 8 <= input_dimension; dimension += 8) {
+            const int16x8_t centered_weights = vmovl_s8(
+                vreinterpret_s8_u8(veor_u8(
+                    vld1_u8(token_weights + dimension), weight_sign)));
+            const int16x8_t centered0 = vreinterpretq_s16_u16(vsubq_u16(
+                vld1q_u16(input0 + dimension), input_zero0));
+            const int16x8_t centered1 = vreinterpretq_s16_u16(vsubq_u16(
+                vld1q_u16(input1 + dimension), input_zero1));
+            accum0_lo = vmlal_s16(
+                accum0_lo, vget_low_s16(centered_weights),
+                vget_low_s16(centered0));
+            accum0_hi = vmlal_high_s16(
+                accum0_hi, centered_weights, centered0);
+            accum1_lo = vmlal_s16(
+                accum1_lo, vget_low_s16(centered_weights),
+                vget_low_s16(centered1));
+            accum1_hi = vmlal_high_s16(
+                accum1_hi, centered_weights, centered1);
+            weight_sum = vpadalq_s16(weight_sum, centered_weights);
+        }
+        int64_t dot0 = (int64_t) vaddvq_s32(accum0_lo) +
+            vaddvq_s32(accum0_hi);
+        int64_t dot1 = (int64_t) vaddvq_s32(accum1_lo) +
+            vaddvq_s32(accum1_hi);
+        int64_t expanded_weight_sum = vaddvq_s32(weight_sum);
+        for (; dimension < input_dimension; ++dimension) {
+            const int32_t weight = (int32_t) token_weights[dimension] - 128;
+            dot0 += ((int32_t) input0[dimension] - input_zero_point0) * weight;
+            dot1 += ((int32_t) input1[dimension] - input_zero_point1) * weight;
+            expanded_weight_sum += weight;
+        }
+        output0[token] = ggml_u16_matmul_requant_q31(
+            ggml_qnn_a16s8_reduce_accumulator(
+                dot0, expanded_weight_sum, input_zero_point0),
+            product_to_output_q20_0, output_zero_point0);
+        output1[token] = ggml_u16_matmul_requant_q31(
+            ggml_qnn_a16s8_reduce_accumulator(
+                dot1, expanded_weight_sum, input_zero_point1),
+            product_to_output_q20_1, output_zero_point1);
+    }
+}
+
+static int ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair_neon(
+        int input_dimension,
+        int output_dimension,
+        size_t token_stride,
+        uint16_t * GGML_RESTRICT output0,
+        uint16_t * GGML_RESTRICT output1,
+        const uint16_t * GGML_RESTRICT input0,
+        const uint16_t * GGML_RESTRICT input1,
+        const uint8_t * GGML_RESTRICT weights,
+        int32_t input_zero_point0,
+        int32_t input_zero_point1,
+        int64_t product_to_output_q20_0,
+        int64_t product_to_output_q20_1,
+        int32_t output_zero_point0,
+        int32_t output_zero_point1) {
+    const uint64_t max_input0 = (uint64_t) MAX(
+        input_zero_point0, (int32_t) UINT16_MAX - input_zero_point0);
+    const uint64_t max_input1 = (uint64_t) MAX(
+        input_zero_point1, (int32_t) UINT16_MAX - input_zero_point1);
+    if (MAX(max_input0, max_input1) * 128U * (uint64_t) input_dimension >
+            INT32_MAX) {
+        return 0;
+    }
+
+    if (!ggml_qnn_attention_s16_enabled()) {
+        goto use_u16_s32;
+    }
+
+    uint16x8_t minimum0 = vdupq_n_u16(UINT16_MAX);
+    uint16x8_t maximum0 = vdupq_n_u16(0);
+    uint16x8_t minimum1 = vdupq_n_u16(UINT16_MAX);
+    uint16x8_t maximum1 = vdupq_n_u16(0);
+    int scan_dimension = 0;
+    for (; scan_dimension + 8 <= input_dimension; scan_dimension += 8) {
+        const uint16x8_t values0 = vld1q_u16(input0 + scan_dimension);
+        const uint16x8_t values1 = vld1q_u16(input1 + scan_dimension);
+        minimum0 = vminq_u16(minimum0, values0);
+        maximum0 = vmaxq_u16(maximum0, values0);
+        minimum1 = vminq_u16(minimum1, values1);
+        maximum1 = vmaxq_u16(maximum1, values1);
+    }
+    uint16_t min0 = vminvq_u16(minimum0);
+    uint16_t max0 = vmaxvq_u16(maximum0);
+    uint16_t min1 = vminvq_u16(minimum1);
+    uint16_t max1 = vmaxvq_u16(maximum1);
+    for (; scan_dimension < input_dimension; ++scan_dimension) {
+        min0 = MIN(min0, input0[scan_dimension]);
+        max0 = MAX(max0, input0[scan_dimension]);
+        min1 = MIN(min1, input1[scan_dimension]);
+        max1 = MAX(max1, input1[scan_dimension]);
+    }
+    const int32_t centered_min0 = (int32_t) min0 - input_zero_point0;
+    const int32_t centered_max0 = (int32_t) max0 - input_zero_point0;
+    const int32_t centered_min1 = (int32_t) min1 - input_zero_point1;
+    const int32_t centered_max1 = (int32_t) max1 - input_zero_point1;
+    if (centered_min0 >= INT16_MIN && centered_max0 <= INT16_MAX &&
+            centered_min1 >= INT16_MIN && centered_max1 <= INT16_MAX) {
+        ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair_s16(
+            input_dimension, output_dimension, token_stride,
+            output0, output1, input0, input1, weights,
+            input_zero_point0, input_zero_point1,
+            product_to_output_q20_0, product_to_output_q20_1,
+            output_zero_point0, output_zero_point1);
+        return 1;
+    }
+
+use_u16_s32:
+    ;
+    const int32x4_t input_zero0 = vdupq_n_s32(input_zero_point0);
+    const int32x4_t input_zero1 = vdupq_n_s32(input_zero_point1);
+    const int32x4_t weight_zero = vdupq_n_s32(128);
+    for (int token = 0; token < output_dimension; ++token) {
+        int32x4_t accum0_lo = vdupq_n_s32(0);
+        int32x4_t accum0_hi = vdupq_n_s32(0);
+        int32x4_t accum1_lo = vdupq_n_s32(0);
+        int32x4_t accum1_hi = vdupq_n_s32(0);
+        int32x4_t weight_sum_lo = vdupq_n_s32(0);
+        int32x4_t weight_sum_hi = vdupq_n_s32(0);
+        const uint8_t * token_weights = weights + (size_t) token * token_stride;
+        int dimension = 0;
+        for (; dimension + 8 <= input_dimension; dimension += 8) {
+            const uint16x8_t packed = vmovl_u8(
+                vld1_u8(token_weights + dimension));
+            const int32x4_t weights_lo = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(packed))),
+                weight_zero);
+            const int32x4_t weights_hi = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(packed))),
+                weight_zero);
+            const uint16x8_t values0 = vld1q_u16(input0 + dimension);
+            const uint16x8_t values1 = vld1q_u16(input1 + dimension);
+            const int32x4_t values0_lo = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values0))),
+                input_zero0);
+            const int32x4_t values0_hi = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(values0))),
+                input_zero0);
+            const int32x4_t values1_lo = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values1))),
+                input_zero1);
+            const int32x4_t values1_hi = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(values1))),
+                input_zero1);
+            accum0_lo = vmlaq_s32(accum0_lo, weights_lo, values0_lo);
+            accum0_hi = vmlaq_s32(accum0_hi, weights_hi, values0_hi);
+            accum1_lo = vmlaq_s32(accum1_lo, weights_lo, values1_lo);
+            accum1_hi = vmlaq_s32(accum1_hi, weights_hi, values1_hi);
+            weight_sum_lo = vaddq_s32(weight_sum_lo, weights_lo);
+            weight_sum_hi = vaddq_s32(weight_sum_hi, weights_hi);
+        }
+        int64_t dot0 = (int64_t) vaddvq_s32(accum0_lo) +
+            vaddvq_s32(accum0_hi);
+        int64_t dot1 = (int64_t) vaddvq_s32(accum1_lo) +
+            vaddvq_s32(accum1_hi);
+        int64_t weight_sum = (int64_t) vaddvq_s32(weight_sum_lo) +
+            vaddvq_s32(weight_sum_hi);
+        for (; dimension < input_dimension; ++dimension) {
+            const int32_t weight = (int32_t) token_weights[dimension] - 128;
+            dot0 += ((int32_t) input0[dimension] - input_zero_point0) * weight;
+            dot1 += ((int32_t) input1[dimension] - input_zero_point1) * weight;
+            weight_sum += weight;
+        }
+        output0[token] = ggml_u16_matmul_requant_q31(
+            ggml_qnn_a16s8_reduce_accumulator(
+                dot0, weight_sum, input_zero_point0),
+            product_to_output_q20_0, output_zero_point0);
+        output1[token] = ggml_u16_matmul_requant_q31(
+            ggml_qnn_a16s8_reduce_accumulator(
+                dot1, weight_sum, input_zero_point1),
+            product_to_output_q20_1, output_zero_point1);
+    }
+    return 1;
+}
+#endif
+
 void ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
         int input_dimension,
         int output_dimension,
@@ -5121,6 +5718,17 @@ void ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
         int64_t product_to_output_q20_1,
         int32_t output_zero_point0,
         int32_t output_zero_point1) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (weight_zero_point == 128 &&
+            ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair_neon(
+                input_dimension, output_dimension, token_stride,
+                output0, output1, input0, input1, weights,
+                input_zero_point0, input_zero_point1,
+                product_to_output_q20_0, product_to_output_q20_1,
+                output_zero_point0, output_zero_point1)) {
+        return;
+    }
+#endif
 #if defined(__aarch64__) && defined(__clang__) && defined(__ARM_NEON)
     if (weight_zero_point == 128 &&
             input_dimension % 4 == 0 &&
@@ -5345,35 +5953,81 @@ static inline int32_t ggml_u16_softmax_sat_i16(int64_t value) {
     return (int32_t) MAX(INT16_MIN, MIN(INT16_MAX, value));
 }
 
+static const uint16_t ggml_u16_softmax_exp_base[4] = {
+    UINT16_C(0x10cc), UINT16_C(0x13ff),
+    UINT16_C(0x17c7), UINT16_C(0x1c3e),
+};
+
+static const uint16_t ggml_u16_softmax_exp_linear[4] = {
+    UINT16_C(0x587c), UINT16_C(0x5538),
+    UINT16_C(0x4d91), UINT16_C(0x4014),
+};
+
+static const uint16_t ggml_u16_softmax_exp_quadratic[4] = {
+    UINT16_C(0x8001), UINT16_C(0x806c),
+    UINT16_C(0x825b), UINT16_C(0x8773),
+};
+
 static inline uint16_t ggml_u16_softmax_exp_htp(
         uint32_t code_delta,
         uint16_t exponent_multiplier_q22) {
-    static const uint16_t base[4] = {
-        UINT16_C(0x10cc), UINT16_C(0x13ff),
-        UINT16_C(0x17c7), UINT16_C(0x1c3e),
-    };
-    static const uint16_t linear[4] = {
-        UINT16_C(0x587c), UINT16_C(0x5538),
-        UINT16_C(0x4d91), UINT16_C(0x4014),
-    };
-    static const uint16_t quadratic[4] = {
-        UINT16_C(0x8001), UINT16_C(0x806c),
-        UINT16_C(0x825b), UINT16_C(0x8773),
-    };
-
     const uint32_t exponent_q16 =
         (uint32_t) (((uint64_t) code_delta * exponent_multiplier_q22) >> 6);
     const uint16_t fraction = (uint16_t) ~(uint16_t) exponent_q16;
     const uint32_t segment = fraction >> 14;
     int32_t polynomial = ggml_u16_softmax_sat_i16(
-        ((int64_t) base[segment] * fraction +
-            ((int64_t) linear[segment] << 15)) >> 16);
+        ((int64_t) ggml_u16_softmax_exp_base[segment] * fraction +
+            ((int64_t) ggml_u16_softmax_exp_linear[segment] << 15)) >> 16);
     polynomial = ggml_u16_softmax_sat_i16(
         ((int64_t) polynomial * fraction +
-            ((int64_t) quadratic[segment] << 15)) >> 16);
+            ((int64_t) ggml_u16_softmax_exp_quadratic[segment] << 15)) >> 16);
     const uint32_t integer_part = MIN(UINT32_C(15), exponent_q16 >> 16);
     return (uint16_t) ((uint16_t) polynomial >> integer_part);
 }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline uint32_t ggml_u16_softmax_exp_htp_neon4(
+        uint16_t * GGML_RESTRICT output,
+        const uint16_t * GGML_RESTRICT input,
+        uint16_t maximum,
+        uint16_t exponent_multiplier_q22) {
+    const uint16x4_t code_delta = vsub_u16(
+        vdup_n_u16(maximum), vld1_u16(input));
+    const uint32x4_t exponent_q16 = vshrq_n_u32(
+        vmull_n_u16(code_delta, exponent_multiplier_q22), 6);
+    const uint16x4_t fraction = vmvn_u16(vmovn_u32(exponent_q16));
+    const uint16x4_t segment = vshr_n_u16(fraction, 14);
+    const uint8x8_t table_index = vreinterpret_u8_u16(vmla_n_u16(
+        vdup_n_u16(UINT16_C(0x0100)), segment, UINT16_C(0x0202)));
+
+    const uint16x4_t base = vreinterpret_u16_u8(vtbl1_u8(
+        vreinterpret_u8_u16(vld1_u16(ggml_u16_softmax_exp_base)),
+        table_index));
+    const uint16x4_t linear = vreinterpret_u16_u8(vtbl1_u8(
+        vreinterpret_u8_u16(vld1_u16(ggml_u16_softmax_exp_linear)),
+        table_index));
+    const uint16x4_t quadratic = vreinterpret_u16_u8(vtbl1_u8(
+        vreinterpret_u8_u16(vld1_u16(ggml_u16_softmax_exp_quadratic)),
+        table_index));
+
+    uint32x4_t polynomial = vaddq_u32(
+        vmull_u16(base, fraction), vshll_n_u16(linear, 15));
+    polynomial = vminq_u32(
+        vshrq_n_u32(polynomial, 16), vdupq_n_u32(INT16_MAX));
+    polynomial = vaddq_u32(
+        vmull_u16(vmovn_u32(polynomial), fraction),
+        vshll_n_u16(quadratic, 15));
+    polynomial = vminq_u32(
+        vshrq_n_u32(polynomial, 16), vdupq_n_u32(INT16_MAX));
+
+    const uint16x4_t integer_part = vmin_u16(
+        vmovn_u32(vshrq_n_u32(exponent_q16, 16)), vdup_n_u16(15));
+    const uint16x4_t result = vshl_u16(
+        vmovn_u32(polynomial), vneg_s16(vreinterpret_s16_u16(integer_part)));
+    vst1_u16(output, result);
+    return vaddlv_u16(result);
+}
+#endif
 
 static inline int32_t ggml_u16_softmax_vmpye(
         int32_t value,
@@ -5450,7 +6104,15 @@ void ggml_vec_softmax_u16_qnn_fixed(
             (uint16_t) (scale_over_ln2_q24 >> 2);
         GGML_ASSERT(exponent_multiplier_q22 > 0);
         uint32_t exponential_sum = 0;
-        for (int index = 0; index < n; ++index) {
+        int index = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        for (; index + 4 <= n; index += 4) {
+            exponential_sum += ggml_u16_softmax_exp_htp_neon4(
+                output + index, input + index, maximum,
+                exponent_multiplier_q22);
+        }
+#endif
+        for (; index < n; ++index) {
             output[index] = ggml_u16_softmax_exp_htp(
                 (uint32_t) maximum - input[index],
                 exponent_multiplier_q22);
@@ -5460,7 +6122,7 @@ void ggml_vec_softmax_u16_qnn_fixed(
         const uint16_t reciprocal = ggml_u16_softmax_reciprocal_htp(
             exponential_sum, &final_right_shift);
         GGML_ASSERT(final_right_shift >= 0 && final_right_shift < 32);
-        for (int index = 0; index < n; ++index) {
+        for (index = 0; index < n; ++index) {
             output[index] = (uint16_t) MIN(UINT16_MAX,
                 ((uint32_t) output[index] * reciprocal) >> final_right_shift);
         }
@@ -5622,9 +6284,15 @@ void ggml_vec_rms_norm_affine_u16_qnn(
 }
 
 static uint64_t ggml_u128_isqrt(__uint128_t value) {
-    __uint128_t bit = ((__uint128_t) 1) << 126;
+    if (value == 0) {
+        return 0;
+    }
+    const uint64_t high = (uint64_t) (value >> 64);
+    const int highest_bit = high != 0
+        ? 127 - __builtin_clzll(high)
+        : 63 - __builtin_clzll((uint64_t) value);
+    __uint128_t bit = ((__uint128_t) 1) << (highest_bit & ~1);
     __uint128_t root = 0;
-    while (bit > value) bit >>= 2;
     while (bit != 0) {
         if (value >= root + bit) {
             value -= root + bit;

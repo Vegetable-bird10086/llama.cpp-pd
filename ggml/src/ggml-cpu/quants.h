@@ -303,7 +303,8 @@ int ggml_gptq2_32_prepare_u16_activation(
         int32_t activation_zero_point,
         int32_t * GGML_RESTRICT activation_block_sums,
         uint8_t * GGML_RESTRICT activation_low,
-        int8_t * GGML_RESTRICT activation_high);
+        int8_t * GGML_RESTRICT activation_high,
+        int32_t * GGML_RESTRICT sum_abs_centered);
 
 void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_8rows(
         int n,
@@ -338,6 +339,7 @@ void ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
         const int8_t * GGML_RESTRICT activation_high,
         const int32_t * GGML_RESTRICT activation_block_sums,
         int activations_fit_i16,
+        int accumulation_fits_i32,
         const uint8_t * GGML_RESTRICT prepared_block_codes,
         size_t prepared_row_stride,
         const int64_t * GGML_RESTRICT channel_scale_to_output_q31,
