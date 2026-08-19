@@ -5,12 +5,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <new>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -22,6 +40,216 @@ bool is_enabled_value(const char * value) {
     return setting == "1" || setting == "true" || setting == "TRUE" ||
         setting == "on" || setting == "ON";
 }
+
+
+struct qnn_gs32_i8mm_sidecar_header {
+    char magic[8];
+    uint32_t version;
+    uint32_t entry_count;
+    uint64_t data_offset;
+};
+
+struct qnn_gs32_i8mm_sidecar_entry {
+    int32_t layer_id;
+    uint32_t projection_id;
+    uint32_t columns;
+    uint32_t rows;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t source_fingerprint;
+    char projection[16];
+    uint64_t reserved;
+};
+
+static_assert(sizeof(qnn_gs32_i8mm_sidecar_header) == 24);
+static_assert(sizeof(qnn_gs32_i8mm_sidecar_entry) == 64);
+
+int qnn_gs32_projection_id(std::string_view projection) {
+    if (projection == "self_attn.q_proj") return 0;
+    if (projection == "self_attn.k_proj") return 1;
+    if (projection == "self_attn.v_proj") return 2;
+    if (projection == "self_attn.o_proj") return 3;
+    if (projection == "mlp.gate_proj") return 4;
+    if (projection == "mlp.up_proj") return 5;
+    if (projection == "mlp.down_proj") return 6;
+    return -1;
+}
+
+uint64_t qnn_gs32_source_sample_fingerprint(
+        const uint8_t * source,
+        size_t bytes,
+        uint64_t columns,
+        uint64_t rows) {
+    GGML_ASSERT(source != nullptr && bytes >= 1024);
+    uint64_t value = UINT64_C(0xcbf29ce484222325);
+    const auto update = [&value](uint8_t byte) {
+        value ^= byte;
+        value *= UINT64_C(0x100000001b3);
+    };
+    for (size_t index = 0; index < 512; ++index) {
+        update(source[index]);
+    }
+    for (size_t index = bytes - 512; index < bytes; ++index) {
+        update(source[index]);
+    }
+    for (uint64_t item : { columns, rows }) {
+        for (int shift = 0; shift < 64; shift += 8) {
+            update(static_cast<uint8_t>(item >> shift));
+        }
+    }
+    return value;
+}
+
+class qnn_gs32_i8mm_sidecar {
+public:
+    static qnn_gs32_i8mm_sidecar & instance() {
+        static qnn_gs32_i8mm_sidecar value;
+        return value;
+    }
+
+    const uint8_t * find(
+            const llama_qnn_linear_qparams * qparams,
+            const void * source_weights,
+            int64_t columns,
+            int64_t rows) {
+        if (qparams == nullptr || source_weights == nullptr ||
+            !ggml_gptq2_32_gs32_i8mm_dotprod_enabled()) {
+            return nullptr;
+        }
+        std::call_once(load_once_, [this]() { load(); });
+        if (mapping_ == nullptr) {
+            return nullptr;
+        }
+        const int projection_id =
+            qnn_gs32_projection_id(qparams->projection);
+        if (projection_id < 0) {
+            return nullptr;
+        }
+        for (uint32_t index = 0; index < header_->entry_count; ++index) {
+            const auto & entry = entries_[index];
+            if (entry.layer_id != qparams->layer_id ||
+                entry.projection_id != static_cast<uint32_t>(projection_id) ||
+                entry.columns != static_cast<uint32_t>(columns) ||
+                entry.rows != static_cast<uint32_t>(rows)) {
+                continue;
+            }
+            uint8_t status =
+                verified_[index].load(std::memory_order_acquire);
+            if (status == 0) {
+                const size_t source_bytes =
+                    static_cast<size_t>(rows) * (columns / 32) * 12;
+                const uint64_t fingerprint =
+                    qnn_gs32_source_sample_fingerprint(
+                        static_cast<const uint8_t *>(source_weights),
+                        source_bytes, columns, rows);
+                const uint8_t desired =
+                    fingerprint == entry.source_fingerprint ? 1 : 2;
+                uint8_t expected = 0;
+                verified_[index].compare_exchange_strong(
+                    expected, desired, std::memory_order_release,
+                    std::memory_order_acquire);
+                status = verified_[index].load(std::memory_order_acquire);
+                if (status == 2) {
+                    std::fprintf(stderr,
+                        "qnn-u16: I8MM sidecar source fingerprint mismatch "
+                        "layer=%d projection=%s\n",
+                        qparams->layer_id, qparams->projection.c_str());
+                }
+            }
+            return status == 1 ? mapping_ + entry.offset : nullptr;
+        }
+        return nullptr;
+    }
+
+private:
+    void load() {
+#if defined(__linux__) || defined(__ANDROID__)
+        const char * path =
+            std::getenv("GGML_QNN_GS32_I8MM_SIDECAR");
+        if (path == nullptr || path[0] == 0) {
+            return;
+        }
+        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            std::fprintf(stderr,
+                "qnn-u16: failed to open I8MM sidecar: %s\n", path);
+            return;
+        }
+        struct stat stat_buffer;
+        if (fstat(fd, &stat_buffer) != 0 ||
+            stat_buffer.st_size < static_cast<off_t>(
+                sizeof(qnn_gs32_i8mm_sidecar_header))) {
+            close(fd);
+            std::fprintf(stderr,
+                "qnn-u16: invalid I8MM sidecar size: %s\n", path);
+            return;
+        }
+        void * mapped = mmap(
+            nullptr, static_cast<size_t>(stat_buffer.st_size), PROT_READ,
+            MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (mapped == MAP_FAILED) {
+            std::fprintf(stderr,
+                "qnn-u16: failed to mmap I8MM sidecar: %s\n", path);
+            return;
+        }
+        auto * bytes = static_cast<uint8_t *>(mapped);
+        auto * header =
+            reinterpret_cast<const qnn_gs32_i8mm_sidecar_header *>(bytes);
+        const uint8_t expected_magic[8] = {
+            0x51, 0x47, 0x32, 0x49, 0x38, 0x4d, 0x31, 0x00,
+        };
+        const size_t file_size = static_cast<size_t>(stat_buffer.st_size);
+        const size_t entries_end = sizeof(*header) +
+            static_cast<size_t>(header->entry_count) *
+                sizeof(qnn_gs32_i8mm_sidecar_entry);
+        bool valid =
+            std::memcmp(header->magic, expected_magic, 8) == 0 &&
+            header->version == 1 && header->entry_count > 0 &&
+            header->entry_count <= verified_.size() &&
+            entries_end <= file_size &&
+            header->data_offset >= entries_end &&
+            header->data_offset <= file_size;
+        const auto * entries = reinterpret_cast<
+            const qnn_gs32_i8mm_sidecar_entry *>(
+                bytes + sizeof(*header));
+        for (uint32_t index = 0; valid && index < header->entry_count; ++index) {
+            const auto & entry = entries[index];
+            const uint64_t expected_size =
+                static_cast<uint64_t>(entry.rows) *
+                (entry.columns / 32) * 8;
+            valid = entry.columns % 32 == 0 && entry.rows % 16 == 0 &&
+                entry.size == expected_size &&
+                entry.offset >= header->data_offset &&
+                entry.offset <= file_size &&
+                entry.size <= file_size - entry.offset;
+        }
+        if (!valid) {
+            munmap(mapped, file_size);
+            std::fprintf(stderr,
+                "qnn-u16: malformed I8MM sidecar: %s\n", path);
+            return;
+        }
+        mapping_ = bytes;
+        mapping_size_ = file_size;
+        header_ = header;
+        entries_ = entries;
+        std::fprintf(stderr,
+            "qnn-u16: mapped I8MM native 2-bit sidecar entries=%u "
+            "bytes=%zu path=%s\n",
+            header_->entry_count, mapping_size_, path);
+#else
+        return;
+#endif
+    }
+
+    std::once_flag load_once_;
+    uint8_t * mapping_ = nullptr;
+    size_t mapping_size_ = 0;
+    const qnn_gs32_i8mm_sidecar_header * header_ = nullptr;
+    const qnn_gs32_i8mm_sidecar_entry * entries_ = nullptr;
+    std::array<std::atomic<uint8_t>, 512> verified_{};
+};
 
 bool use_profiled_oproj_nearest(const char * value, int32_t layer_id) {
     if (value == nullptr) {
@@ -234,6 +462,22 @@ void qnn_u16_binary_params_q15(
         zero_average;
 }
 
+struct qnn_u16_mul_mat_runtime_params {
+    const llama_qnn_linear_qparams * qparams;
+    int8_t * dynamic_s8;
+    int32_t * dynamic_block_max_abs;
+    std::atomic<int32_t> quantize_arrivals { 0 };
+    std::atomic<uint32_t> quantize_generation { 0 };
+
+    qnn_u16_mul_mat_runtime_params(
+            const llama_qnn_linear_qparams * qparams_value,
+            int8_t * dynamic_s8_value,
+            int32_t * dynamic_block_max_abs_value)
+        : qparams(qparams_value),
+          dynamic_s8(dynamic_s8_value),
+          dynamic_block_max_abs(dynamic_block_max_abs_value) {}
+};
+
 struct qnn_u16_binary_params {
     int64_t lhs_multiplier;
     int64_t rhs_multiplier;
@@ -242,6 +486,17 @@ struct qnn_u16_binary_params {
     int32_t rhs_zero_point;
     int32_t output_zero_point;
     bool multiply;
+};
+
+struct qnn_u8_binary_params {
+    llama_qnn_a8_add_subtract_params add_subtract;
+    llama_qnn_a8_multiply_params multiply;
+    bool use_multiply;
+};
+
+struct qnn_u8_static_binary_params {
+    qnn_u8_binary_params binary;
+    uint8_t rhs_code;
 };
 
 struct qnn_f32_u16_boundary_params {
@@ -264,6 +519,8 @@ struct qnn_u16_rms_norm_params {
     uint64_t epsilon_in_codes_q16;
     int64_t weight_to_output_q31;
     int32_t output_zero_point;
+    double a8_epsilon_in_codes;
+    double a8_weight_to_output;
 };
 
 struct qnn_u16_lut_params {
@@ -284,6 +541,19 @@ struct qnn_u16_rope_params {
     int64_t half_dimension;
 };
 
+struct qnn_u8_rope_params {
+    const uint16_t * cos_codes;
+    const uint16_t * sin_codes;
+    int64_t table_rows;
+    int64_t half_dimension;
+    int32_t split_input_zero_point;
+    int64_t split_to_output_q31[2];
+    int32_t split_output_zero_points[2];
+    llama_qnn_a8_multiply_params multiply[4];
+    llama_qnn_a8_add_subtract_params subtract;
+    llama_qnn_a8_add_subtract_params add;
+};
+
 struct qnn_u16_s16_matmul_params {
     const int16_t * weights;
     int64_t input_dimension;
@@ -294,6 +564,16 @@ struct qnn_u16_s16_matmul_params {
     int32_t output_zero_point;
     int32_t weight_right_shift;
     int32_t accumulator_reduction_shift;
+};
+
+struct qnn_u8_u8_matmul_params {
+    const uint16_t * weights;
+    int64_t input_dimension;
+    int64_t output_dimension;
+    int32_t input_zero_point;
+    int32_t weight_zero_point;
+    int64_t product_to_output_q31;
+    int32_t output_zero_point;
 };
 
 struct qnn_u16_to_u8_params {
@@ -352,6 +632,43 @@ struct qnn_u16_attention_params {
     int32_t n_head_kv;
 };
 
+struct qnn_u8_attention_softmax_params {
+    qnn_u16_unary_requant_params divide;
+    int64_t masked_scale_over_ln2_q24;
+    qnn_u16_unary_requant_params minimum;
+    const uint16_t * minimum_lut;
+    llama_qnn_a8_add_subtract_params floor_add;
+    uint8_t floor_rhs_code;
+    qnn_u16_select_params select;
+    qnn_u16_softmax_params softmax;
+};
+
+struct qnn_u8_attention_matmul_params {
+    int32_t input_zero_point;
+    int32_t cache_zero_point;
+    int64_t cache_to_weight_q31;
+    int32_t weight_zero_point;
+    int64_t product_to_output_q31;
+    int32_t output_zero_point;
+    std::array<int32_t, 256> output_thresholds;
+    bool weight_signed;
+    std::array<int8_t, 256> centered_cache_lut;
+    bool centered_cache_lut_valid;
+    bool centered_cache_xor128_clamp;
+};
+
+struct qnn_u8_attention_head_params {
+    qnn_u8_attention_matmul_params score;
+    qnn_u8_attention_softmax_params softmax;
+    qnn_u8_attention_matmul_params value;
+};
+
+struct qnn_u8_attention_params {
+    const qnn_u8_attention_head_params * heads;
+    int32_t n_head;
+    int32_t n_head_kv;
+};
+
 template <typename T>
 struct qnn_u16_head_params {
     const T * values;
@@ -394,6 +711,198 @@ const uint8_t * qnn_u8_row(const ggml_tensor * tensor, int64_t row) {
     return reinterpret_cast<const uint8_t *>(
         reinterpret_cast<const char *>(tensor->data) +
         i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
+}
+
+uint8_t * qnn_u8_row(ggml_tensor * tensor, int64_t row) {
+    const int64_t i1 = row % tensor->ne[1];
+    const int64_t i2 = (row / tensor->ne[1]) % tensor->ne[2];
+    const int64_t i3 = row / (tensor->ne[1] * tensor->ne[2]);
+    return reinterpret_cast<uint8_t *>(
+        reinterpret_cast<char *>(tensor->data) +
+        i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
+}
+
+int64_t qnn_floor_shift(int64_t value, int32_t shift) {
+    GGML_ASSERT(shift > 0 && shift < 63);
+    return value >= 0
+        ? value >> shift
+        : -(((-value) + (INT64_C(1) << shift) - 1) >> shift);
+}
+
+int64_t qnn_floor_divide(int64_t value, int64_t divisor) {
+    GGML_ASSERT(divisor > 0);
+    return value >= 0
+        ? value / divisor
+        : -((-value + divisor - 1) / divisor);
+}
+
+uint8_t qnn_u8_hmx_conv2d_code(
+        int64_t accumulator,
+        int64_t scale_to_output_q31,
+        int32_t output_zero_point) {
+    GGML_ASSERT(scale_to_output_q31 > 0);
+    const int32_t msb = 63 - __builtin_clzll(
+        static_cast<unsigned long long>(scale_to_output_q31));
+    int32_t exponent = msb - 7;
+    const int32_t multiplier_shift = exponent - 4;
+    int64_t mantissa_x2 = multiplier_shift > 0
+        ? (scale_to_output_q31 + (INT64_C(1) << (multiplier_shift - 1))) >>
+            multiplier_shift
+        : scale_to_output_q31 << -multiplier_shift;
+    if (mantissa_x2 == 4096) {
+        mantissa_x2 = 2048;
+        ++exponent;
+    }
+    GGML_ASSERT(mantissa_x2 >= 2048 && mantissa_x2 < 4096);
+    GGML_ASSERT(exponent >= 0 && exponent <= 20);
+
+    const int64_t conventional = qnn_floor_shift(
+        accumulator * scale_to_output_q31 + (INT64_C(1) << 30), 31);
+    int32_t code = static_cast<int32_t>(std::clamp<int64_t>(
+        conventional + output_zero_point, 0, UINT8_MAX));
+    const int64_t grid = INT64_C(1) << (20 - exponent);
+    const auto threshold = [&](int32_t absolute_code) {
+        const int64_t centered_code = absolute_code - output_zero_point;
+        const int64_t numerator = (2 * centered_code - 1) * (INT64_C(1) << 14);
+        int64_t quotient = qnn_floor_divide(numerator, mantissa_x2);
+        const int64_t remainder = numerator - quotient * mantissa_x2;
+        if (2 * remainder > mantissa_x2) {
+            ++quotient;
+        }
+        return quotient * grid;
+    };
+    while (code > 0 && accumulator < threshold(code)) {
+        --code;
+    }
+    while (code < UINT8_MAX && accumulator >= threshold(code + 1)) {
+        ++code;
+    }
+    return static_cast<uint8_t>(code);
+}
+
+int64_t qnn_round_shift_away_from_zero(int64_t value, int32_t shift) {
+    GGML_ASSERT(shift > 0 && shift < 63);
+    const int64_t half = INT64_C(1) << (shift - 1);
+    return value >= 0
+        ? (value + half) >> shift
+        : -(((-value) + half) >> shift);
+}
+
+int16_t qnn_wrap_i16(int64_t value) {
+    const uint16_t wrapped = static_cast<uint16_t>(value);
+    int16_t result = 0;
+    std::memcpy(&result, &wrapped, sizeof(result));
+    return result;
+}
+
+uint8_t qnn_u8_add_subtract_code(
+        uint8_t lhs,
+        uint8_t rhs,
+        const llama_qnn_a8_add_subtract_params & params) {
+    GGML_ASSERT(params.valid && params.shift >= 0 && params.shift <= 7);
+    const int32_t lhs_coefficient = params.coefficients[0];
+    const int32_t rhs_coefficient = params.coefficients[1];
+    const uint16_t low_product = static_cast<uint16_t>(
+        lhs * (lhs_coefficient & 127) + rhs * (rhs_coefficient & 127));
+    const auto coefficient_high = [](int32_t coefficient) {
+        return static_cast<int8_t>(
+            (static_cast<uint16_t>(coefficient) >> 7) & 0xff);
+    };
+    const int32_t high_product =
+        lhs * coefficient_high(lhs_coefficient) +
+        rhs * coefficient_high(rhs_coefficient);
+    const int32_t reconstructed = static_cast<int32_t>(
+        qnn_floor_shift(high_product + (low_product >> 7), 1));
+    const int32_t biased = std::clamp<int32_t>(
+        reconstructed + params.bias, INT16_MIN, INT16_MAX);
+    const int64_t rounded = params.shift == 0
+        ? biased
+        : qnn_floor_shift(
+            static_cast<int64_t>(biased) +
+                (INT64_C(1) << (params.shift - 1)),
+            params.shift);
+    return static_cast<uint8_t>(std::clamp<int64_t>(rounded, 0, UINT8_MAX));
+}
+
+uint8_t qnn_u8_multiply_code(
+        uint8_t lhs,
+        uint8_t rhs,
+        const llama_qnn_a8_multiply_params & params) {
+    GGML_ASSERT(params.valid && params.shift > 0 && params.shift < 15);
+    const uint16_t packed = static_cast<uint16_t>(params.packed_zero_points);
+    const int32_t lhs_zero_point = packed & 0xff;
+    const int32_t rhs_zero_point = packed >> 8;
+    const int16_t product = qnn_wrap_i16(
+        static_cast<int64_t>(params.pre_multiply_bias) + lhs * rhs);
+    const int16_t centered = qnn_wrap_i16(
+        static_cast<int32_t>(product) -
+        lhs * rhs_zero_point - rhs * lhs_zero_point);
+    const int32_t scaled = std::clamp<int64_t>(
+        qnn_floor_shift(
+            static_cast<int64_t>(centered) * params.q15_coefficient +
+                (INT64_C(1) << 14),
+            15),
+        INT16_MIN, INT16_MAX);
+    const int32_t biased = std::clamp<int32_t>(
+        scaled + params.output_bias, INT16_MIN, INT16_MAX);
+    const int64_t rounded = qnn_floor_shift(
+        static_cast<int64_t>(biased) +
+            (INT64_C(1) << (params.shift - 1)),
+        params.shift);
+    return static_cast<uint8_t>(std::clamp<int64_t>(rounded, 0, UINT8_MAX));
+}
+
+void qnn_u8_binary_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u8_binary_params *>(userdata);
+    const ggml_tensor * lhs = dst->src[0];
+    const ggml_tensor * rhs = dst->src[1];
+    GGML_ASSERT(params != nullptr && lhs != nullptr && rhs != nullptr);
+    GGML_ASSERT(lhs->type == GGML_TYPE_U8 && rhs->type == GGML_TYPE_U8);
+    GGML_ASSERT(dst->type == GGML_TYPE_U8 && ggml_are_same_shape(lhs, rhs));
+    GGML_ASSERT(ggml_are_same_shape(lhs, dst));
+    const int64_t rows = qnn_u16_rows(lhs);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * lhs_data = qnn_u8_row(lhs, row);
+        const uint8_t * rhs_data = qnn_u8_row(rhs, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t index = 0; index < lhs->ne[0]; ++index) {
+            output[index] = params->use_multiply
+                ? qnn_u8_multiply_code(
+                    lhs_data[index], rhs_data[index], params->multiply)
+                : qnn_u8_add_subtract_code(
+                    lhs_data[index], rhs_data[index], params->add_subtract);
+        }
+    }
+}
+
+void qnn_u8_static_binary_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u8_static_binary_params *>(userdata);
+    const ggml_tensor * lhs = dst->src[0];
+    GGML_ASSERT(params != nullptr && lhs != nullptr);
+    GGML_ASSERT(lhs->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(ggml_are_same_shape(lhs, dst));
+    const int64_t rows = qnn_u16_rows(lhs);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * source = qnn_u8_row(lhs, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t index = 0; index < lhs->ne[0]; ++index) {
+            output[index] = params->binary.use_multiply
+                ? qnn_u8_multiply_code(
+                    source[index], params->rhs_code,
+                    params->binary.multiply)
+                : qnn_u8_add_subtract_code(
+                    source[index], params->rhs_code,
+                    params->binary.add_subtract);
+        }
+    }
 }
 
 void qnn_u16_binary_compute(
@@ -466,6 +975,30 @@ void qnn_quantize_f32_u16_compute(
     }
 }
 
+void qnn_quantize_f32_u8_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_f32_u16_boundary_params *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(params != nullptr && input != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(ggml_are_same_shape(input, dst));
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const float * source = reinterpret_cast<const float *>(
+            reinterpret_cast<const char *>(input->data) +
+            (row % input->ne[1]) * input->nb[1] +
+            ((row / input->ne[1]) % input->ne[2]) * input->nb[2] +
+            (row / (input->ne[1] * input->ne[2])) * input->nb[3]);
+        uint8_t * output = qnn_u8_row(dst, row);
+        ggml_quantize_f32_u8_qnn_v75(
+            static_cast<int>(input->ne[0]), output, source,
+            params->scale, params->zero_point);
+    }
+}
+
 void qnn_dequantize_u16_f32_compute(
         ggml_tensor * dst,
         int ith,
@@ -485,6 +1018,31 @@ void qnn_dequantize_u16_f32_compute(
             reinterpret_cast<char *>(dst->data) +
             i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
         const uint16_t * source = qnn_u16_row(input, row);
+        for (int64_t index = 0; index < input->ne[0]; ++index) {
+            output[index] = (static_cast<int32_t>(source[index]) -
+                params->zero_point) * params->scale;
+        }
+    }
+}
+
+void qnn_dequantize_u8_f32_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_f32_u16_boundary_params *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(params != nullptr && input != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(input, dst));
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * source = qnn_u8_row(input, row);
+        float * output = reinterpret_cast<float *>(
+            reinterpret_cast<char *>(dst->data) +
+            (row % dst->ne[1]) * dst->nb[1] +
+            ((row / dst->ne[1]) % dst->ne[2]) * dst->nb[2] +
+            (row / (dst->ne[1] * dst->ne[2])) * dst->nb[3]);
         for (int64_t index = 0; index < input->ne[0]; ++index) {
             output[index] = (static_cast<int32_t>(source[index]) -
                 params->zero_point) * params->scale;
@@ -579,6 +1137,28 @@ void qnn_u16_rms_norm_compute(
     }
 }
 
+void qnn_u8_rms_norm_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u16_rms_norm_params *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(params != nullptr && input != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(ggml_are_same_shape(input, dst));
+    GGML_ASSERT(input->ne[0] == params->weight_elements);
+    const int n = static_cast<int>(input->ne[0]);
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        ggml_vec_rms_norm_affine_u8_qnn_fixed(
+            n, qnn_u8_row(dst, row), qnn_u8_row(input, row),
+            params->input_zero_point, params->weight,
+            params->weight_zero_point, params->a8_epsilon_in_codes,
+            params->a8_weight_to_output, params->output_zero_point);
+    }
+}
+
 void qnn_u16_rms_norm_heads_compute(
         ggml_tensor * dst,
         int ith,
@@ -602,6 +1182,31 @@ void qnn_u16_rms_norm_heads_compute(
             params.weight, params.weight_zero_point,
             params.epsilon_in_codes_q16,
             params.weight_to_output_q31,
+            params.output_zero_point);
+    }
+}
+
+void qnn_u8_rms_norm_heads_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * head_params =
+        static_cast<const qnn_u16_head_params<qnn_u16_rms_norm_params> *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(head_params != nullptr && head_params->values != nullptr);
+    GGML_ASSERT(input != nullptr && input->type == GGML_TYPE_U8);
+    GGML_ASSERT(dst->type == GGML_TYPE_U8 && ggml_are_same_shape(input, dst));
+    GGML_ASSERT(input->ne[1] == head_params->n_head);
+    const int n = static_cast<int>(input->ne[0]);
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const auto & params = head_params->values[row % head_params->n_head];
+        GGML_ASSERT(input->ne[0] == params.weight_elements);
+        ggml_vec_rms_norm_affine_u8_qnn_fixed(
+            n, qnn_u8_row(dst, row), qnn_u8_row(input, row),
+            params.input_zero_point, params.weight, params.weight_zero_point,
+            params.a8_epsilon_in_codes, params.a8_weight_to_output,
             params.output_zero_point);
     }
 }
@@ -636,6 +1241,61 @@ void qnn_u16_lut_compute(
         }
         for (; index < input->ne[0]; ++index) {
             output[index] = params->lut[source[index]];
+        }
+    }
+}
+
+void qnn_u8_lut_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u16_lut_params *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(params != nullptr && params->lut != nullptr && input != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(ggml_are_same_shape(input, dst));
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * source = qnn_u8_row(input, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t index = 0; index < input->ne[0]; ++index) {
+            output[index] = static_cast<uint8_t>(params->lut[source[index]]);
+        }
+    }
+}
+
+struct qnn_u8_swiglu_params {
+    const uint16_t * sigmoid_lut;
+    qnn_u8_binary_params silu;
+    qnn_u8_binary_params product;
+};
+
+void qnn_u8_swiglu_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u8_swiglu_params *>(userdata);
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+    GGML_ASSERT(params != nullptr && params->sigmoid_lut != nullptr);
+    GGML_ASSERT(gate != nullptr && up != nullptr);
+    GGML_ASSERT(gate->type == GGML_TYPE_U8 && up->type == GGML_TYPE_U8);
+    GGML_ASSERT(dst->type == GGML_TYPE_U8 && ggml_are_same_shape(gate, up));
+    GGML_ASSERT(ggml_are_same_shape(gate, dst));
+    const int64_t rows = qnn_u16_rows(gate);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * gate_codes = qnn_u8_row(gate, row);
+        const uint8_t * up_codes = qnn_u8_row(up, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t index = 0; index < gate->ne[0]; ++index) {
+            const uint8_t sigmoid = static_cast<uint8_t>(
+                params->sigmoid_lut[gate_codes[index]]);
+            const uint8_t silu = qnn_u8_multiply_code(
+                gate_codes[index], sigmoid, params->silu.multiply);
+            output[index] = qnn_u8_multiply_code(
+                silu, up_codes[index], params->product.multiply);
         }
     }
 }
@@ -750,6 +1410,73 @@ void qnn_u16_rope_heads_compute(
     }
 }
 
+void qnn_u8_rope_heads_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * head_params =
+        static_cast<const qnn_u16_head_params<qnn_u8_rope_params> *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    const ggml_tensor * positions = dst->src[1];
+    GGML_ASSERT(head_params != nullptr && head_params->values != nullptr);
+    GGML_ASSERT(input != nullptr && positions != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(input->ne[1] == head_params->n_head);
+    GGML_ASSERT(positions->ne[0] >= input->ne[2]);
+    const int64_t rows = qnn_u16_rows(input);
+    const auto * position_data = static_cast<const int32_t *>(positions->data);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const int32_t head = row % head_params->n_head;
+        const int64_t token = (row / head_params->n_head) % input->ne[2];
+        const auto & params = head_params->values[head];
+        const int32_t position = position_data[token];
+        GGML_ASSERT(input->ne[0] == params.half_dimension * 2);
+        GGML_ASSERT(position >= 0 && position < params.table_rows);
+        const uint8_t * source = qnn_u8_row(input, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        const uint16_t * cos_codes =
+            params.cos_codes + (int64_t) position * params.half_dimension;
+        const uint16_t * sin_codes =
+            params.sin_codes + (int64_t) position * params.half_dimension;
+        for (int64_t index = 0; index < params.half_dimension; ++index) {
+            GGML_ASSERT(cos_codes[index] <= UINT8_MAX &&
+                sin_codes[index] <= UINT8_MAX);
+            const int64_t first_centered =
+                static_cast<int32_t>(source[index]) -
+                params.split_input_zero_point;
+            const int64_t second_centered =
+                static_cast<int32_t>(source[index + params.half_dimension]) -
+                params.split_input_zero_point;
+            const uint8_t first = static_cast<uint8_t>(std::clamp<int64_t>(
+                qnn_floor_shift(
+                    first_centered * params.split_to_output_q31[0] +
+                        (INT64_C(1) << 30),
+                    31) + params.split_output_zero_points[0],
+                0, UINT8_MAX));
+            const uint8_t second = static_cast<uint8_t>(std::clamp<int64_t>(
+                qnn_floor_shift(
+                    second_centered * params.split_to_output_q31[1] +
+                        (INT64_C(1) << 30),
+                    31) + params.split_output_zero_points[1],
+                0, UINT8_MAX));
+            const uint8_t product0 = qnn_u8_multiply_code(
+                first, static_cast<uint8_t>(cos_codes[index]), params.multiply[0]);
+            const uint8_t product1 = qnn_u8_multiply_code(
+                second, static_cast<uint8_t>(sin_codes[index]), params.multiply[1]);
+            const uint8_t product2 = qnn_u8_multiply_code(
+                first, static_cast<uint8_t>(sin_codes[index]), params.multiply[2]);
+            const uint8_t product3 = qnn_u8_multiply_code(
+                second, static_cast<uint8_t>(cos_codes[index]), params.multiply[3]);
+            output[index] = qnn_u8_add_subtract_code(
+                product0, product1, params.subtract);
+            output[index + params.half_dimension] = qnn_u8_add_subtract_code(
+                product2, product3, params.add);
+        }
+    }
+}
+
 void qnn_u16_s16_matmul_compute(
         ggml_tensor * dst,
         int ith,
@@ -783,6 +1510,77 @@ void qnn_u16_s16_matmul_compute(
             params->output_zero_point,
             params->weight_right_shift,
             params->accumulator_reduction_shift);
+    }
+}
+
+void qnn_u8_u8_matmul_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u8_u8_matmul_params *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(params != nullptr && params->weights != nullptr && input != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(input->ne[0] == params->input_dimension);
+    GGML_ASSERT(dst->ne[0] == params->output_dimension);
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const uint8_t * source = qnn_u8_row(input, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t column = 0; column < params->output_dimension; ++column) {
+            int64_t accumulator = 0;
+            for (int64_t index = 0; index < params->input_dimension; ++index) {
+                accumulator +=
+                    (static_cast<int32_t>(source[index]) -
+                        params->input_zero_point) *
+                    (static_cast<int32_t>(params->weights[
+                        index * params->output_dimension + column]) -
+                        params->weight_zero_point);
+            }
+            const int64_t quantized = qnn_floor_shift(
+                accumulator * params->product_to_output_q31 +
+                    (INT64_C(1) << 30),
+                31) + params->output_zero_point;
+            output[column] = static_cast<uint8_t>(
+                std::clamp<int64_t>(quantized, 0, UINT8_MAX));
+        }
+    }
+}
+
+void qnn_u8_u8_matmul_heads_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * head_params =
+        static_cast<const qnn_u16_head_params<qnn_u8_u8_matmul_params> *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(head_params != nullptr && head_params->values != nullptr);
+    GGML_ASSERT(input != nullptr && input->type == GGML_TYPE_U8);
+    GGML_ASSERT(dst->type == GGML_TYPE_U8 && input->ne[1] == head_params->n_head);
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const auto & params = head_params->values[row % head_params->n_head];
+        const uint8_t * source = qnn_u8_row(input, row);
+        uint8_t * output = qnn_u8_row(dst, row);
+        for (int64_t column = 0; column < params.output_dimension; ++column) {
+            int64_t accumulator = 0;
+            for (int64_t index = 0; index < params.input_dimension; ++index) {
+                accumulator +=
+                    (static_cast<int32_t>(source[index]) -
+                        params.input_zero_point) *
+                    (static_cast<int32_t>(params.weights[
+                        index * params.output_dimension + column]) -
+                        params.weight_zero_point);
+            }
+            const int64_t quantized = qnn_floor_shift(
+                accumulator * params.product_to_output_q31 +
+                    (INT64_C(1) << 30),
+                31) + params.output_zero_point;
+            output[column] = static_cast<uint8_t>(
+                std::clamp<int64_t>(quantized, 0, UINT8_MAX));
+        }
     }
 }
 
@@ -868,6 +1666,38 @@ void qnn_u16_to_u8_heads_compute(
             n, output, qnn_u16_row(input, row),
             params.input_zero_point, params.input_to_output_q31,
             params.output_zero_point);
+    }
+}
+
+void qnn_u8_to_u8_heads_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * head_params =
+        static_cast<const qnn_u16_head_params<qnn_u16_to_u8_params> *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    GGML_ASSERT(head_params != nullptr && head_params->values != nullptr);
+    GGML_ASSERT(input != nullptr && input->type == GGML_TYPE_U8);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8 && input->ne[1] == head_params->n_head);
+    const int64_t rows = qnn_u16_rows(input);
+    for (int64_t row = ith; row < rows; row += nth) {
+        const auto & params = head_params->values[row % head_params->n_head];
+        const uint8_t * source = qnn_u8_row(input, row);
+        uint8_t * output = reinterpret_cast<uint8_t *>(dst->data) +
+            (row % dst->ne[1]) * dst->nb[1] +
+            ((row / dst->ne[1]) % dst->ne[2]) * dst->nb[2] +
+            (row / (dst->ne[1] * dst->ne[2])) * dst->nb[3];
+        for (int64_t index = 0; index < input->ne[0]; ++index) {
+            const int64_t centered =
+                static_cast<int32_t>(source[index]) - params.input_zero_point;
+            const int64_t code = qnn_floor_shift(
+                centered * params.input_to_output_q31 +
+                    (INT64_C(1) << 30),
+                31) + params.output_zero_point;
+            output[index] = static_cast<uint8_t>(
+                std::clamp<int64_t>(code, 0, UINT8_MAX));
+        }
     }
 }
 
@@ -1017,12 +1847,31 @@ void qnn_u16_apply_attention_softmax(
         uint16_t * output,
         const uint16_t * score,
         const uint8_t * condition,
-        const qnn_u16_attention_softmax_params & params) {
+        const qnn_u16_attention_softmax_params & params,
+        bool condition_all_true = false) {
     ggml_vec_requant_u16_qnn_fixed(
         n, output, score,
         params.divide.input_zero_point,
         params.divide.input_to_output_q20,
         params.divide.output_zero_point);
+    const char * const all_true_value =
+        std::getenv("GGML_QNN_ATTN_ALL_TRUE_FAST");
+    const bool all_true = condition_all_true &&
+        (all_true_value == nullptr ||
+         (std::strcmp(all_true_value, "0") != 0 &&
+          std::strcmp(all_true_value, "off") != 0 &&
+          std::strcmp(all_true_value, "false") != 0));
+    if (all_true) {
+        ggml_vec_requant_u16_qnn_q15(
+            n, output, output, params.select.true_zero_point,
+            params.select.true_multiplier_q15,
+            params.select.true_right_shift, params.select.output_zero_point);
+        ggml_vec_softmax_u16_qnn_fixed(
+            n, output, output, params.softmax.scale_over_ln2_q24,
+            params.softmax.output_unit_code, params.softmax.output_zero_point,
+            params.softmax.exp2_lut_q31);
+        return;
+    }
     const uint16_t minimum = ggml_vec_min_u16_qnn(n, output);
     uint16_t requantized_minimum;
     ggml_vec_requant_u16_qnn_fixed(
@@ -1100,7 +1949,8 @@ void qnn_u16_attention_compute(
     GGML_ASSERT(query->ne[0] == dst->ne[0] && query->ne[1] == params->n_head);
     GGML_ASSERT(dst->ne[1] == params->n_head && query->ne[2] == dst->ne[2]);
     GGML_ASSERT(key->ne[0] == query->ne[0] && key->ne[2] == params->n_head_kv);
-    GGML_ASSERT(value->ne[0] == query->ne[0] && value->ne[1] == params->n_head_kv);
+    GGML_ASSERT(value->ne[0] == query->ne[0]);
+    GGML_ASSERT(value->ne[1] == params->n_head_kv);
     GGML_ASSERT(value->ne[2] == key->ne[1]);
     GGML_ASSERT(condition->ne[0] == key->ne[1]);
     GGML_ASSERT(condition->ne[1] == query->ne[2]);
@@ -1117,6 +1967,244 @@ void qnn_u16_attention_compute(
     score0.resize(n_kv);
     score1.resize(n_kv);
 
+    const char * const valid_prefix_value =
+        std::getenv("GGML_QNN_ATTN_VALID_PREFIX");
+    const bool valid_prefix = valid_prefix_value == nullptr ||
+        (std::strcmp(valid_prefix_value, "0") != 0 &&
+        std::strcmp(valid_prefix_value, "off") != 0 &&
+        std::strcmp(valid_prefix_value, "false") != 0);
+    thread_local std::vector<int> active_kv_counts;
+    thread_local std::vector<uint8_t> active_kv_all_true;
+    active_kv_counts.resize(query->ne[2]);
+    active_kv_all_true.resize(query->ne[2]);
+    for (int64_t token = 0; token < query->ne[2]; ++token) {
+        const uint8_t * row = qnn_u8_row(condition, token);
+        int count = n_kv;
+        if (valid_prefix) {
+            while (count > 1 && row[count - 1] == 0) {
+                --count;
+            }
+        }
+        bool all_true = true;
+        for (int index = 0; all_true && index < count; ++index) {
+            all_true = row[index] != 0;
+        }
+        active_kv_counts[token] = count;
+        active_kv_all_true[token] = all_true;
+    }
+
+    // Qwen3-4B GQA maps four adjacent query heads to one KV head. Process
+    // adjacent query heads as a pair so the exact pair kernels reuse each
+    // K/V load while retaining each head accumulator and requantization.
+    const char * const pair_parallel_value =
+        std::getenv("GGML_QNN_ATTN_PAIR_PARALLEL");
+    const bool pair_parallel_enabled = pair_parallel_value == nullptr ||
+        (std::strcmp(pair_parallel_value, "0") != 0 &&
+         std::strcmp(pair_parallel_value, "off") != 0 &&
+         std::strcmp(pair_parallel_value, "false") != 0);
+    bool mixed_pair_parallel = queries_per_kv > 3 && queries_per_kv % 2 == 1 &&
+        pair_parallel_enabled;
+    const int32_t pairs_per_kv = queries_per_kv / 2;
+    for (int32_t kv_head = 0;
+         mixed_pair_parallel && kv_head < params->n_head_kv;
+         ++kv_head) {
+        const int32_t first_head = kv_head * queries_per_kv;
+        for (int32_t pair = 0; pair < pairs_per_kv; ++pair) {
+            const int32_t head0 = first_head + pair * 2;
+            const int32_t head1 = head0 + 1;
+            mixed_pair_parallel =
+                params->heads[head0].score.weight_zero_point ==
+                    params->heads[head1].score.weight_zero_point &&
+                params->heads[head0].value.weight_zero_point ==
+                    params->heads[head1].value.weight_zero_point;
+            if (!mixed_pair_parallel) {
+                break;
+            }
+        }
+    }
+    if (mixed_pair_parallel) {
+        const int32_t work_items_per_kv = pairs_per_kv + 1;
+        const int32_t work_items_per_token =
+            params->n_head_kv * work_items_per_kv;
+        const int64_t work_items = query->ne[2] * work_items_per_token;
+        for (int64_t work = ith; work < work_items; work += nth) {
+            const int64_t token = work / work_items_per_token;
+            const int32_t token_work = work % work_items_per_token;
+            const int32_t kv_head = token_work / work_items_per_kv;
+            const int32_t kv_work = token_work % work_items_per_kv;
+            const int32_t first_head = kv_head * queries_per_kv;
+            const auto * key_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(key->data) +
+                kv_head * key->nb[2]);
+            const auto * value_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(value->data) +
+                kv_head * value->nb[1]);
+            const auto * condition_row = qnn_u8_row(condition, token);
+            const int active_n_kv = active_kv_counts[token];
+            const bool condition_all_true = active_kv_all_true[token];
+            if (kv_work < pairs_per_kv) {
+                const int32_t head0 = first_head + kv_work * 2;
+                const int32_t head1 = head0 + 1;
+                const int64_t row0 = token * params->n_head + head0;
+                const int64_t row1 = row0 + 1;
+                const auto & hp0 = params->heads[head0];
+                const auto & hp1 = params->heads[head1];
+                ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
+                    head_dimension, active_n_kv, key->nb[1],
+                    score0.data(), score1.data(),
+                    qnn_u16_row(query, row0), qnn_u16_row(query, row1),
+                    key_head,
+                    hp0.score.input_zero_point,
+                    hp1.score.input_zero_point,
+                    hp0.score.weight_zero_point,
+                    hp0.score.product_to_output_q20,
+                    hp1.score.product_to_output_q20,
+                    hp0.score.output_zero_point,
+                    hp1.score.output_zero_point);
+                qnn_u16_apply_attention_softmax(
+                    active_n_kv, score0.data(), score0.data(), condition_row,
+                    hp0.softmax, condition_all_true);
+                qnn_u16_apply_attention_softmax(
+                    active_n_kv, score1.data(), score1.data(), condition_row,
+                    hp1.softmax, condition_all_true);
+                ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
+                    active_n_kv, head_dimension, value->nb[2],
+                    qnn_u16_row(dst, row0), qnn_u16_row(dst, row1),
+                    score0.data(), score1.data(), value_head,
+                    hp0.value.input_zero_point,
+                    hp1.value.input_zero_point,
+                    hp0.value.weight_zero_point,
+                    hp0.value.product_to_output_q20,
+                    hp1.value.product_to_output_q20,
+                    hp0.value.output_zero_point,
+                    hp1.value.output_zero_point);
+            } else {
+                const int32_t head = first_head + queries_per_kv - 1;
+                const int64_t row = token * params->n_head + head;
+                const auto & hp = params->heads[head];
+                ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+                    head_dimension, active_n_kv, key->nb[1], score0.data(),
+                    qnn_u16_row(query, row), key_head,
+                    hp.score.input_zero_point,
+                    hp.score.weight_zero_point,
+                    hp.score.product_to_output_q20,
+                    hp.score.output_zero_point);
+                qnn_u16_apply_attention_softmax(
+                    active_n_kv, score0.data(), score0.data(), condition_row,
+                    hp.softmax, condition_all_true);
+                ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+                    active_n_kv, head_dimension, value->nb[2],
+                    qnn_u16_row(dst, row), score0.data(), value_head,
+                    hp.value.input_zero_point,
+                    hp.value.weight_zero_point,
+                    hp.value.product_to_output_q20,
+                    hp.value.output_zero_point);
+            }
+        }
+        return;
+    }
+
+    bool pair_parallel = queries_per_kv > 2 && queries_per_kv % 2 == 0 &&
+        pair_parallel_enabled;
+    for (int32_t head = 0; pair_parallel && head < params->n_head; head += 2) {
+        pair_parallel =
+            params->heads[head].score.weight_zero_point ==
+                params->heads[head + 1].score.weight_zero_point &&
+            params->heads[head].value.weight_zero_point ==
+                params->heads[head + 1].value.weight_zero_point;
+    }
+    if (pair_parallel) {
+        const int32_t pairs_per_token = params->n_head / 2;
+        const int64_t pair_rows = query->ne[2] * pairs_per_token;
+        for (int64_t pair_row = ith; pair_row < pair_rows; pair_row += nth) {
+            const int64_t token = pair_row / pairs_per_token;
+            const int32_t head0 = (pair_row % pairs_per_token) * 2;
+            const int32_t head1 = head0 + 1;
+            const int32_t kv_head = head0 / queries_per_kv;
+            const int64_t row0 = token * params->n_head + head0;
+            const int64_t row1 = row0 + 1;
+            const auto * key_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(key->data) +
+                kv_head * key->nb[2]);
+            const auto * value_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(value->data) +
+                kv_head * value->nb[1]);
+            const auto * condition_row = qnn_u8_row(condition, token);
+            const int active_n_kv = active_kv_counts[token];
+        const bool condition_all_true = active_kv_all_true[token];
+            const auto & hp0 = params->heads[head0];
+            const auto & hp1 = params->heads[head1];
+
+            ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
+                head_dimension, active_n_kv, key->nb[1],
+                score0.data(), score1.data(),
+                qnn_u16_row(query, row0), qnn_u16_row(query, row1), key_head,
+                hp0.score.input_zero_point, hp1.score.input_zero_point,
+                hp0.score.weight_zero_point,
+                hp0.score.product_to_output_q20,
+                hp1.score.product_to_output_q20,
+                hp0.score.output_zero_point, hp1.score.output_zero_point);
+            qnn_u16_apply_attention_softmax(
+                active_n_kv, score0.data(), score0.data(), condition_row, hp0.softmax, condition_all_true);
+            qnn_u16_apply_attention_softmax(
+                active_n_kv, score1.data(), score1.data(), condition_row, hp1.softmax, condition_all_true);
+            ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
+                active_n_kv, head_dimension, value->nb[2],
+                qnn_u16_row(dst, row0), qnn_u16_row(dst, row1),
+                score0.data(), score1.data(), value_head,
+                hp0.value.input_zero_point, hp1.value.input_zero_point,
+                hp0.value.weight_zero_point,
+                hp0.value.product_to_output_q20,
+                hp1.value.product_to_output_q20,
+                hp0.value.output_zero_point, hp1.value.output_zero_point);
+        }
+        return;
+    }
+
+    // Qwen3-4B has four query heads per KV head. Scheduling by KV group gives
+    // six workers an imbalanced 2,2,1,1,1,1 split, while the paired two-head
+    // path below cannot be selected. Schedule independent query heads instead;
+    // this preserves each head's arithmetic order and only changes ownership.
+    const char * const head_parallel_value =
+        std::getenv("GGML_QNN_ATTN_HEAD_PARALLEL");
+    const bool head_parallel = queries_per_kv > 2 &&
+        (head_parallel_value == nullptr ||
+         (std::strcmp(head_parallel_value, "0") != 0 &&
+          std::strcmp(head_parallel_value, "off") != 0 &&
+          std::strcmp(head_parallel_value, "false") != 0));
+    if (head_parallel) {
+        const int64_t head_rows = query->ne[2] * params->n_head;
+        for (int64_t row = ith; row < head_rows; row += nth) {
+            const int64_t token = row / params->n_head;
+            const int32_t head = row % params->n_head;
+            const int32_t kv_head = head / queries_per_kv;
+            const auto * key_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(key->data) +
+                kv_head * key->nb[2]);
+            const auto * value_head = reinterpret_cast<const uint8_t *>(
+                reinterpret_cast<const char *>(value->data) +
+                kv_head * value->nb[1]);
+            const auto * condition_row = qnn_u8_row(condition, token);
+            const int active_n_kv = active_kv_counts[token];
+            const bool condition_all_true = active_kv_all_true[token];
+            const auto & hp = params->heads[head];
+
+            ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
+                head_dimension, active_n_kv, key->nb[1],
+                score0.data(), qnn_u16_row(query, row), key_head,
+                hp.score.input_zero_point, hp.score.weight_zero_point,
+                hp.score.product_to_output_q20, hp.score.output_zero_point);
+            qnn_u16_apply_attention_softmax(
+                active_n_kv, score0.data(), score0.data(), condition_row, hp.softmax, condition_all_true);
+            ggml_vec_matmul_u16_u8_qnn_fixed_strided(
+                active_n_kv, head_dimension, value->nb[2],
+                qnn_u16_row(dst, row), score0.data(), value_head,
+                hp.value.input_zero_point, hp.value.weight_zero_point,
+                hp.value.product_to_output_q20, hp.value.output_zero_point);
+        }
+        return;
+    }
+
     for (int64_t group = ith; group < groups; group += nth) {
         const int64_t token = group / params->n_head_kv;
         const int32_t kv_head = group % params->n_head_kv;
@@ -1125,6 +2213,8 @@ void qnn_u16_attention_compute(
         const auto * value_head = reinterpret_cast<const uint8_t *>(
             reinterpret_cast<const char *>(value->data) + kv_head * value->nb[1]);
         const auto * condition_row = qnn_u8_row(condition, token);
+        const int active_n_kv = active_kv_counts[token];
+            const bool condition_all_true = active_kv_all_true[token];
 
         if (queries_per_kv == 2) {
             const int32_t head0 = kv_head * 2;
@@ -1136,7 +2226,7 @@ void qnn_u16_attention_compute(
             if (hp0.score.weight_zero_point == hp1.score.weight_zero_point &&
                     hp0.value.weight_zero_point == hp1.value.weight_zero_point) {
                 ggml_vec_matmul_u16_u8_qnn_fixed_token_major_pair(
-                    head_dimension, n_kv, key->nb[1],
+                    head_dimension, active_n_kv, key->nb[1],
                     score0.data(), score1.data(),
                     qnn_u16_row(query, row0), qnn_u16_row(query, row1),
                     key_head,
@@ -1149,14 +2239,14 @@ void qnn_u16_attention_compute(
                     hp1.score.output_zero_point);
 
                 qnn_u16_apply_attention_softmax(
-                    n_kv, score0.data(), score0.data(), condition_row,
-                    hp0.softmax);
+                    active_n_kv, score0.data(), score0.data(), condition_row,
+                    hp0.softmax, condition_all_true);
                 qnn_u16_apply_attention_softmax(
-                    n_kv, score1.data(), score1.data(), condition_row,
-                    hp1.softmax);
+                    active_n_kv, score1.data(), score1.data(), condition_row,
+                    hp1.softmax, condition_all_true);
 
                 ggml_vec_matmul_u16_u8_qnn_fixed_strided_pair(
-                    n_kv, head_dimension, value->nb[2],
+                    active_n_kv, head_dimension, value->nb[2],
                     qnn_u16_row(dst, row0), qnn_u16_row(dst, row1),
                     score0.data(), score1.data(), value_head,
                     hp0.value.input_zero_point,
@@ -1176,7 +2266,7 @@ void qnn_u16_attention_compute(
             const auto & hp = params->heads[head];
 
             ggml_vec_matmul_u16_u8_qnn_fixed_token_major(
-                head_dimension, n_kv, key->nb[1],
+                head_dimension, active_n_kv, key->nb[1],
                 score0.data(), qnn_u16_row(query, row), key_head,
                 hp.score.input_zero_point,
                 hp.score.weight_zero_point,
@@ -1186,10 +2276,10 @@ void qnn_u16_attention_compute(
             // Preserve the exact exported QNN fixed-point boundaries while
             // keeping the score row thread-local instead of a graph tensor.
             qnn_u16_apply_attention_softmax(
-                n_kv, score0.data(), score0.data(), condition_row, hp.softmax);
+                active_n_kv, score0.data(), score0.data(), condition_row, hp.softmax, condition_all_true);
 
             ggml_vec_matmul_u16_u8_qnn_fixed_strided(
-                n_kv, head_dimension, value->nb[2],
+                active_n_kv, head_dimension, value->nb[2],
                 qnn_u16_row(dst, row), score0.data(), value_head,
                 hp.value.input_zero_point,
                 hp.value.weight_zero_point,
@@ -1199,12 +2289,366 @@ void qnn_u16_attention_compute(
     }
 }
 
+uint8_t qnn_u8_requant_q20(
+        uint8_t code,
+        const qnn_u16_unary_requant_params & params) {
+    const int64_t centered = static_cast<int32_t>(code) - params.input_zero_point;
+    const int64_t output = qnn_round_shift_away_from_zero(
+        centered * params.input_to_output_q20, 20) + params.output_zero_point;
+    return static_cast<uint8_t>(std::clamp<int64_t>(output, 0, UINT8_MAX));
+}
+
+uint8_t qnn_u8_select_code(
+        bool condition,
+        uint8_t when_true,
+        uint8_t when_false,
+        const qnn_u16_select_params & params) {
+    const int64_t product = condition
+        ? (static_cast<int32_t>(when_true) - params.true_zero_point) *
+            params.true_multiplier_q15
+        : (static_cast<int32_t>(when_false) - params.false_zero_point) *
+            params.false_multiplier_q15;
+    const int32_t shift = condition
+        ? params.true_right_shift : params.false_right_shift;
+    const int64_t code = qnn_floor_shift(
+        product + (INT64_C(1) << (shift - 1)), shift) +
+        params.output_zero_point;
+    return static_cast<uint8_t>(std::clamp<int64_t>(code, 0, UINT8_MAX));
+}
+
+void qnn_u8_apply_attention_softmax(
+        int n,
+        uint8_t * codes,
+        const uint8_t * condition,
+        const qnn_u8_attention_softmax_params & params) {
+    for (int index = 0; index < n; ++index) {
+        codes[index] = qnn_u8_requant_q20(codes[index], params.divide);
+    }
+    const char * masked_value = std::getenv("GGML_QNN_A8_MASKED_SOFTMAX");
+    const bool use_masked_softmax = masked_value == nullptr ||
+        is_enabled_value(masked_value);
+    if (use_masked_softmax) {
+        ggml_vec_softmax_u8_qnn_fixed_masked(
+            n, codes, codes, condition, params.masked_scale_over_ln2_q24,
+            params.softmax.output_unit_code, params.softmax.output_zero_point);
+        return;
+    }
+    uint8_t minimum = UINT8_MAX;
+    for (int index = 0; index < n; ++index) {
+        minimum = std::min(minimum, codes[index]);
+    }
+    const uint8_t requantized_minimum = params.minimum_lut != nullptr
+        ? static_cast<uint8_t>(params.minimum_lut[minimum])
+        : qnn_u8_requant_q20(minimum, params.minimum);
+    const uint8_t mask_floor = qnn_u8_add_subtract_code(
+        requantized_minimum, params.floor_rhs_code, params.floor_add);
+    for (int index = 0; index < n; ++index) {
+        codes[index] = qnn_u8_select_code(
+            condition[index] != 0, codes[index], mask_floor, params.select);
+    }
+    ggml_vec_softmax_u8_qnn_fixed(
+        n, codes, codes, params.softmax.scale_over_ln2_q24,
+        params.softmax.output_unit_code, params.softmax.output_zero_point,
+        params.softmax.exp2_lut_q31);
+}
+
+int32_t qnn_u8_attention_cache_code(
+        uint8_t code,
+        const qnn_u8_attention_matmul_params & params) {
+    const int64_t centered = static_cast<int32_t>(code) - params.cache_zero_point;
+    const int64_t converted = qnn_floor_shift(
+        centered * params.cache_to_weight_q31 + (INT64_C(1) << 30), 31) +
+        params.weight_zero_point;
+    return static_cast<int32_t>(params.weight_signed
+        ? std::clamp<int64_t>(converted, INT8_MIN, INT8_MAX)
+        : std::clamp<int64_t>(converted, 0, UINT8_MAX));
+}
+
+uint8_t qnn_u8_attention_matmul_code(
+        int64_t accumulator,
+        const qnn_u8_attention_matmul_params & params) {
+    int64_t code = qnn_floor_shift(
+        accumulator * params.product_to_output_q31 + (INT64_C(1) << 30), 31) +
+        params.output_zero_point;
+    code = std::clamp<int64_t>(code, 0, UINT8_MAX);
+    while (code > 0 && accumulator < params.output_thresholds[code]) {
+        --code;
+    }
+    while (code < UINT8_MAX && accumulator >= params.output_thresholds[code + 1]) {
+        ++code;
+    }
+    return static_cast<uint8_t>(code);
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+__attribute__((target("dotprod")))
+int32_t qnn_s8_dotprod(int n, const int8_t * lhs, const int8_t * rhs) {
+    int32x4_t accumulator = vdupq_n_s32(0);
+    int index = 0;
+    for (; index + 16 <= n; index += 16) {
+        accumulator = vdotq_s32(
+            accumulator, vld1q_s8(lhs + index), vld1q_s8(rhs + index));
+    }
+    int32_t result = vaddvq_s32(accumulator);
+    for (; index < n; ++index) {
+        result += static_cast<int32_t>(lhs[index]) * rhs[index];
+    }
+    return result;
+}
+
+void qnn_u8_attention_value_rowmajor(
+        int head_dimension,
+        int n_kv,
+        const int8_t * score_low,
+        const int8_t * score_high,
+        const uint8_t * values,
+        size_t value_stride,
+        int32_t * output) {
+    GGML_ASSERT(head_dimension % 16 == 0);
+    const uint8x16_t sign_bit = vdupq_n_u8(0x80);
+    const int8x16_t minimum = vdupq_n_s8(-127);
+    for (int column = 0; column < head_dimension; column += 16) {
+        int32x4_t accumulator0 = vdupq_n_s32(0);
+        int32x4_t accumulator1 = vdupq_n_s32(0);
+        int32x4_t accumulator2 = vdupq_n_s32(0);
+        int32x4_t accumulator3 = vdupq_n_s32(0);
+        for (int kv = 0; kv < n_kv; ++kv) {
+            const int8x16_t value = vmaxq_s8(
+                vreinterpretq_s8_u8(veorq_u8(
+                    vld1q_u8(values + kv * value_stride + column), sign_bit)),
+                minimum);
+            const int8x8_t low_value = vget_low_s8(value);
+            const int8x8_t high_value = vget_high_s8(value);
+            const int8x8_t low_score = vdup_n_s8(score_low[kv]);
+            const int8x8_t high_score = vdup_n_s8(score_high[kv]);
+            const int16x8_t product_low0 = vmull_s8(low_value, low_score);
+            const int16x8_t product_low1 = vmull_s8(high_value, low_score);
+            const int16x8_t product_high0 = vmull_s8(low_value, high_score);
+            const int16x8_t product_high1 = vmull_s8(high_value, high_score);
+            accumulator0 = vaddq_s32(accumulator0, vaddq_s32(
+                vmovl_s16(vget_low_s16(product_low0)),
+                vshlq_n_s32(vmovl_s16(vget_low_s16(product_high0)), 7)));
+            accumulator1 = vaddq_s32(accumulator1, vaddq_s32(
+                vmovl_s16(vget_high_s16(product_low0)),
+                vshlq_n_s32(vmovl_s16(vget_high_s16(product_high0)), 7)));
+            accumulator2 = vaddq_s32(accumulator2, vaddq_s32(
+                vmovl_s16(vget_low_s16(product_low1)),
+                vshlq_n_s32(vmovl_s16(vget_low_s16(product_high1)), 7)));
+            accumulator3 = vaddq_s32(accumulator3, vaddq_s32(
+                vmovl_s16(vget_high_s16(product_low1)),
+                vshlq_n_s32(vmovl_s16(vget_high_s16(product_high1)), 7)));
+        }
+        vst1q_s32(output + column, accumulator0);
+        vst1q_s32(output + column + 4, accumulator1);
+        vst1q_s32(output + column + 8, accumulator2);
+        vst1q_s32(output + column + 12, accumulator3);
+    }
+}
+
+#endif
+
+bool qnn_u8_attention_score_dotprod_enabled() {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+    static const bool enabled =
+        is_enabled_value(std::getenv("GGML_QNN_A8_ATTN_SCORE_DOTPROD")) &&
+        ggml_gptq2_32_gs32_dotprod_enabled();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool qnn_u8_attention_value_dotprod_enabled() {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+    static const bool enabled =
+        is_enabled_value(std::getenv("GGML_QNN_A8_ATTN_VALUE_DOTPROD")) &&
+        ggml_gptq2_32_gs32_dotprod_enabled();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool qnn_u8_attention_value_rowmajor_enabled() {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+    static const bool enabled =
+        is_enabled_value(std::getenv("GGML_QNN_A8_ATTN_VALUE_ROWMAJOR"));
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+void qnn_u8_attention_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * params = static_cast<const qnn_u8_attention_params *>(userdata);
+    const ggml_tensor * query = dst->src[0];
+    const ggml_tensor * key = dst->src[1];
+    const ggml_tensor * value = dst->src[2];
+    const ggml_tensor * condition = dst->src[3];
+    GGML_ASSERT(params != nullptr && params->heads != nullptr);
+    GGML_ASSERT(query != nullptr && key != nullptr && value != nullptr && condition != nullptr);
+    GGML_ASSERT(query->type == GGML_TYPE_U8 && key->type == GGML_TYPE_I8);
+    GGML_ASSERT(value->type == GGML_TYPE_I8 && condition->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(query->ne[1] == params->n_head);
+    GGML_ASSERT(key->ne[2] == params->n_head_kv && value->ne[1] == params->n_head_kv);
+    GGML_ASSERT(params->n_head % params->n_head_kv == 0);
+    const int head_dimension = static_cast<int>(query->ne[0]);
+    const int n_kv = static_cast<int>(key->ne[1]);
+    const int queries_per_kv = params->n_head / params->n_head_kv;
+    const int64_t groups = query->ne[2] * params->n_head_kv;
+    thread_local std::vector<uint8_t> scores;
+    thread_local std::vector<int8_t> centered_query;
+    thread_local std::vector<int8_t> centered_key;
+    thread_local std::vector<int8_t> score_low;
+    thread_local std::vector<int8_t> score_high;
+    thread_local std::vector<int8_t> centered_value;
+    thread_local std::vector<int32_t> value_accumulators;
+    scores.resize(n_kv);
+    for (int64_t group = ith; group < groups; group += nth) {
+        const int64_t token = group / params->n_head_kv;
+        const int32_t kv_head = group % params->n_head_kv;
+        const uint8_t * key_head = reinterpret_cast<const uint8_t *>(
+            reinterpret_cast<const char *>(key->data) + kv_head * key->nb[2]);
+        const uint8_t * value_head = reinterpret_cast<const uint8_t *>(
+            reinterpret_cast<const char *>(value->data) + kv_head * value->nb[1]);
+        const uint8_t * condition_row = qnn_u8_row(condition, token);
+        for (int32_t offset = 0; offset < queries_per_kv; ++offset) {
+            const int32_t head = kv_head * queries_per_kv + offset;
+            const int64_t row = token * params->n_head + head;
+            const auto & hp = params->heads[head];
+            const uint8_t * query_row = qnn_u8_row(query, row);
+            bool use_score_dotprod =
+                qnn_u8_attention_score_dotprod_enabled() &&
+                hp.score.centered_cache_lut_valid;
+            if (use_score_dotprod) {
+                centered_query.resize(head_dimension);
+                centered_key.resize(head_dimension);
+                for (int index = 0; index < head_dimension; ++index) {
+                    const int32_t centered =
+                        static_cast<int32_t>(query_row[index]) -
+                        hp.score.input_zero_point;
+                    if (centered < INT8_MIN || centered > INT8_MAX) {
+                        use_score_dotprod = false;
+                        break;
+                    }
+                    centered_query[index] = static_cast<int8_t>(centered);
+                }
+            }
+            for (int kv = 0; kv < n_kv; ++kv) {
+                const uint8_t * key_row = key_head + kv * key->nb[1];
+                int64_t accumulator = 0;
+                if (use_score_dotprod) {
+                    for (int index = 0; index < head_dimension; ++index) {
+                        centered_key[index] =
+                            hp.score.centered_cache_lut[key_row[index]];
+                    }
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+                    accumulator = qnn_s8_dotprod(
+                        head_dimension, centered_query.data(), centered_key.data());
+#endif
+                } else {
+                    for (int index = 0; index < head_dimension; ++index) {
+                        const int32_t key_code = qnn_u8_attention_cache_code(
+                            key_row[index], hp.score);
+                        accumulator +=
+                            (static_cast<int32_t>(query_row[index]) -
+                                hp.score.input_zero_point) *
+                            (key_code - hp.score.weight_zero_point);
+                    }
+                }
+                scores[kv] = qnn_u8_attention_matmul_code(accumulator, hp.score);
+            }
+            qnn_u8_apply_attention_softmax(
+                n_kv, scores.data(), condition_row, hp.softmax);
+            const bool use_value_dotprod =
+                qnn_u8_attention_value_dotprod_enabled() &&
+                hp.value.centered_cache_lut_valid;
+            const bool use_value_rowmajor =
+                qnn_u8_attention_value_rowmajor_enabled() &&
+                hp.value.centered_cache_xor128_clamp &&
+                head_dimension % 16 == 0;
+            if (use_value_dotprod || use_value_rowmajor) {
+                score_low.resize(n_kv);
+                score_high.resize(n_kv);
+                if (use_value_dotprod && !use_value_rowmajor) {
+                    centered_value.resize(n_kv);
+                }
+                for (int kv = 0; kv < n_kv; ++kv) {
+                    const int32_t centered =
+                        static_cast<int32_t>(scores[kv]) -
+                        hp.value.input_zero_point;
+                    const int32_t high = static_cast<int32_t>(
+                        qnn_floor_shift(centered, 7));
+                    score_low[kv] = static_cast<int8_t>(centered - 128 * high);
+                    score_high[kv] = static_cast<int8_t>(high);
+                }
+            }
+            uint8_t * output = qnn_u8_row(dst, row);
+            if (use_value_rowmajor) {
+                value_accumulators.resize(head_dimension);
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+                qnn_u8_attention_value_rowmajor(
+                    head_dimension, n_kv, score_low.data(), score_high.data(),
+                    value_head, value->nb[2], value_accumulators.data());
+#endif
+                for (int column = 0; column < head_dimension; ++column) {
+                    output[column] = qnn_u8_attention_matmul_code(
+                        value_accumulators[column], hp.value);
+                }
+                continue;
+            }
+            for (int column = 0; column < head_dimension; ++column) {
+                int64_t accumulator = 0;
+                if (use_value_dotprod) {
+                    for (int kv = 0; kv < n_kv; ++kv) {
+                        centered_value[kv] = hp.value.centered_cache_lut[
+                            value_head[kv * value->nb[2] + column]];
+                    }
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__clang__)
+                    accumulator = qnn_s8_dotprod(
+                        n_kv, score_low.data(), centered_value.data());
+                    accumulator += INT64_C(128) * qnn_s8_dotprod(
+                        n_kv, score_high.data(), centered_value.data());
+#endif
+                } else {
+                    for (int kv = 0; kv < n_kv; ++kv) {
+                        const int32_t weight = qnn_u8_attention_cache_code(
+                            value_head[kv * value->nb[2] + column], hp.value);
+                        accumulator +=
+                            (static_cast<int32_t>(scores[kv]) -
+                                hp.value.input_zero_point) *
+                            (weight - hp.value.weight_zero_point);
+                    }
+                }
+                output[column] = qnn_u8_attention_matmul_code(accumulator, hp.value);
+            }
+        }
+    }
+}
+
+bool qnn_dynamic_a8_gemv_enabled(
+        int64_t columns,
+        const llama_qnn_linear_qparams * qparams);
+
+void qnn_dynamic_a8_mul_mat_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        qnn_u16_mul_mat_runtime_params * runtime);
+
 void qnn_u16_mul_mat_compute(
         ggml_tensor * dst,
         int ith,
         int nth,
         void * userdata) {
-    const auto * qparams = static_cast<const llama_qnn_linear_qparams *>(userdata);
+    auto * runtime =
+        static_cast<qnn_u16_mul_mat_runtime_params *>(userdata);
+    const auto * qparams = runtime->qparams;
     const ggml_tensor * input = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
@@ -1255,6 +2699,20 @@ void qnn_u16_mul_mat_compute(
         weights->type == GGML_TYPE_GPTQ2_32 ? 32 :
         weights->type == GGML_TYPE_GPTQ2_64 ? 64 : 128;
     const int64_t vectors = input->ne[1] * input->ne[2] * input->ne[3];
+    const bool use_qwen3_4b_dynamic_a8 =
+        vectors == 1 &&
+        has_qnn_block_scales &&
+        qparams->qnn_weight_block_codes_prepared &&
+        qparams->weights_gs32_source &&
+        weights->type == GGML_TYPE_GPTQ2_32 &&
+        rows % 16 == 0 &&
+        qparams->qnn_weight_block_code_layout ==
+            LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR &&
+        qnn_dynamic_a8_gemv_enabled(weights->ne[0], qparams);
+    if (use_qwen3_4b_dynamic_a8) {
+        qnn_dynamic_a8_mul_mat_compute(dst, ith, nth, runtime);
+        return;
+    }
     if (has_qnn_block_scales &&
         qparams->qnn_weight_block_codes_prepared &&
         source_group_size == 32) {
@@ -1501,6 +2959,483 @@ void qnn_u16_mul_mat_compute(
     }
 }
 
+// Native A8 Decode projection. Activations are consumed directly as affine
+// U8 codes by the UDOT GS32 kernel; no U16 staging buffer is permitted here.
+void qnn_u8_mul_mat_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        void * userdata) {
+    const auto * qparams =
+        static_cast<const llama_qnn_linear_qparams *>(userdata);
+    const ggml_tensor * input = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    GGML_ASSERT(qparams != nullptr && input != nullptr && weights != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_U8 && dst->type == GGML_TYPE_U8);
+    GGML_ASSERT(weights->type == GGML_TYPE_GPTQ2_32);
+    GGML_ASSERT(weights->ne[0] == input->ne[0]);
+    GGML_ASSERT(weights->ne[2] == 1 && weights->ne[3] == 1);
+    GGML_ASSERT(input->nb[0] == sizeof(uint8_t));
+    GGML_ASSERT(dst->nb[0] == sizeof(uint8_t));
+    GGML_ASSERT(qparams->weights_gs32_source);
+    GGML_ASSERT(qparams->qnn_weight_block_size == 32);
+    GGML_ASSERT(qparams->qnn_weight_block_codes_prepared);
+    GGML_ASSERT(qparams->qnn_weight_block_code_layout ==
+        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR);
+    GGML_ASSERT(qparams->input.zero_point >= 0 &&
+        qparams->input.zero_point <= UINT8_MAX);
+    GGML_ASSERT(qparams->output.zero_point >= 0 &&
+        qparams->output.zero_point <= UINT8_MAX);
+
+    const int64_t rows = weights->ne[1];
+    const int64_t columns = weights->ne[0];
+    const int64_t blocks = columns / 32;
+    GGML_ASSERT(columns > 0 && columns % 32 == 0);
+    GGML_ASSERT(rows > 0 && rows % 16 == 0);
+    GGML_ASSERT(qparams->qnn_weight_blocks_per_row == blocks);
+    GGML_ASSERT(qparams->qnn_weight_block_scale_codes.size() ==
+        static_cast<size_t>(rows * blocks));
+    GGML_ASSERT(qparams->qnn_channel_scale_to_output_q31.size() ==
+        static_cast<size_t>(rows));
+    GGML_ASSERT(qparams->qnn_prepared_weight_sums.size() ==
+        static_cast<size_t>(rows));
+
+    const int64_t vectors = input->ne[1] * input->ne[2] * input->ne[3];
+    const int64_t row_groups = rows / 16;
+    const int64_t work_items = row_groups * vectors;
+    const int64_t work_begin = vectors == 1 ? work_items * ith / nth : ith;
+    const int64_t work_end = vectors == 1 ? work_items * (ith + 1) / nth : work_items;
+    const int64_t work_stride = vectors == 1 ? 1 : nth;
+    for (int64_t work = work_begin; work < work_end; work += work_stride) {
+        const int64_t vector = work / row_groups;
+        const int64_t row = (work - vector * row_groups) * 16;
+        const uint8_t * activation = qnn_u8_row(input, vector);
+        uint8_t * output = qnn_u8_row(dst, vector) + row;
+        int64_t centered_dots[16];
+        ggml_gptq2_32_gs32_u8_centered_dot_16rows(
+            static_cast<int>(columns), centered_dots, weights->data, row,
+            activation,
+            qparams->qnn_weight_block_scale_codes.data() + row * blocks,
+            qparams->qnn_prepared_weight_sums.data() + row,
+            qparams->input.zero_point);
+        for (int output_row = 0; output_row < 16; ++output_row) {
+            const int64_t multiplier =
+                qparams->qnn_channel_scale_to_output_q31[row + output_row];
+            output[output_row] = qnn_u8_hmx_conv2d_code(
+                centered_dots[output_row], multiplier,
+                qparams->output.zero_point);
+        }
+    }
+}
+
+// Default decode GEMV path for every compatible model: dynamically compress
+// one U16 activation row to symmetric A8, run the native GS32 I8MM and
+// DOTPROD kernel, then requantize into the original U16 graph domain. Models
+// that do not satisfy the caller's GPTQ2_32, GS32 and native-layout contract
+// fall back to the established A16 implementation before this selector.
+bool qnn_dynamic_a8_gemv_enabled(
+        int64_t columns,
+        const llama_qnn_linear_qparams * qparams) {
+    GGML_ASSERT(columns > 0 && columns % 32 == 0);
+    const char * enabled_value = std::getenv("GGML_QNN_DYNAMIC_A8_GEMV");
+    const bool enabled = enabled_value == nullptr ||
+        !(std::strcmp(enabled_value, "0") == 0 ||
+          std::strcmp(enabled_value, "false") == 0 ||
+          std::strcmp(enabled_value, "FALSE") == 0 ||
+          std::strcmp(enabled_value, "off") == 0 ||
+          std::strcmp(enabled_value, "OFF") == 0);
+    const char * scope = std::getenv("GGML_QNN_DYNAMIC_A8_SCOPE");
+    if (scope == nullptr) {
+        scope = std::getenv("GGML_QNN_QWEN3_4B_DYNAMIC_A8_SCOPE");
+    }
+    const bool down_projection =
+        qparams != nullptr && qparams->projection == "mlp.down_proj";
+    const char * selected_scope =
+        scope == nullptr || scope[0] == '\0' ? "all" : scope;
+    const bool scope_selected = std::strcmp(selected_scope, "all") == 0 ||
+        (std::strcmp(selected_scope, "down_proj") == 0 && down_projection);
+    const bool selected = enabled && scope_selected;
+    if (selected) {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (reported.compare_exchange_strong(expected, true)) {
+            std::fprintf(stderr,
+                "qnn-u16: default dynamic A8 GEMV enabled "
+                "(A16 graph I/O, scope=%s, columns=%lld)\n",
+                selected_scope, static_cast<long long>(columns));
+        }
+    }
+    return selected;
+}
+
+int64_t qnn_round_divide_nearest(int64_t numerator, int64_t denominator) {
+    GGML_ASSERT(denominator > 0);
+    const int64_t half = denominator / 2;
+    return numerator >= 0
+        ? (numerator + half) / denominator
+        : -((-numerator + half) / denominator);
+}
+
+// Exact over the dynamic-A8 domain: |numerator| <= 127.5 * denominator
+// and denominator <= 65535. A floor Q32 reciprocal can underestimate the
+// quotient by at most one, so one correction replaces the per-element divide.
+inline int64_t qnn_round_divide_nearest_recip32(
+        int64_t numerator, int64_t denominator, uint64_t reciprocal_q32) {
+    GGML_ASSERT(denominator > 0 && numerator != INT64_MIN);
+    const uint64_t magnitude = numerator >= 0
+        ? static_cast<uint64_t>(numerator)
+        : static_cast<uint64_t>(-numerator);
+    const uint64_t adjusted = magnitude + static_cast<uint64_t>(denominator / 2);
+    uint64_t quotient = (adjusted * reciprocal_q32) >> 32;
+    quotient += adjusted - quotient * static_cast<uint64_t>(denominator) >=
+        static_cast<uint64_t>(denominator);
+    return numerator >= 0
+        ? static_cast<int64_t>(quotient)
+        : -static_cast<int64_t>(quotient);
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+inline int32x4_t qnn_dynamic_a8_quantize_i32x4(
+        int32x4_t centered, uint32_t denominator, uint32_t reciprocal_q32) {
+    const uint32x4_t magnitude = vreinterpretq_u32_s32(vabsq_s32(centered));
+    const uint32x4_t adjusted = vaddq_u32(
+        vmulq_n_u32(magnitude, 127), vdupq_n_u32(denominator / 2));
+    const uint32x2_t reciprocal = vdup_n_u32(reciprocal_q32);
+    const uint32x4_t quotient0 = vcombine_u32(
+        vshrn_n_u64(vmull_u32(vget_low_u32(adjusted), reciprocal), 32),
+        vshrn_n_u64(vmull_u32(vget_high_u32(adjusted), reciprocal), 32));
+    const uint32x4_t remainder = vsubq_u32(
+        adjusted, vmulq_n_u32(quotient0, denominator));
+    const uint32x4_t quotient = vaddq_u32(quotient0, vshrq_n_u32(
+        vcgeq_u32(remainder, vdupq_n_u32(denominator)), 31));
+    const int32x4_t positive = vreinterpretq_s32_u32(quotient);
+    return vbslq_s32(vcltq_s32(centered, vdupq_n_s32(0)),
+        vnegq_s32(positive), positive);
+}
+
+inline void qnn_dynamic_a8_quantize_block_neon(
+        const uint16_t * input, int32_t zero_point, int32_t max_abs, int8_t * output) {
+    GGML_ASSERT(max_abs > 0 && max_abs <= UINT16_MAX);
+    const uint32_t denominator = static_cast<uint32_t>(max_abs);
+    const uint32_t reciprocal_q32 = denominator == 1 ? UINT32_MAX :
+        static_cast<uint32_t>((UINT64_C(1) << 32) / denominator);
+    const int32x4_t zero = vdupq_n_s32(zero_point);
+    for (int offset = 0; offset < 32; offset += 8) {
+        const uint16x8_t codes = vld1q_u16(input + offset);
+        const int32x4_t centered0 = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(codes))), zero);
+        const int32x4_t centered1 = vsubq_s32(
+            vreinterpretq_s32_u32(vmovl_high_u16(codes)), zero);
+        const int16x8_t quantized16 = vcombine_s16(
+            vqmovn_s32(qnn_dynamic_a8_quantize_i32x4(
+                centered0, denominator, reciprocal_q32)),
+            vqmovn_s32(qnn_dynamic_a8_quantize_i32x4(
+                centered1, denominator, reciprocal_q32)));
+        vst1_s8(output + offset, vqmovn_s16(quantized16));
+    }
+}
+#endif
+
+__extension__ typedef __int128 qnn_int128_t;
+
+int64_t qnn_floor_shift_i128(qnn_int128_t value, int32_t shift) {
+    GGML_ASSERT(shift > 0 && shift < 127);
+    if (value >= 0) {
+        return static_cast<int64_t>(value >> shift);
+    }
+    const qnn_int128_t magnitude = -value;
+    return -static_cast<int64_t>(
+        (magnitude + ((static_cast<qnn_int128_t>(1) << shift) - 1)) >> shift);
+}
+
+int64_t qnn_floor_divide_i64_positive_denominator(int64_t value, int64_t denominator) {
+    GGML_ASSERT(denominator > 0 && value != INT64_MIN);
+    return value >= 0
+        ? value / denominator
+        : -((-value + denominator - 1) / denominator);
+}
+
+int64_t qnn_floor_divide_i128(qnn_int128_t value, int64_t denominator) {
+    GGML_ASSERT(denominator > 0);
+    if (value >= 0) {
+        return static_cast<int64_t>(value / denominator);
+    }
+    const qnn_int128_t magnitude = -value;
+    return -static_cast<int64_t>(
+        (magnitude + denominator - 1) / denominator);
+}
+
+void qnn_dynamic_a8_mul_mat_compute(
+        ggml_tensor * dst,
+        int ith,
+        int nth,
+        qnn_u16_mul_mat_runtime_params * runtime) {
+    const llama_qnn_linear_qparams * qparams = runtime->qparams;
+    const ggml_tensor * input = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    const int64_t columns = weights->ne[0];
+    const int64_t rows = weights->ne[1];
+    const int64_t blocks = columns / 32;
+    const int64_t vectors = input->ne[1] * input->ne[2] * input->ne[3];
+    GGML_ASSERT(vectors == 1);
+    GGML_ASSERT(columns % 32 == 0 && rows % 16 == 0);
+    GGML_ASSERT(qparams->weights_gs32_source);
+    GGML_ASSERT(qparams->qnn_weight_block_codes_prepared);
+    GGML_ASSERT(qparams->qnn_weight_block_code_layout ==
+        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR);
+    GGML_ASSERT(qparams->qnn_weight_blocks_per_row == blocks);
+
+    static const bool fast_constant_divide = []() {
+        const char * const value = std::getenv(
+            "GGML_QNN_DYNAMIC_A8_FAST_CONSTANT_DIVIDE");
+        return value == nullptr ||
+            (std::strcmp(value, "0") != 0 &&
+             std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0);
+    }();
+    static const bool fast_dynamic_divide = []() {
+        const char * const value = std::getenv(
+            "GGML_QNN_DYNAMIC_A8_FAST_DYNAMIC_DIVIDE");
+        return value == nullptr ||
+            (std::strcmp(value, "0") != 0 &&
+             std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0);
+    }();
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    static const bool neon_dynamic_quantize = []() {
+        const char * const value = std::getenv(
+            "GGML_QNN_DYNAMIC_A8_NEON_QUANTIZE");
+        return value == nullptr ||
+            (std::strcmp(value, "0") != 0 &&
+             std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0);
+    }();
+    static const bool validate_neon_dynamic_quantize = is_enabled_value(
+        std::getenv("GGML_QNN_DYNAMIC_A8_NEON_VALIDATE"));
+#endif
+    const auto * activation = static_cast<const uint16_t *>(input->data);
+    static const bool shared_dynamic_quantize = []() {
+        const char * const value = std::getenv(
+            "GGML_QNN_DYNAMIC_A8_SHARED_QUANTIZE");
+        return value == nullptr ||
+            (std::strcmp(value, "0") != 0 &&
+             std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0);
+    }();
+    thread_local std::vector<int8_t> fallback_dynamic_s8;
+    thread_local std::vector<int32_t> fallback_dynamic_block_max_abs;
+    const bool use_shared_quantize = shared_dynamic_quantize &&
+        runtime->dynamic_s8 != nullptr &&
+        runtime->dynamic_block_max_abs != nullptr;
+    if (!use_shared_quantize) {
+        fallback_dynamic_s8.resize(columns);
+        fallback_dynamic_block_max_abs.resize(blocks);
+    }
+    int8_t * dynamic_s8 = use_shared_quantize
+        ? runtime->dynamic_s8 : fallback_dynamic_s8.data();
+    int32_t * dynamic_block_max_abs = use_shared_quantize
+        ? runtime->dynamic_block_max_abs : fallback_dynamic_block_max_abs.data();
+    const int64_t quantize_begin = use_shared_quantize ? ith : 0;
+    const int64_t quantize_step = use_shared_quantize ? nth : 1;
+    for (int64_t block = quantize_begin; block < blocks; block += quantize_step) {
+        int32_t max_abs = 0;
+        for (int64_t offset = 0; offset < 32; ++offset) {
+            const int64_t column = block * 32 + offset;
+            const int32_t centered = static_cast<int32_t>(activation[column]) -
+                qparams->input.zero_point;
+            max_abs = std::max(max_abs, std::abs(centered));
+        }
+        dynamic_block_max_abs[block] = max_abs;
+        const uint64_t reciprocal_q32 = max_abs == 0 ? 0 :
+            (UINT64_C(1) << 32) / static_cast<uint32_t>(max_abs);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (fast_dynamic_divide && neon_dynamic_quantize && max_abs != 0) {
+            qnn_dynamic_a8_quantize_block_neon(
+                activation + block * 32, qparams->input.zero_point, max_abs,
+                dynamic_s8 + block * 32);
+            if (validate_neon_dynamic_quantize) {
+                for (int64_t offset = 0; offset < 32; ++offset) {
+                    const int64_t column = block * 32 + offset;
+                    const int32_t centered =
+                        static_cast<int32_t>(activation[column]) -
+                        qparams->input.zero_point;
+                    const int8_t reference = static_cast<int8_t>(
+                        qnn_round_divide_nearest(
+                            static_cast<int64_t>(centered) * 127, max_abs));
+                    GGML_ASSERT(dynamic_s8[column] == reference);
+                }
+            }
+            continue;
+        }
+#endif
+        for (int64_t offset = 0; offset < 32; ++offset) {
+            const int64_t column = block * 32 + offset;
+            if (max_abs == 0) {
+                dynamic_s8[column] = 0;
+                continue;
+            }
+            const int32_t centered = static_cast<int32_t>(activation[column]) -
+                qparams->input.zero_point;
+            const int64_t quantized = fast_dynamic_divide
+                ? qnn_round_divide_nearest_recip32(
+                    static_cast<int64_t>(centered) * 127,
+                    max_abs, reciprocal_q32)
+                : qnn_round_divide_nearest(
+                    static_cast<int64_t>(centered) * 127, max_abs);
+            dynamic_s8[column] = static_cast<int8_t>(std::clamp<int64_t>(
+                quantized, -127, 127));
+        }
+    }
+    if (use_shared_quantize) {
+        const uint32_t generation = runtime->quantize_generation.load(
+            std::memory_order_acquire);
+        const int32_t arrival = runtime->quantize_arrivals.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (arrival == nth - 1) {
+            runtime->quantize_arrivals.store(0, std::memory_order_relaxed);
+            runtime->quantize_generation.fetch_add(1, std::memory_order_release);
+        } else {
+            while (runtime->quantize_generation.load(
+                    std::memory_order_acquire) == generation) {
+#if defined(__aarch64__)
+                __asm__ volatile("yield");
+#endif
+            }
+        }
+    }
+    const uint8_t * native_i8mm_weights = nullptr;
+    if (!qparams->weights_i8mm_native_source) {
+        native_i8mm_weights = qnn_gs32_i8mm_sidecar::instance().find(
+            qparams, weights->data, columns, rows);
+    }
+
+    const int64_t row_groups = rows / 16;
+    const int64_t group_begin = row_groups * ith / nth;
+    const int64_t group_end = row_groups * (ith + 1) / nth;
+    for (int64_t group = group_begin; group < group_end; ++group) {
+        const int64_t row = group * 16;
+        int64_t centered_dots[16];
+        if (qparams->weights_i8mm_native_source) {
+            const int64_t row_block = row / 64;
+            const int64_t tile_in_block = (row % 64) / 16;
+            const size_t source_block_bytes =
+                static_cast<size_t>(blocks) * 768;
+            const uint8_t * embedded_native_tile =
+                static_cast<const uint8_t *>(weights->data) +
+                static_cast<size_t>(row_block) * source_block_bytes +
+                static_cast<size_t>(tile_in_block) * blocks * 128;
+            ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
+                static_cast<int>(columns), centered_dots,
+                embedded_native_tile, 0, dynamic_s8,
+                qparams->qnn_weight_block_scale_codes.data() + row * blocks,
+                dynamic_block_max_abs);
+        } else if (native_i8mm_weights != nullptr) {
+            ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
+                static_cast<int>(columns), centered_dots,
+                native_i8mm_weights, row, dynamic_s8,
+                qparams->qnn_weight_block_scale_codes.data() + row * blocks,
+                dynamic_block_max_abs);
+        } else {
+            ggml_gptq2_32_gs32_s8_groupwise_dot_16rows(
+                static_cast<int>(columns), centered_dots, weights->data, row,
+                dynamic_s8,
+                qparams->qnn_weight_block_scale_codes.data() + row * blocks,
+                dynamic_block_max_abs);
+        }
+        auto * output = static_cast<uint16_t *>(dst->data) + row;
+        for (int output_row = 0; output_row < 16; ++output_row) {
+            const int64_t base_multiplier =
+                qparams->qnn_channel_scale_to_output_q31[row + output_row];
+            const qnn_int128_t scaled_numerator =
+                static_cast<qnn_int128_t>(centered_dots[output_row]) *
+                    base_multiplier +
+                static_cast<qnn_int128_t>(127) *
+                    (static_cast<qnn_int128_t>(1) << 30);
+            const int64_t centered_output = fast_constant_divide
+                ? qnn_floor_divide_i64_positive_denominator(
+                    qnn_floor_shift_i128(scaled_numerator, 31), 127)
+                : qnn_floor_divide_i128(
+                    scaled_numerator, INT64_C(127) << 31);
+            output[output_row] = static_cast<uint16_t>(std::clamp<int64_t>(
+                centered_output + qparams->output.zero_point,
+                0, UINT16_MAX));
+        }
+        if (group == 0 && is_enabled_value(std::getenv(
+                "GGML_QNN_DYNAMIC_A8_COMPARE_A16"))) {
+            static std::atomic<bool> compared{false};
+            static std::atomic<uint64_t> compared_down_layers{0};
+            bool compare_this_operator = false;
+            if (qparams->projection == "mlp.down_proj" &&
+                qparams->layer_id >= 0 && qparams->layer_id < 64) {
+                const uint64_t layer_bit =
+                    UINT64_C(1) << qparams->layer_id;
+                compare_this_operator =
+                    (compared_down_layers.fetch_or(layer_bit) & layer_bit) == 0;
+            } else {
+                bool expected = false;
+                compare_this_operator =
+                    compared.compare_exchange_strong(expected, true);
+            }
+            if (compare_this_operator) {
+                std::vector<int32_t> block_sums(blocks);
+                std::vector<uint8_t> activation_low(columns);
+                std::vector<int8_t> activation_high(columns);
+                int32_t activation_abs_sum = 0;
+                const int activation_range =
+                    ggml_gptq2_32_prepare_u16_activation(
+                        static_cast<int>(columns), activation,
+                        qparams->input.zero_point, block_sums.data(),
+                        activation_low.data(), activation_high.data(),
+                        &activation_abs_sum);
+                uint16_t a16_reference[16];
+                const bool blockwise_requant =
+                    is_enabled_value(std::getenv(
+                        "GGML_QNN_U16_BLOCKWISE_REQUANT")) &&
+                    qparams->input.scale / qparams->output.scale >=
+                        1.4142135623730951;
+                ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
+                    static_cast<int>(columns), a16_reference, weights->data, 0,
+                    activation,
+                    activation_range ? activation_low.data() : nullptr,
+                    activation_range == GGML_GPTQ2_U16_ACTIVATION_I16
+                        ? activation_high.data()
+                        : nullptr,
+                    block_sums.data(), activation_range,
+                    static_cast<int64_t>(activation_abs_sum) * 7 * 31 <=
+                        INT32_MAX,
+                    qparams->qnn_weight_block_scale_codes.data(), 0,
+                    qparams->qnn_channel_scale_to_output_q31.data(),
+                    qparams->qnn_prepared_weight_sums.data(),
+                    qparams->input.zero_point, qparams->output.zero_point,
+                    blockwise_requant ? 29 : 0, 0, 0);
+                int64_t absolute_error = 0;
+                int32_t max_error = 0;
+                int32_t a8_saturated = 0;
+                int32_t a16_saturated = 0;
+                for (int row_index = 0; row_index < 16; ++row_index) {
+                    const int32_t error = std::abs(
+                        static_cast<int32_t>(output[row_index]) -
+                        static_cast<int32_t>(a16_reference[row_index]));
+                    absolute_error += error;
+                    max_error = std::max(max_error, error);
+                    a8_saturated += output[row_index] == 0 ||
+                        output[row_index] == UINT16_MAX;
+                    a16_saturated += a16_reference[row_index] == 0 ||
+                        a16_reference[row_index] == UINT16_MAX;
+                }
+                std::fprintf(stderr,
+                    "qnn-u16: dynamic A8/A16 first-tile compare "
+                    "layer=%d projection=%s a8_0=%u a16_0=%u "
+                    "mae=%.3f max=%d sat_a8=%d sat_a16=%d\n",
+                    qparams->layer_id, qparams->projection.c_str(),
+                    output[0], a16_reference[0],
+                    static_cast<double>(absolute_error) / 16.0, max_error,
+                    a8_saturated, a16_saturated);
+            }
+        }
+    }
+}
+
 } // namespace
 
 bool llama_qnn_u16_activations_enabled() {
@@ -1512,20 +3447,35 @@ ggml_tensor * llama_qnn_quantize_f32_to_u16(
         ggml_tensor * input,
         const llama_qnn_quant_profile * profile,
         const llama_qnn_operation * quantize_operation) {
-    GGML_ASSERT(ctx != nullptr && input != nullptr && profile != nullptr);
-    GGML_ASSERT(input->type == GGML_TYPE_F32);
     GGML_ASSERT(quantize_operation != nullptr &&
         quantize_operation->type_name == "Quantize");
-    const llama_qnn_u16_tensor * output_tensor =
-        require_u16_operand(profile, quantize_operation, "output", 0);
+    return llama_qnn_quantize_f32_to_u16(
+        ctx, input, profile,
+        require_u16_operand(profile, quantize_operation, "output", 0));
+}
+
+ggml_tensor * llama_qnn_quantize_f32_to_u16(
+        ggml_context * ctx,
+        ggml_tensor * input,
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_u16_tensor * output_tensor) {
+    GGML_ASSERT(ctx != nullptr && input != nullptr && profile != nullptr);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(output_tensor != nullptr);
+    GGML_ASSERT(output_tensor->qparams.encoding ==
+        LLAMA_QNN_QUANTIZATION_SCALE_OFFSET);
+    GGML_ASSERT(output_tensor->qparams.scale_offsets.size() == 1);
     const auto & qparams = output_tensor->qparams.scale_offsets[0];
     const qnn_f32_u16_boundary_params value { qparams.scale, qparams.zero_point };
     auto * params = new_qnn_u16_params(ctx, value);
     ggml_tensor * args[] = { input };
+    const bool use_a8 = profile->activation_bits == 8;
     return ggml_custom_4d(
-        ctx, GGML_TYPE_U16,
+        ctx, use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_quantize_f32_u16_compute, GGML_N_TASKS_MAX, params);
+        args, 1,
+        use_a8 ? qnn_quantize_f32_u8_compute : qnn_quantize_f32_u16_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_dequantize_u16_to_f32(
@@ -1533,7 +3483,7 @@ ggml_tensor * llama_qnn_dequantize_u16_to_f32(
         ggml_tensor * input,
         const llama_qnn_u16_tensor * input_qparams) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && input_qparams != nullptr);
-    GGML_ASSERT(input->type == GGML_TYPE_U16);
+    GGML_ASSERT(input->type == GGML_TYPE_U16 || input->type == GGML_TYPE_U8);
     GGML_ASSERT(input_qparams->qparams.encoding ==
         LLAMA_QNN_QUANTIZATION_SCALE_OFFSET);
     GGML_ASSERT(input_qparams->qparams.scale_offsets.size() == 1);
@@ -1541,10 +3491,13 @@ ggml_tensor * llama_qnn_dequantize_u16_to_f32(
     const qnn_f32_u16_boundary_params value { qparams.scale, qparams.zero_point };
     auto * params = new_qnn_u16_params(ctx, value);
     ggml_tensor * args[] = { input };
+    const bool use_a8 = input->type == GGML_TYPE_U8;
     return ggml_custom_4d(
         ctx, GGML_TYPE_F32,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_dequantize_u16_f32_compute, GGML_N_TASKS_MAX, params);
+        args, 1,
+        use_a8 ? qnn_dequantize_u8_f32_compute : qnn_dequantize_u16_f32_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_u16_mul_mat(
@@ -1553,21 +3506,40 @@ ggml_tensor * llama_qnn_u16_mul_mat(
         ggml_tensor * input,
         const llama_qnn_linear_qparams * qparams) {
     GGML_ASSERT(ctx != nullptr && weights != nullptr && input != nullptr && qparams != nullptr);
-    GGML_ASSERT(input->type == GGML_TYPE_U16);
+    GGML_ASSERT(input->type == GGML_TYPE_U16 || input->type == GGML_TYPE_U8);
     GGML_ASSERT(weights->ne[0] == input->ne[0]);
+    const bool use_a8 = input->type == GGML_TYPE_U8;
+    const bool allocate_dynamic_a8_scratch = !use_a8 &&
+        weights->type == GGML_TYPE_GPTQ2_32 &&
+        qparams->weights_gs32_source &&
+        qparams->qnn_weight_block_codes_prepared &&
+        weights->ne[0] % 32 == 0 && weights->ne[1] % 16 == 0 &&
+        qnn_dynamic_a8_gemv_enabled(weights->ne[0], qparams);
+    int8_t * dynamic_s8 = allocate_dynamic_a8_scratch
+        ? static_cast<int8_t *>(ggml_new_buffer(ctx, weights->ne[0]))
+        : nullptr;
+    int32_t * dynamic_block_max_abs = allocate_dynamic_a8_scratch
+        ? static_cast<int32_t *>(ggml_new_buffer(
+            ctx, sizeof(int32_t) * weights->ne[0] / 32))
+        : nullptr;
+    auto * runtime = new (ggml_new_buffer(
+        ctx, sizeof(qnn_u16_mul_mat_runtime_params)))
+        qnn_u16_mul_mat_runtime_params(
+            qparams, dynamic_s8, dynamic_block_max_abs);
     ggml_tensor * args[] = { input, weights };
     return ggml_custom_4d(
         ctx,
-        GGML_TYPE_U16,
+        use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16,
         weights->ne[1],
         input->ne[1],
         input->ne[2],
         input->ne[3],
         args,
         2,
-        qnn_u16_mul_mat_compute,
-        GGML_N_TASKS_MAX,
-        const_cast<llama_qnn_linear_qparams *>(qparams));
+        use_a8 ? qnn_u8_mul_mat_compute : qnn_u16_mul_mat_compute,
+        GGML_N_TASKS_MAX, use_a8
+            ? static_cast<void *>(const_cast<llama_qnn_linear_qparams *>(qparams))
+            : static_cast<void *>(runtime));
 }
 
 static ggml_tensor * llama_qnn_u16_binary(
@@ -1580,7 +3552,9 @@ static ggml_tensor * llama_qnn_u16_binary(
         bool multiply) {
     GGML_ASSERT(ctx != nullptr && lhs != nullptr && rhs != nullptr);
     GGML_ASSERT(profile != nullptr && operation != nullptr);
-    GGML_ASSERT(lhs->type == GGML_TYPE_U16 && rhs->type == GGML_TYPE_U16);
+    const ggml_type activation_type = profile->activation_bits == 8
+        ? GGML_TYPE_U8 : GGML_TYPE_U16;
+    GGML_ASSERT(lhs->type == activation_type && rhs->type == activation_type);
     GGML_ASSERT(ggml_are_same_shape(lhs, rhs));
     GGML_ASSERT(operation->inputs.size() >= 2 && !operation->outputs.empty());
     if (multiply) {
@@ -1592,6 +3566,23 @@ static ggml_tensor * llama_qnn_u16_binary(
     } else {
         GGML_ASSERT(operation->type_name == "ElementWiseAdd");
         GGML_ASSERT(operation->input_to_output_q20.size() >= 2);
+    }
+
+    if (profile->activation_bits == 8) {
+        GGML_ASSERT(multiply
+            ? operation->a8_multiply.valid
+            : operation->a8_add_subtract.valid);
+        const qnn_u8_binary_params value {
+            operation->a8_add_subtract,
+            operation->a8_multiply,
+            multiply,
+        };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { lhs, rhs };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            lhs->ne[0], lhs->ne[1], lhs->ne[2], lhs->ne[3],
+            args, 2, qnn_u8_binary_compute, GGML_N_TASKS_MAX, params);
     }
 
     const llama_qnn_u16_tensor * lhs_tensor =
@@ -1661,7 +3652,9 @@ static ggml_tensor * llama_qnn_u16_binary_static(
         const llama_qnn_operation * operation,
         bool multiply) {
     GGML_ASSERT(ctx != nullptr && lhs != nullptr && profile != nullptr);
-    GGML_ASSERT(operation != nullptr && lhs->type == GGML_TYPE_U16);
+    const ggml_type activation_type = profile->activation_bits == 8
+        ? GGML_TYPE_U8 : GGML_TYPE_U16;
+    GGML_ASSERT(operation != nullptr && lhs->type == activation_type);
     GGML_ASSERT(operation->inputs.size() >= 2 && !operation->outputs.empty());
     GGML_ASSERT(operation->type_name == (multiply
         ? "ElementWiseMultiply" : "ElementWiseAdd"));
@@ -1669,6 +3662,26 @@ static ggml_tensor * llama_qnn_u16_binary_static(
     const auto * rhs_tensor = require_u16_operand(profile, operation, "input", 1);
     const auto * output_tensor = require_u16_operand(profile, operation, "output", 0);
     GGML_ASSERT(rhs_tensor->static_data.size() == 1);
+    if (profile->activation_bits == 8) {
+        GGML_ASSERT(rhs_tensor->static_data[0] <= UINT8_MAX);
+        GGML_ASSERT(multiply
+            ? operation->a8_multiply.valid
+            : operation->a8_add_subtract.valid);
+        const qnn_u8_static_binary_params value {
+            {
+                operation->a8_add_subtract,
+                operation->a8_multiply,
+                multiply,
+            },
+            static_cast<uint8_t>(rhs_tensor->static_data[0]),
+        };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { lhs };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            lhs->ne[0], lhs->ne[1], lhs->ne[2], lhs->ne[3],
+            args, 1, qnn_u8_static_binary_compute, GGML_N_TASKS_MAX, params);
+    }
     GGML_ASSERT(multiply || operation->input_to_output_q20.size() >= 2);
     GGML_ASSERT(!multiply || operation->product_to_output_q31 >= 0);
     int32_t folded_multiplier_q15 = 0;
@@ -1771,6 +3784,10 @@ qnn_u16_rms_norm_params make_rms_norm_params(
     for (const uint16_t code : bias_tensor->static_data) {
         GGML_ASSERT(code == bias_zero_point);
     }
+    const float input_scale = input_tensor->qparams.scale_offsets[0].scale;
+    const float weight_scale = weight_tensor->qparams.scale_offsets[0].scale;
+    const float output_scale = output_tensor->qparams.scale_offsets[0].scale;
+    const float epsilon = static_cast<float>(operation->rms_epsilon);
     return {
         weight_tensor->static_data.data(),
         static_cast<int64_t>(weight_tensor->static_data.size()),
@@ -1779,6 +3796,9 @@ qnn_u16_rms_norm_params make_rms_norm_params(
         operation->rms_epsilon_in_codes_q16,
         qnn_u16_scale_ratio_q31(weight_tensor, output_tensor),
         output_tensor->qparams.scale_offsets[0].zero_point,
+        static_cast<double>(epsilon) /
+            (static_cast<double>(input_scale) * static_cast<double>(input_scale)),
+        static_cast<double>(weight_scale) / static_cast<double>(output_scale),
     };
 }
 
@@ -1791,14 +3811,16 @@ ggml_tensor * llama_qnn_u16_rms_norm(
         const llama_qnn_operation * operation) {
     GGML_ASSERT(ctx != nullptr && input != nullptr);
     GGML_ASSERT(profile != nullptr && operation != nullptr);
-    GGML_ASSERT(input->type == GGML_TYPE_U16);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(input->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16));
     const auto value = make_rms_norm_params(profile, operation, input->ne[0]);
     qnn_u16_rms_norm_params * params = new_qnn_u16_params(ctx, value);
     ggml_tensor * args[] = { input };
     return ggml_custom_4d(
-        ctx, GGML_TYPE_U16,
+        ctx, use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_u16_rms_norm_compute, GGML_N_TASKS_MAX, params);
+        args, 1, use_a8 ? qnn_u8_rms_norm_compute : qnn_u16_rms_norm_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_u16_rms_norm_heads(
@@ -1809,19 +3831,56 @@ ggml_tensor * llama_qnn_u16_rms_norm_heads(
         int32_t n_head) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && profile != nullptr);
     GGML_ASSERT(operations != nullptr && n_head > 0);
-    GGML_ASSERT(input->type == GGML_TYPE_U16 && input->ne[1] == n_head);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(input->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16) &&
+        input->ne[1] == n_head);
     auto * values = static_cast<qnn_u16_rms_norm_params *>(
         ggml_new_buffer(ctx, sizeof(qnn_u16_rms_norm_params) * n_head));
-    for (int32_t head = 0; head < n_head; ++head) {
-        values[head] = make_rms_norm_params(profile, operations[head], input->ne[0]);
+    static const bool cache_static_params =
+        is_enabled_value(std::getenv("GGML_QNN_STATIC_PARAMS_CACHE"));
+    struct cache_entry {
+        int32_t n_head;
+        int64_t dimension;
+        std::vector<qnn_u16_rms_norm_params> values;
+    };
+    struct cache_state {
+        const llama_qnn_quant_profile * profile = nullptr;
+        std::unordered_map<const llama_qnn_operation *, cache_entry> entries;
+    };
+    thread_local cache_state & cache = *new cache_state();
+    auto cached = cache.entries.end();
+    if (cache_static_params) {
+        if (cache.profile != profile) {
+            cache.profile = profile;
+            cache.entries.clear();
+        }
+        cached = cache.entries.find(operations[0]);
+    }
+    if (cached != cache.entries.end()) {
+        GGML_ASSERT(cached->second.n_head == n_head &&
+            cached->second.dimension == input->ne[0] &&
+            cached->second.values.size() == static_cast<size_t>(n_head));
+        std::copy(cached->second.values.begin(), cached->second.values.end(), values);
+    } else {
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] = make_rms_norm_params(profile, operations[head], input->ne[0]);
+        }
+        if (cache_static_params) {
+            cache.entries.emplace(operations[0], cache_entry {
+                n_head, input->ne[0],
+                std::vector<qnn_u16_rms_norm_params>(values, values + n_head),
+            });
+        }
     }
     const qnn_u16_head_params<qnn_u16_rms_norm_params> value { values, n_head };
     auto * params = new_qnn_u16_params(ctx, value);
     ggml_tensor * args[] = { input };
     return ggml_custom_4d(
-        ctx, GGML_TYPE_U16,
+        ctx, use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_u16_rms_norm_heads_compute, GGML_N_TASKS_MAX, params);
+        args, 1,
+        use_a8 ? qnn_u8_rms_norm_heads_compute : qnn_u16_rms_norm_heads_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_u16_sigmoid(
@@ -1829,16 +3888,20 @@ ggml_tensor * llama_qnn_u16_sigmoid(
         ggml_tensor * input,
         const llama_qnn_operation * operation) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && operation != nullptr);
-    GGML_ASSERT(input->type == GGML_TYPE_U16);
+    GGML_ASSERT(input->type == GGML_TYPE_U16 || input->type == GGML_TYPE_U8);
     GGML_ASSERT(operation->type_name == "Sigmoid");
-    GGML_ASSERT(operation->unary_lut.size() == static_cast<size_t>(UINT16_MAX) + 1);
+    const bool use_a8 = input->type == GGML_TYPE_U8;
+    GGML_ASSERT(operation->unary_lut.size() ==
+        (use_a8 ? static_cast<size_t>(UINT8_MAX) + 1
+                : static_cast<size_t>(UINT16_MAX) + 1));
     const qnn_u16_lut_params value { operation->unary_lut.data() };
     qnn_u16_lut_params * params = new_qnn_u16_params(ctx, value);
     ggml_tensor * args[] = { input };
     return ggml_custom_4d(
-        ctx, GGML_TYPE_U16,
+        ctx, use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_u16_lut_compute, GGML_N_TASKS_MAX, params);
+        args, 1, use_a8 ? qnn_u8_lut_compute : qnn_u16_lut_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_u16_swiglu(
@@ -1853,11 +3916,30 @@ ggml_tensor * llama_qnn_u16_swiglu(
     GGML_ASSERT(profile != nullptr && sigmoid_operation != nullptr);
     GGML_ASSERT(silu_multiply_operation != nullptr &&
         product_multiply_operation != nullptr);
-    GGML_ASSERT(gate->type == GGML_TYPE_U16 && up->type == GGML_TYPE_U16);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(gate->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16) &&
+        up->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16));
     GGML_ASSERT(ggml_are_same_shape(gate, up));
     GGML_ASSERT(sigmoid_operation->type_name == "Sigmoid");
     GGML_ASSERT(sigmoid_operation->unary_lut.size() ==
-        static_cast<size_t>(UINT16_MAX) + 1);
+        (use_a8 ? static_cast<size_t>(UINT8_MAX) + 1
+                : static_cast<size_t>(UINT16_MAX) + 1));
+
+    if (use_a8) {
+        GGML_ASSERT(silu_multiply_operation->a8_multiply.valid);
+        GGML_ASSERT(product_multiply_operation->a8_multiply.valid);
+        const qnn_u8_swiglu_params value {
+            sigmoid_operation->unary_lut.data(),
+            {{}, silu_multiply_operation->a8_multiply, true},
+            {{}, product_multiply_operation->a8_multiply, true},
+        };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { gate, up };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            gate->ne[0], gate->ne[1], gate->ne[2], gate->ne[3],
+            args, 2, qnn_u8_swiglu_compute, GGML_N_TASKS_MAX, params);
+    }
 
     const auto make_multiply_params =
         [profile](const llama_qnn_operation * operation) {
@@ -2026,6 +4108,53 @@ qnn_u16_rope_params make_rope_params(
     return value;
 }
 
+qnn_u8_rope_params make_u8_rope_params(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_u16_rope_head_ops & ops,
+        int64_t dimension) {
+    GGML_ASSERT(profile != nullptr && profile->activation_bits == 8);
+    GGML_ASSERT(ops.subtract != nullptr && ops.add != nullptr);
+    GGML_ASSERT(ops.cos_table != nullptr && ops.sin_table != nullptr);
+    GGML_ASSERT(ops.cos_table->dimensions.size() == 2);
+    GGML_ASSERT(ops.cos_table->dimensions == ops.sin_table->dimensions);
+    GGML_ASSERT(!ops.cos_table->static_data.empty() &&
+        !ops.sin_table->static_data.empty());
+    qnn_u8_rope_params value {};
+    value.cos_codes = ops.cos_table->static_data.data();
+    value.sin_codes = ops.sin_table->static_data.data();
+    value.table_rows = ops.cos_table->dimensions[0];
+    value.half_dimension = ops.cos_table->dimensions[1];
+    GGML_ASSERT(dimension == value.half_dimension * 2);
+    const llama_qnn_u16_tensor * split_input =
+        require_u16_operand(profile, ops.slices[0], "input", 0);
+    const llama_qnn_u16_tensor * split_input_second =
+        require_u16_operand(profile, ops.slices[1], "input", 0);
+    GGML_ASSERT(split_input->name == split_input_second->name);
+    value.split_input_zero_point =
+        split_input->qparams.scale_offsets[0].zero_point;
+    for (int index = 0; index < 2; ++index) {
+        const llama_qnn_u16_tensor * split_output =
+            require_u16_operand(profile, ops.slices[index], "output", 0);
+        value.split_to_output_q31[index] =
+            qnn_u16_scale_ratio_q31(split_input, split_output);
+        value.split_output_zero_points[index] =
+            split_output->qparams.scale_offsets[0].zero_point;
+    }
+    for (int index = 0; index < 4; ++index) {
+        GGML_ASSERT(ops.multiply[index] != nullptr &&
+            ops.multiply[index]->type_name == "ElementWiseMultiply" &&
+            ops.multiply[index]->a8_multiply.valid);
+        value.multiply[index] = ops.multiply[index]->a8_multiply;
+    }
+    GGML_ASSERT(ops.subtract->type_name == "ElementWiseSubtract" &&
+        ops.subtract->a8_add_subtract.valid);
+    GGML_ASSERT(ops.add->type_name == "ElementWiseAdd" &&
+        ops.add->a8_add_subtract.valid);
+    value.subtract = ops.subtract->a8_add_subtract;
+    value.add = ops.add->a8_add_subtract;
+    return value;
+}
+
 } // namespace
 
 ggml_tensor * llama_qnn_u16_rope(
@@ -2081,10 +4210,12 @@ ggml_tensor * llama_qnn_u16_rope(
 
     // These are the exact U16 source tables embedded by the Qwen3 export.
     // Every later shard receives code-identical views of these two tensors.
-    const llama_qnn_u16_tensor * cos_table =
-        profile->find_u16_tensor("b__frozen_param311@0");
-    const llama_qnn_u16_tensor * sin_table =
-        profile->find_u16_tensor("b__frozen_param312@0");
+    const llama_qnn_u16_tensor * cos_table = profile->find_u16_tensor(
+        "b__frozen_param" +
+        std::to_string(11 * profile->num_decoder_layers + 3) + "@0");
+    const llama_qnn_u16_tensor * sin_table = profile->find_u16_tensor(
+        "b__frozen_param" +
+        std::to_string(11 * profile->num_decoder_layers + 4) + "@0");
     GGML_ASSERT(cos_table != nullptr && sin_table != nullptr);
     GGML_ASSERT(cos_table->dimensions.size() == 2 && sin_table->dimensions.size() == 2);
     GGML_ASSERT(cos_table->dimensions == sin_table->dimensions);
@@ -2174,12 +4305,70 @@ ggml_tensor * llama_qnn_u16_rope_heads(
         int32_t n_head) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && positions != nullptr);
     GGML_ASSERT(profile != nullptr && head_ops != nullptr && n_head > 0);
-    GGML_ASSERT(input->type == GGML_TYPE_U16 && positions->type == GGML_TYPE_I32);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(input->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16) &&
+        positions->type == GGML_TYPE_I32);
     GGML_ASSERT(input->ne[1] == n_head);
+    if (use_a8) {
+        auto * values = static_cast<qnn_u8_rope_params *>(
+            ggml_new_buffer(ctx, sizeof(qnn_u8_rope_params) * n_head));
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] = make_u8_rope_params(
+                profile, head_ops[head], input->ne[0]);
+        }
+        const qnn_u16_head_params<qnn_u8_rope_params> value { values, n_head };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { input, positions };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+            args, 2, qnn_u8_rope_heads_compute, GGML_N_TASKS_MAX, params);
+    }
     auto * values = static_cast<qnn_u16_rope_params *>(
         ggml_new_buffer(ctx, sizeof(qnn_u16_rope_params) * n_head));
-    for (int32_t head = 0; head < n_head; ++head) {
-        values[head] = make_rope_params(profile, head_ops[head], input->ne[0]);
+    static const bool cache_rope_params = []() {
+        const char * value =
+            std::getenv("GGML_QNN_ROPE_PARAMS_SEQUENCE_CACHE");
+        return value != nullptr && std::string_view(value) != "0";
+    }();
+    struct rope_cache_entry {
+        int32_t n_head;
+        int64_t dimension;
+        std::vector<qnn_u16_rope_params> values;
+    };
+    struct rope_cache_state {
+        const llama_qnn_quant_profile * profile = nullptr;
+        std::unordered_map<
+            const llama_qnn_operation *, rope_cache_entry> entries;
+    };
+    thread_local rope_cache_state cache;
+    const llama_qnn_operation * cache_key = head_ops[0].multiply[0];
+    auto cached = cache.entries.end();
+    if (cache_rope_params) {
+        if (cache.profile != profile) {
+            cache.profile = profile;
+            cache.entries.clear();
+        }
+        cached = cache.entries.find(cache_key);
+    }
+    if (cached != cache.entries.end()) {
+        GGML_ASSERT(cached->second.n_head == n_head &&
+            cached->second.dimension == input->ne[0] &&
+            cached->second.values.size() == static_cast<size_t>(n_head));
+        std::copy(
+            cached->second.values.begin(), cached->second.values.end(), values);
+    } else {
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] =
+                make_rope_params(profile, head_ops[head], input->ne[0]);
+        }
+        if (cache_rope_params) {
+            cache.entries.emplace(cache_key, rope_cache_entry {
+                n_head,
+                input->ne[0],
+                std::vector<qnn_u16_rope_params>(values, values + n_head),
+            });
+        }
     }
     const qnn_u16_head_params<qnn_u16_rope_params> value { values, n_head };
     auto * params = new_qnn_u16_params(ctx, value);
@@ -2191,6 +4380,50 @@ ggml_tensor * llama_qnn_u16_rope_heads(
 }
 
 namespace {
+
+void require_qnn_hadamard_weights(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * operation,
+        const llama_qnn_aux_quantized_tensor * weight_tensor,
+        const int16_t * static_weights,
+        int64_t input_dimension,
+        int64_t output_dimension) {
+    static const bool cache_validation = []() {
+        const char * value =
+            std::getenv("GGML_QNN_QK_HADAMARD_VALIDATION_CACHE");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    if (cache_validation) {
+        struct validation_cache {
+            const llama_qnn_quant_profile * profile = nullptr;
+            const llama_qnn_operation * operations_data = nullptr;
+            size_t operation_count = 0;
+            std::unordered_set<const llama_qnn_operation *> validated;
+        };
+        thread_local validation_cache cache;
+        if (cache.profile != profile ||
+                cache.operations_data != profile->operations.data() ||
+                cache.operation_count != profile->operations.size()) {
+            cache.profile = profile;
+            cache.operations_data = profile->operations.data();
+            cache.operation_count = profile->operations.size();
+            cache.validated.clear();
+        }
+        if (!cache.validated.emplace(operation).second) {
+            return;
+        }
+    }
+    bool is_qnn_hadamard = input_dimension == 128 && output_dimension == 128 &&
+        weight_tensor->qparams.scale_offsets[0].zero_point == 0;
+    for (int64_t index = 0;
+         is_qnn_hadamard && index < input_dimension * output_dimension;
+         ++index) {
+        is_qnn_hadamard = static_weights[index] == INT16_MAX ||
+            static_weights[index] == -INT16_MAX;
+    }
+    GGML_ASSERT(is_qnn_hadamard &&
+        "QNN Q/K rotation matrix no longer matches the validated HTP contract");
+}
 
 qnn_u16_s16_matmul_params make_qk_rotate_params(
         const llama_qnn_quant_profile * profile,
@@ -2216,16 +4449,9 @@ qnn_u16_s16_matmul_params make_qk_rotate_params(
         static_cast<size_t>(input_dimension * output_dimension) * sizeof(int16_t));
     const auto * static_weights =
         reinterpret_cast<const int16_t *>(weight_tensor->static_data.data());
-    bool is_qnn_hadamard = input_dimension == 128 && output_dimension == 128 &&
-        weight_tensor->qparams.scale_offsets[0].zero_point == 0;
-    for (int64_t index = 0;
-         is_qnn_hadamard && index < input_dimension * output_dimension;
-         ++index) {
-        is_qnn_hadamard = static_weights[index] == INT16_MAX ||
-            static_weights[index] == -INT16_MAX;
-    }
-    GGML_ASSERT(is_qnn_hadamard &&
-        "QNN Q/K rotation matrix no longer matches the validated HTP contract");
+    require_qnn_hadamard_weights(
+        profile, operation, weight_tensor, static_weights,
+        input_dimension, output_dimension);
     const double ratio =
         (static_cast<double>(input_tensor->qparams.scale_offsets[0].scale) *
          static_cast<double>(weight_tensor->qparams.scale_offsets[0].scale)) /
@@ -2244,6 +4470,36 @@ qnn_u16_s16_matmul_params make_qk_rotate_params(
     };
 }
 
+qnn_u8_u8_matmul_params make_u8_qk_rotate_params(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * operation,
+        int64_t dimension) {
+    GGML_ASSERT(profile != nullptr && profile->activation_bits == 8);
+    GGML_ASSERT(operation != nullptr && operation->type_name == "MatMul");
+    const llama_qnn_u16_tensor * input_tensor =
+        require_u16_operand(profile, operation, "input", 0);
+    const llama_qnn_u16_tensor * weight_tensor =
+        require_u16_operand(profile, operation, "input", 1);
+    const llama_qnn_u16_tensor * output_tensor =
+        require_u16_operand(profile, operation, "output", 0);
+    GGML_ASSERT(weight_tensor->data_type == "QNN_DATATYPE_UFIXED_POINT_8");
+    GGML_ASSERT(weight_tensor->dimensions.size() == 2);
+    GGML_ASSERT(weight_tensor->qparams.scale_offsets.size() == 1);
+    const int64_t input_dimension = weight_tensor->dimensions[0];
+    const int64_t output_dimension = weight_tensor->dimensions[1];
+    GGML_ASSERT(dimension == input_dimension);
+    GGML_ASSERT(weight_tensor->static_data.size() ==
+        static_cast<size_t>(input_dimension * output_dimension));
+    GGML_ASSERT(operation->matmul_product_to_output_q31 > 0);
+    return {
+        weight_tensor->static_data.data(), input_dimension, output_dimension,
+        input_tensor->qparams.scale_offsets[0].zero_point,
+        weight_tensor->qparams.scale_offsets[0].zero_point,
+        operation->matmul_product_to_output_q31,
+        output_tensor->qparams.scale_offsets[0].zero_point,
+    };
+}
+
 qnn_u16_to_u8_params make_to_u8_params(
         const llama_qnn_quant_profile * profile,
         const llama_qnn_operation * operation) {
@@ -2258,6 +4514,24 @@ qnn_u16_to_u8_params make_to_u8_params(
     GGML_ASSERT(output_tensor->data_type == "QNN_DATATYPE_UFIXED_POINT_8");
     GGML_ASSERT(output_tensor->element_bytes == sizeof(uint8_t));
     GGML_ASSERT(output_tensor->qparams.scale_offsets.size() == 1);
+    return {
+        input_tensor->qparams.scale_offsets[0].zero_point,
+        operation->unary_input_to_output_q31,
+        output_tensor->qparams.scale_offsets[0].zero_point,
+    };
+}
+
+qnn_u16_to_u8_params make_u8_to_u8_params(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * operation) {
+    GGML_ASSERT(profile != nullptr && profile->activation_bits == 8);
+    GGML_ASSERT(operation != nullptr && operation->type_name == "Convert");
+    GGML_ASSERT(operation->unary_input_to_output_q31 > 0);
+    const llama_qnn_u16_tensor * input_tensor =
+        require_u16_operand(profile, operation, "input", 0);
+    const llama_qnn_u16_tensor * output_tensor =
+        require_u16_operand(profile, operation, "output", 0);
+    GGML_ASSERT(output_tensor->data_type == "QNN_DATATYPE_UFIXED_POINT_8");
     return {
         input_tensor->qparams.scale_offsets[0].zero_point,
         operation->unary_input_to_output_q31,
@@ -2307,16 +4581,9 @@ ggml_tensor * llama_qnn_u16_qk_rotate(
         static_cast<size_t>(input_dimension * output_dimension) * sizeof(int16_t));
     const auto * static_weights =
         reinterpret_cast<const int16_t *>(weight_tensor->static_data.data());
-    bool is_qnn_hadamard = input_dimension == 128 && output_dimension == 128 &&
-        weight_tensor->qparams.scale_offsets[0].zero_point == 0;
-    for (int64_t index = 0;
-         is_qnn_hadamard && index < input_dimension * output_dimension;
-         ++index) {
-        is_qnn_hadamard = static_weights[index] == INT16_MAX ||
-            static_weights[index] == -INT16_MAX;
-    }
-    GGML_ASSERT(is_qnn_hadamard &&
-        "QNN Q/K rotation matrix no longer matches the validated HTP contract");
+    require_qnn_hadamard_weights(
+        profile, operation, weight_tensor, static_weights,
+        input_dimension, output_dimension);
     const double hadamard_ratio =
         (
             static_cast<double>(
@@ -2361,11 +4628,63 @@ ggml_tensor * llama_qnn_u16_qk_rotate_heads(
         int32_t n_head) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && profile != nullptr);
     GGML_ASSERT(operations != nullptr && n_head > 0);
-    GGML_ASSERT(input->type == GGML_TYPE_U16 && input->ne[1] == n_head);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(input->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16) &&
+        input->ne[1] == n_head);
+    if (use_a8) {
+        auto * values = static_cast<qnn_u8_u8_matmul_params *>(
+            ggml_new_buffer(ctx, sizeof(qnn_u8_u8_matmul_params) * n_head));
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] = make_u8_qk_rotate_params(
+                profile, operations[head], input->ne[0]);
+        }
+        const qnn_u16_head_params<qnn_u8_u8_matmul_params> value {
+            values, n_head,
+        };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { input };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+            args, 1, qnn_u8_u8_matmul_heads_compute, GGML_N_TASKS_MAX, params);
+    }
     auto * values = static_cast<qnn_u16_s16_matmul_params *>(
         ggml_new_buffer(ctx, sizeof(qnn_u16_s16_matmul_params) * n_head));
-    for (int32_t head = 0; head < n_head; ++head) {
-        values[head] = make_qk_rotate_params(profile, operations[head], input->ne[0]);
+    static const bool cache_static_params =
+        is_enabled_value(std::getenv("GGML_QNN_STATIC_PARAMS_CACHE"));
+    struct cache_entry {
+        int32_t n_head;
+        int64_t dimension;
+        std::vector<qnn_u16_s16_matmul_params> values;
+    };
+    struct cache_state {
+        const llama_qnn_quant_profile * profile = nullptr;
+        std::unordered_map<const llama_qnn_operation *, cache_entry> entries;
+    };
+    thread_local cache_state & cache = *new cache_state();
+    auto cached = cache.entries.end();
+    if (cache_static_params) {
+        if (cache.profile != profile) {
+            cache.profile = profile;
+            cache.entries.clear();
+        }
+        cached = cache.entries.find(operations[0]);
+    }
+    if (cached != cache.entries.end()) {
+        GGML_ASSERT(cached->second.n_head == n_head &&
+            cached->second.dimension == input->ne[0] &&
+            cached->second.values.size() == static_cast<size_t>(n_head));
+        std::copy(cached->second.values.begin(), cached->second.values.end(), values);
+    } else {
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] = make_qk_rotate_params(profile, operations[head], input->ne[0]);
+        }
+        if (cache_static_params) {
+            cache.entries.emplace(operations[0], cache_entry {
+                n_head, input->ne[0],
+                std::vector<qnn_u16_s16_matmul_params>(values, values + n_head),
+            });
+        }
     }
     const qnn_u16_head_params<qnn_u16_s16_matmul_params> value { values, n_head };
     auto * params = new_qnn_u16_params(ctx, value);
@@ -2417,11 +4736,46 @@ ggml_tensor * llama_qnn_u16_to_u8_heads(
         int32_t n_head) {
     GGML_ASSERT(ctx != nullptr && input != nullptr && profile != nullptr);
     GGML_ASSERT(operations != nullptr && n_head > 0);
-    GGML_ASSERT(input->type == GGML_TYPE_U16 && input->ne[1] == n_head);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(input->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16) &&
+        input->ne[1] == n_head);
     auto * values = static_cast<qnn_u16_to_u8_params *>(
         ggml_new_buffer(ctx, sizeof(qnn_u16_to_u8_params) * n_head));
-    for (int32_t head = 0; head < n_head; ++head) {
-        values[head] = make_to_u8_params(profile, operations[head]);
+    static const bool cache_static_params =
+        is_enabled_value(std::getenv("GGML_QNN_STATIC_PARAMS_CACHE"));
+    struct cache_entry {
+        int32_t n_head;
+        std::vector<qnn_u16_to_u8_params> values;
+    };
+    struct cache_state {
+        const llama_qnn_quant_profile * profile = nullptr;
+        std::unordered_map<const llama_qnn_operation *, cache_entry> entries;
+    };
+    thread_local cache_state & cache = *new cache_state();
+    auto cached = cache.entries.end();
+    if (!use_a8 && cache_static_params) {
+        if (cache.profile != profile) {
+            cache.profile = profile;
+            cache.entries.clear();
+        }
+        cached = cache.entries.find(operations[0]);
+    }
+    if (cached != cache.entries.end()) {
+        GGML_ASSERT(cached->second.n_head == n_head &&
+            cached->second.values.size() == static_cast<size_t>(n_head));
+        std::copy(cached->second.values.begin(), cached->second.values.end(), values);
+    } else {
+        for (int32_t head = 0; head < n_head; ++head) {
+            values[head] = use_a8
+                ? make_u8_to_u8_params(profile, operations[head])
+                : make_to_u8_params(profile, operations[head]);
+        }
+        if (!use_a8 && cache_static_params) {
+            cache.entries.emplace(operations[0], cache_entry {
+                n_head,
+                std::vector<qnn_u16_to_u8_params>(values, values + n_head),
+            });
+        }
     }
     const qnn_u16_head_params<qnn_u16_to_u8_params> value { values, n_head };
     auto * params = new_qnn_u16_params(ctx, value);
@@ -2429,7 +4783,9 @@ ggml_tensor * llama_qnn_u16_to_u8_heads(
     return ggml_custom_4d(
         ctx, GGML_TYPE_I8,
         input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-        args, 1, qnn_u16_to_u8_heads_compute, GGML_N_TASKS_MAX, params);
+        args, 1,
+        use_a8 ? qnn_u8_to_u8_heads_compute : qnn_u16_to_u8_heads_compute,
+        GGML_N_TASKS_MAX, params);
 }
 
 ggml_tensor * llama_qnn_u16_u8_matmul(
@@ -2623,6 +4979,8 @@ ggml_tensor * llama_qnn_u16_attention_softmax(
         require_u16_operand(profile, softmax_operation, "output", 0);
     GGML_ASSERT(divide_operation->unary_input_to_output_q20 > 0);
     GGML_ASSERT(minimum_operation->unary_input_to_output_q20 > 0);
+    GGML_ASSERT(minimum_operation->unary_lut.empty() ||
+        minimum_operation->unary_lut.size() == 256);
     GGML_ASSERT(floor_add_operation->input_to_output_q20.size() >= 2);
     GGML_ASSERT(floor_rhs->static_data.size() == 1);
     GGML_ASSERT(softmax_operation->softmax_scale_over_ln2_q24 > 0);
@@ -2803,6 +5161,168 @@ qnn_u16_attention_softmax_params make_attention_softmax_params(
     };
 }
 
+qnn_u8_attention_matmul_params make_u8_attention_matmul_params(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * operation) {
+    GGML_ASSERT(profile != nullptr && profile->activation_bits == 8);
+    GGML_ASSERT(operation != nullptr && operation->type_name == "MatMul");
+    const auto * input = require_u16_operand(profile, operation, "input", 0);
+    const auto * output = require_u16_operand(profile, operation, "output", 0);
+    const auto * weight_u8 = profile->find_u16_operand(*operation, "input", 1);
+    const auto * weight_aux = profile->find_aux_operand(*operation, "input", 1);
+    GGML_ASSERT((weight_u8 != nullptr) != (weight_aux != nullptr));
+    const llama_qnn_tensor_qparams & weight_qparams = weight_u8 != nullptr
+        ? weight_u8->qparams
+        : weight_aux->qparams;
+    const std::string & weight_data_type = weight_u8 != nullptr
+        ? weight_u8->data_type
+        : weight_aux->data_type;
+    GGML_ASSERT(weight_qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET);
+    GGML_ASSERT(weight_qparams.scale_offsets.size() == 1);
+    GGML_ASSERT(weight_data_type == "QNN_DATATYPE_UFIXED_POINT_8" ||
+        weight_data_type == "QNN_DATATYPE_SFIXED_POINT_8");
+    const llama_qnn_operation * convert = profile->find_producer(
+        operation->shard_index, operation->inputs[1]);
+    GGML_ASSERT(convert != nullptr && convert->type_name == "Convert");
+    const auto * cache = require_u16_operand(profile, convert, "input", 0);
+    GGML_ASSERT(convert->unary_input_to_output_q31 > 0);
+    GGML_ASSERT(operation->matmul_product_to_output_q31 > 0);
+    qnn_u8_attention_matmul_params params = {
+        input->qparams.scale_offsets[0].zero_point,
+        cache->qparams.scale_offsets[0].zero_point,
+        convert->unary_input_to_output_q31,
+        weight_qparams.scale_offsets[0].zero_point,
+        operation->matmul_product_to_output_q31,
+        output->qparams.scale_offsets[0].zero_point,
+        {},
+        weight_data_type == "QNN_DATATYPE_SFIXED_POINT_8",
+        {},
+        true,
+        true,
+    };
+    // V75 scale-shuff retains one coefficient bit beyond FP16 and snaps each
+    // affine output-code boundary to an exponent-dependent accumulator grid.
+    // Half-grid ties select the lower accumulator.  This is intentionally
+    // A8-only; the established A16 MatMul path remains unchanged.
+    const float accumulator_scale =
+        static_cast<float>(input->qparams.scale_offsets[0].scale) *
+        static_cast<float>(weight_qparams.scale_offsets[0].scale);
+    const float ratio = accumulator_scale /
+        static_cast<float>(output->qparams.scale_offsets[0].scale);
+    const float coefficient_target = ratio * 512.0f;
+    int target_exponent = 0;
+    std::frexp(coefficient_target, &target_exponent);
+    const double coefficient_step = std::ldexp(1.0, target_exponent - 12);
+    const double coefficient =
+        std::floor(static_cast<double>(coefficient_target) / coefficient_step + 0.5) *
+        coefficient_step;
+    const int coefficient_exponent = std::ilogb(coefficient);
+    const int accumulator_grid = 1 << (5 - coefficient_exponent);
+    params.output_thresholds[0] = std::numeric_limits<int32_t>::min();
+    const auto ceil_div_positive_denominator = [](int64_t numerator, int64_t denominator) {
+        const int64_t quotient = numerator / denominator;
+        const int64_t remainder = numerator % denominator;
+        return quotient + (remainder > 0 ? 1 : 0);
+    };
+    for (int32_t code = 1; code <= UINT8_MAX; ++code) {
+        const double ideal_real =
+            (static_cast<double>(code) -
+                (static_cast<double>(params.output_zero_point) + 0.5)) *
+            512.0 / coefficient;
+        const int64_t ideal = static_cast<int64_t>(std::ceil(ideal_real));
+        const int64_t numerator = 2 * ideal - accumulator_grid;
+        const int64_t grid_index = ceil_div_positive_denominator(
+            numerator, 2 * accumulator_grid);
+        const int64_t threshold = grid_index * accumulator_grid;
+        params.output_thresholds[code] = static_cast<int32_t>(std::clamp<int64_t>(
+            threshold, std::numeric_limits<int32_t>::min(),
+            std::numeric_limits<int32_t>::max()));
+    }
+    for (int32_t code = 0; code <= UINT8_MAX; ++code) {
+        const int32_t centered = qnn_u8_attention_cache_code(
+            static_cast<uint8_t>(code), params) - params.weight_zero_point;
+        if (centered < INT8_MIN || centered > INT8_MAX) {
+            params.centered_cache_lut_valid = false;
+        } else {
+            params.centered_cache_lut[code] = static_cast<int8_t>(centered);
+        }
+        const int32_t xor128_clamp = std::max(code - 128, -127);
+        if (centered != xor128_clamp) {
+            params.centered_cache_xor128_clamp = false;
+        }
+    }
+    return params;
+}
+
+qnn_u8_attention_softmax_params make_u8_attention_softmax_params(
+        const llama_qnn_quant_profile * profile,
+        const llama_qnn_operation * divide_operation,
+        const llama_qnn_operation * minimum_operation,
+        const llama_qnn_operation * floor_add_operation,
+        const llama_qnn_operation * select_operation,
+        const llama_qnn_operation * softmax_operation) {
+    GGML_ASSERT(profile != nullptr && profile->activation_bits == 8);
+    const auto * divide_input =
+        require_u16_operand(profile, divide_operation, "input", 0);
+    const auto * divide_output =
+        require_u16_operand(profile, divide_operation, "output", 0);
+    const auto * minimum_input =
+        require_u16_operand(profile, minimum_operation, "input", 0);
+    const auto * minimum_output =
+        require_u16_operand(profile, minimum_operation, "output", 0);
+    const auto * floor_rhs =
+        require_u16_operand(profile, floor_add_operation, "input", 1);
+    const auto * select_true =
+        require_u16_operand(profile, select_operation, "input", 1);
+    const auto * select_false =
+        require_u16_operand(profile, select_operation, "input", 2);
+    const auto * select_output =
+        require_u16_operand(profile, select_operation, "output", 0);
+    const auto * softmax_output =
+        require_u16_operand(profile, softmax_operation, "output", 0);
+    GGML_ASSERT(divide_operation->unary_input_to_output_q20 > 0);
+    GGML_ASSERT(minimum_operation->unary_input_to_output_q20 > 0);
+    GGML_ASSERT(floor_add_operation->a8_add_subtract.valid);
+    GGML_ASSERT(floor_rhs->static_data.size() == 1 &&
+        floor_rhs->static_data[0] <= UINT8_MAX);
+    const qnn_u16_scalefactor_q15 true_scalefactor =
+        qnn_u16_htp_scalefactor_q15(select_true, select_output);
+    const qnn_u16_scalefactor_q15 false_scalefactor =
+        qnn_u16_htp_scalefactor_q15(select_false, select_output);
+    return {
+        {
+            divide_input->qparams.scale_offsets[0].zero_point,
+            divide_operation->unary_input_to_output_q20,
+            divide_output->qparams.scale_offsets[0].zero_point,
+        },
+        static_cast<int64_t>(std::floor(std::ldexp(
+            divide_output->qparams.scale_offsets[0].scale / std::log(2.0), 22))) << 2,
+        {
+            minimum_input->qparams.scale_offsets[0].zero_point,
+            minimum_operation->unary_input_to_output_q20,
+            minimum_output->qparams.scale_offsets[0].zero_point,
+        },
+        minimum_operation->unary_lut.empty()
+            ? nullptr
+            : minimum_operation->unary_lut.data(),
+        floor_add_operation->a8_add_subtract,
+        static_cast<uint8_t>(floor_rhs->static_data[0]),
+        {
+            select_true->qparams.scale_offsets[0].zero_point,
+            true_scalefactor.multiplier, true_scalefactor.right_shift,
+            select_false->qparams.scale_offsets[0].zero_point,
+            false_scalefactor.multiplier, false_scalefactor.right_shift,
+            select_output->qparams.scale_offsets[0].zero_point,
+        },
+        {
+            softmax_operation->softmax_scale_over_ln2_q24,
+            softmax_operation->softmax_unit_code,
+            softmax_output->qparams.scale_offsets[0].zero_point,
+            softmax_operation->softmax_exp2_lut_q31.data(),
+        },
+    };
+}
+
 } // namespace
 
 ggml_tensor * llama_qnn_u16_attention(
@@ -2818,28 +5338,85 @@ ggml_tensor * llama_qnn_u16_attention(
     GGML_ASSERT(ctx != nullptr && query != nullptr && key_cache != nullptr);
     GGML_ASSERT(value_cache != nullptr && condition != nullptr && profile != nullptr);
     GGML_ASSERT(head_ops != nullptr);
-    GGML_ASSERT(query->type == GGML_TYPE_U16);
+    const bool use_a8 = profile->activation_bits == 8;
+    GGML_ASSERT(query->type == (use_a8 ? GGML_TYPE_U8 : GGML_TYPE_U16));
     GGML_ASSERT(key_cache->type == GGML_TYPE_I8 && value_cache->type == GGML_TYPE_I8);
     GGML_ASSERT(condition->type == GGML_TYPE_I8);
     GGML_ASSERT(n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0);
     GGML_ASSERT(query->ne[1] == n_head);
     GGML_ASSERT(key_cache->ne[0] == query->ne[0] && key_cache->ne[2] == n_head_kv);
-    GGML_ASSERT(value_cache->ne[0] == query->ne[0] && value_cache->ne[1] == n_head_kv);
+    GGML_ASSERT(value_cache->ne[0] == query->ne[0]);
+    GGML_ASSERT(value_cache->ne[1] == n_head_kv);
     GGML_ASSERT(value_cache->ne[2] == key_cache->ne[1]);
     GGML_ASSERT(condition->ne[0] == key_cache->ne[1]);
     GGML_ASSERT(condition->ne[1] == query->ne[2]);
 
+    if (use_a8) {
+        auto * heads = static_cast<qnn_u8_attention_head_params *>(
+            ggml_new_buffer(ctx, sizeof(qnn_u8_attention_head_params) * n_head));
+        for (int32_t head = 0; head < n_head; ++head) {
+            const auto & ops = head_ops[head];
+            heads[head] = {
+                make_u8_attention_matmul_params(profile, ops.score),
+                make_u8_attention_softmax_params(
+                    profile, ops.divide, ops.minimum, ops.floor_add,
+                    ops.select, ops.softmax),
+                make_u8_attention_matmul_params(profile, ops.value),
+            };
+        }
+        const qnn_u8_attention_params value { heads, n_head, n_head_kv };
+        auto * params = new_qnn_u16_params(ctx, value);
+        ggml_tensor * args[] = { query, key_cache, value_cache, condition };
+        return ggml_custom_4d(
+            ctx, GGML_TYPE_U8,
+            query->ne[0], query->ne[1], query->ne[2], query->ne[3],
+            args, 4, qnn_u8_attention_compute, GGML_N_TASKS_MAX, params);
+    }
+
     auto * heads = static_cast<qnn_u16_attention_head_params *>(
         ggml_new_buffer(ctx, sizeof(qnn_u16_attention_head_params) * n_head));
-    for (int32_t head = 0; head < n_head; ++head) {
-        const auto & ops = head_ops[head];
-        heads[head] = {
-            make_u16_u8_matmul_params(profile, ops.score),
-            make_attention_softmax_params(
-                profile, ops.divide, ops.minimum, ops.floor_add,
-                ops.select, ops.softmax),
-            make_u16_u8_matmul_params(profile, ops.value),
-        };
+    static const bool cache_static_params =
+        is_enabled_value(std::getenv("GGML_QNN_STATIC_PARAMS_CACHE"));
+    struct cache_entry {
+        int32_t n_head;
+        int32_t n_head_kv;
+        std::vector<qnn_u16_attention_head_params> heads;
+    };
+    struct cache_state {
+        const llama_qnn_quant_profile * profile = nullptr;
+        std::unordered_map<const llama_qnn_operation *, cache_entry> entries;
+    };
+    thread_local cache_state & cache = *new cache_state();
+    auto cached = cache.entries.end();
+    if (cache_static_params) {
+        if (cache.profile != profile) {
+            cache.profile = profile;
+            cache.entries.clear();
+        }
+        cached = cache.entries.find(head_ops[0].score);
+    }
+    if (cached != cache.entries.end()) {
+        GGML_ASSERT(cached->second.n_head == n_head &&
+            cached->second.n_head_kv == n_head_kv &&
+            cached->second.heads.size() == static_cast<size_t>(n_head));
+        std::copy(cached->second.heads.begin(), cached->second.heads.end(), heads);
+    } else {
+        for (int32_t head = 0; head < n_head; ++head) {
+            const auto & ops = head_ops[head];
+            heads[head] = {
+                make_u16_u8_matmul_params(profile, ops.score),
+                make_attention_softmax_params(
+                    profile, ops.divide, ops.minimum, ops.floor_add,
+                    ops.select, ops.softmax),
+                make_u16_u8_matmul_params(profile, ops.value),
+            };
+        }
+        if (cache_static_params) {
+            cache.entries.emplace(head_ops[0].score, cache_entry {
+                n_head, n_head_kv,
+                std::vector<qnn_u16_attention_head_params>(heads, heads + n_head),
+            });
+        }
     }
 
     const qnn_u16_attention_params value {

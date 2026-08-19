@@ -5744,6 +5744,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
+        case GGML_TYPE_U8:
         case GGML_TYPE_U16:
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:

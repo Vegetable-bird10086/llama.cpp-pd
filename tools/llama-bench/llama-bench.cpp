@@ -2,6 +2,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <csignal>
 #include <cinttypes>
 #include <clocale>
 #include <cmath>
@@ -2393,6 +2394,12 @@ int llama_bench(int argc, char ** argv) {
                                 i + 1, params.reps);
                     }
                 }
+            }
+
+            if (i == 0 && std::getenv("LLAMA_BENCH_PROFILE_STOP_BEFORE_TIMED")) {
+                std::fprintf(stderr, "llama-bench: profile-ready pid=%d\n", getpid());
+                std::fflush(stderr);
+                std::raise(SIGSTOP);
             }
 
             uint64_t t_start = get_time_ns();

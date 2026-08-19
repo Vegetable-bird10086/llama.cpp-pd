@@ -865,15 +865,16 @@ llama_model_loader::llama_model_loader(
 
     std::string gptq2_32_layout;
     if (get_key("general.gptq2_32.layout", gptq2_32_layout, false)) {
-        if (gptq2_32_layout != "gs32_source_v1") {
+        if (gptq2_32_layout != "gs32_source_v1" &&
+            gptq2_32_layout != "i8mm_native_v1") {
             throw std::runtime_error(format(
                 "unsupported general.gptq2_32.layout: %s",
                 gptq2_32_layout.c_str()));
         }
         gptq2_32_gs32_source = true;
         LLAMA_LOG_INFO(
-            "%s: keeping gs32_source_v1 GPTQ2_32 tensors in their shared file-backed layout\n",
-            __func__);
+            "%s: keeping %s GPTQ2_32 tensors in their shared file-backed layout\n",
+            __func__, gptq2_32_layout.c_str());
     }
 
     std::string q8_0_lm_head_layout;

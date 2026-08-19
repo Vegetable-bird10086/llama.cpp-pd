@@ -6,11 +6,13 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <string>
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         std::cerr
-            << "usage: qnn-u16-profile-convert INPUT.json MODEL.gguf OUTPUT.bin\n";
+            << "usage: qnn-u16-profile-convert INPUT.json MODEL.gguf OUTPUT.meta [SHARDS]\n"
+            << "       SHARDS defaults to ceil(num_decoder_layers / 2)\n";
         return 64;
     }
     try {
@@ -31,9 +33,38 @@ int main(int argc, char ** argv) {
             return 1;
         }
         llama_qnn_quant_profile_prepare_kernel_metadata(*model, *profile);
-        llama_qnn_quant_profile_save_binary_file(*profile, argv[3]);
+        size_t shard_count = static_cast<size_t>(
+            (profile->num_decoder_layers + 1) / 2);
+        if (argc == 5) {
+            shard_count = std::stoul(argv[4]);
+        }
+        if (shard_count == 0) {
+            throw std::runtime_error("QNN profile has no decoder shards");
+        }
+        llama_qnn_quant_profile_save_sharded_binary_file(
+            *profile, argv[3], shard_count);
         const auto check = llama_qnn_quant_profile_load_file(argv[3]);
         if (check) {
+            llama_qnn_quant_profile_prepare_kernel_metadata(*model, *check);
+        }
+        size_t streamed_sidecar_bytes = 0;
+        if (check) {
+            if (!check->binary_stream_prepare(shard_count)) {
+                throw std::runtime_error(
+                    "cannot release sharded sidecar buffers for verification");
+            }
+            for (size_t shard = 0; shard < shard_count; ++shard) {
+                size_t loaded = 0;
+                if (!check->binary_stream_fill(shard, &loaded)) {
+                    throw std::runtime_error(
+                        "cannot reload sidecar shard " + std::to_string(shard));
+                }
+                streamed_sidecar_bytes += loaded;
+            }
+            if (!check->binary_stream_finish()) {
+                throw std::runtime_error(
+                    "cannot finish sharded sidecar reload verification");
+            }
             llama_qnn_quant_profile_prepare_kernel_metadata(*model, *check);
         }
         size_t tiled_linears = 0;
@@ -95,6 +126,8 @@ int main(int argc, char ** argv) {
             << " mapped_linear_buffers=" << mapped_linear_buffers
             << " mapped_static_buffers=" << mapped_static_buffers
             << " mapped_operation_buffers=" << mapped_lut_buffers
+            << " sidecar_shards=" << shard_count
+            << " streamed_sidecar_bytes=" << streamed_sidecar_bytes
             << " weight_layout=" << check->weight_layout
             << " lm_head_type=" << check->lm_head_type
             << " lm_head_layout=" << check->lm_head_layout

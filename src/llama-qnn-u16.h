@@ -35,6 +35,29 @@ bool llama_qnn_u16_activations_enabled();
 // metadata mapping until Prefill has released its rebuild working set.
 bool llama_qnn_u16_attach_profile_from_environment(llama_model * model);
 
+// Converts canonical FP16 PD KV ([K,V][layer][head][token][dim]) into the
+// exact per-layer/per-head U8 cache domains declared by the attached QNN
+// profile. This is the bridge used when a non-QNN Prefill backend (for
+// example MTK) hands real-valued KV to the QNN-aligned llama.cpp Decode path.
+struct llama_qnn_kv_quantize_stats {
+    size_t values = 0;
+    size_t non_finite = 0;
+    size_t code_zero = 0;
+    size_t code_255 = 0;
+};
+
+bool llama_qnn_u16_quantize_fp16_kv(
+    const llama_model * model,
+    const uint16_t * fp16_kv,
+    size_t fp16_values,
+    int32_t num_layers,
+    int32_t num_kv_heads,
+    int32_t prompt_length,
+    int32_t head_dim,
+    uint8_t * qnn_u8_kv,
+    llama_qnn_kv_quantize_stats * stats,
+    std::string * error);
+
 // Quantize/dequantize only at the graph boundary. The decode layers between
 // these two calls stay in QNN's integer activation domains.
 ggml_tensor * llama_qnn_quantize_f32_to_u16(
@@ -42,6 +65,12 @@ ggml_tensor * llama_qnn_quantize_f32_to_u16(
     ggml_tensor * input,
     const llama_qnn_quant_profile * profile,
     const llama_qnn_operation * quantize_operation);
+
+ggml_tensor * llama_qnn_quantize_f32_to_u16(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    const llama_qnn_quant_profile * profile,
+    const llama_qnn_u16_tensor * output_qparams);
 
 ggml_tensor * llama_qnn_dequantize_u16_to_f32(
     ggml_context * ctx,

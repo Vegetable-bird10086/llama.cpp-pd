@@ -3,6 +3,8 @@
 #include "pd_cli_inprocess.h"
 #include "json.hpp"
 #include "llama.h"
+#include "llama-ext.h"
+#include "llama-model.h"
 #include "llama-qnn-u16.h"
 #include "log.h"
 #include "sampling.h"
@@ -47,6 +49,9 @@ struct pd_args {
     int memory_fd = -1;
     const uint8_t * memory_ptr = nullptr;
     size_t memory_size = 0;
+    const uint64_t * prompt_tokens_ptr = nullptr;
+    const uint16_t * kv_fp16_ptr = nullptr;
+    size_t kv_fp16_values = 0;
     int32_t prompt_length = 0;
     int32_t num_layers = 0;
     int32_t num_kv_heads = 0;
@@ -394,66 +399,52 @@ struct pd_capture_state {
     bool completed = false;
 };
 
+static thread_local pd_capture_state * g_pd_capture_state = nullptr;
+
 static const char * const pd_default_capture_nodes[] = {
     "qnn_u16_input",
     "qnn_attn_norm-0",
     "qnn_q_projection-0",
     "qnn_k_projection-0",
     "qnn_v_projection-0",
-    "qnn_q_head_norm-0",
-    "qnn_q_head_rope-0",
-    "qnn_q_head_rotate-0",
-    "qnn_k_head_norm-0",
-    "qnn_k_head_rope-0",
-    "qnn_k_head_rotate-0",
-    "qnn_k_head_u8-0",
-    "qnn_v_head_u8-0",
-    "qnn_attention_score-0",
-    "qnn_attention_scaled-0",
-    "qnn_attention_min-0",
-    "qnn_attention_mask_value-0",
-    "qnn_attention_masked-0",
-    "qnn_attention_softmax-0",
-    "qnn_attention_value-0",
+    "qnn_q_heads_norm-0",
+    "qnn_q_heads_rope-0",
+    "qnn_q_heads_rotate-0",
+    "qnn_k_heads_norm-0",
+    "qnn_k_heads_rope-0",
+    "qnn_k_heads_rotate-0",
+    "qnn_k_heads_u8-0",
+    "qnn_v_heads_u8-0",
+    "qnn_attention-0",
     "qnn_attention_concat-0",
     "qnn_attention_output-0",
     "qnn_ffn_input-0",
     "qnn_ffn_norm-0",
     "qnn_ffn_gate-0",
     "qnn_ffn_up-0",
-    "qnn_ffn_sigmoid-0",
-    "qnn_ffn_silu-0",
-    "qnn_ffn_product-0",
+    "qnn_ffn_swiglu-0",
     "qnn_ffn_down-0",
     "qnn_layer_output-0",
     "qnn_attn_norm-1",
     "qnn_q_projection-1",
     "qnn_k_projection-1",
     "qnn_v_projection-1",
-    "qnn_q_head_norm-1",
-    "qnn_q_head_rope-1",
-    "qnn_q_head_rotate-1",
-    "qnn_k_head_norm-1",
-    "qnn_k_head_rope-1",
-    "qnn_k_head_rotate-1",
-    "qnn_k_head_u8-1",
-    "qnn_v_head_u8-1",
-    "qnn_attention_score-1",
-    "qnn_attention_scaled-1",
-    "qnn_attention_min-1",
-    "qnn_attention_mask_value-1",
-    "qnn_attention_masked-1",
-    "qnn_attention_softmax-1",
-    "qnn_attention_value-1",
+    "qnn_q_heads_norm-1",
+    "qnn_q_heads_rope-1",
+    "qnn_q_heads_rotate-1",
+    "qnn_k_heads_norm-1",
+    "qnn_k_heads_rope-1",
+    "qnn_k_heads_rotate-1",
+    "qnn_k_heads_u8-1",
+    "qnn_v_heads_u8-1",
+    "qnn_attention-1",
     "qnn_attention_concat-1",
     "qnn_attention_output-1",
     "qnn_ffn_input-1",
     "qnn_ffn_norm-1",
     "qnn_ffn_gate-1",
     "qnn_ffn_up-1",
-    "qnn_ffn_sigmoid-1",
-    "qnn_ffn_silu-1",
-    "qnn_ffn_product-1",
+    "qnn_ffn_swiglu-1",
     "qnn_ffn_down-1",
     "qnn_layer_output-1",
 };
@@ -464,6 +455,39 @@ static void configure_pd_capture(pd_capture_state & state, const char * output_d
     state.requested.insert(
         std::begin(pd_default_capture_nodes),
         std::end(pd_default_capture_nodes));
+    for (int32_t layer = 0; layer < 36; ++layer) {
+        const std::string suffix = "-" + std::to_string(layer);
+        state.requested.insert("qnn_attn_norm" + suffix);
+        state.requested.insert("qnn_attention_output" + suffix);
+        state.requested.insert("qnn_ffn_down" + suffix);
+        state.requested.insert("qnn_layer_output" + suffix);
+    }
+    const std::vector<std::string> detailed_stages = {
+        "qnn_q_projection",
+        "qnn_k_projection",
+        "qnn_v_projection",
+        "qnn_q_heads_norm",
+        "qnn_q_heads_rope",
+        "qnn_q_heads_rotate",
+        "qnn_k_heads_norm",
+        "qnn_k_heads_rope",
+        "qnn_k_heads_rotate",
+        "qnn_k_heads_u8",
+        "qnn_v_heads_u8",
+        "qnn_attention",
+        "qnn_attention_concat",
+        "qnn_ffn_input",
+        "qnn_ffn_norm",
+        "qnn_ffn_gate",
+        "qnn_ffn_up",
+        "qnn_ffn_swiglu",
+    };
+    for (int32_t layer : {5, 6}) {
+        const std::string suffix = "-" + std::to_string(layer);
+        for (const std::string & stage : detailed_stages) {
+            state.requested.insert(stage + suffix);
+        }
+    }
 }
 
 static bool write_pd_capture(
@@ -477,6 +501,7 @@ static bool write_pd_capture(
     const char * suffix = nullptr;
     switch (tensor->type) {
         case GGML_TYPE_U16: suffix = ".u16.bin"; break;
+        case GGML_TYPE_U8:  suffix = ".u8.bin";  break;
         case GGML_TYPE_I8:  suffix = ".u8.bin";  break;
         default:
             state.error = "unsupported target tensor type: " + name +
@@ -523,7 +548,13 @@ static bool write_pd_capture(
 }
 
 static bool pd_capture_callback(ggml_tensor * tensor, bool ask, void * user_data) {
-    auto & state = *static_cast<pd_capture_state *>(user_data);
+    pd_capture_state * state_ptr = user_data != nullptr
+        ? static_cast<pd_capture_state *>(user_data)
+        : g_pd_capture_state;
+    if (state_ptr == nullptr) {
+        return false;
+    }
+    auto & state = *state_ptr;
     if (!state.active || !state.error.empty()) {
         return false;
     }
@@ -726,6 +757,8 @@ struct pd_op_profile_state {
     }
 };
 
+static thread_local pd_op_profile_state * g_pd_op_profile_state = nullptr;
+
 static bool pd_op_profile_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     auto & state = *static_cast<pd_op_profile_state *>(user_data);
     if (!state.active) {
@@ -790,10 +823,43 @@ static bool pd_op_profile_callback(ggml_tensor * tensor, bool ask, void * user_d
     return true;
 }
 
+// A resident in-process context is created before an individual PD request has
+// its capture/profile state. Keep one callback installed on that context and
+// dispatch to the request-local diagnostic state selected around llama_decode.
+// Both pointers are null in the normal production path.
+static bool pd_resident_eval_callback(ggml_tensor * tensor, bool ask, void *) {
+    if (g_pd_capture_state != nullptr) {
+        return pd_capture_callback(tensor, ask, nullptr);
+    }
+    if (g_pd_op_profile_state != nullptr) {
+        return pd_op_profile_callback(tensor, ask, g_pd_op_profile_state);
+    }
+    return false;
+}
+
 struct process_memory_snapshot {
     uint64_t rss_bytes = 0;
     uint64_t hwm_bytes = 0;
+    uint64_t rss_anon_bytes = 0;
+    uint64_t rss_file_bytes = 0;
+    uint64_t rss_shmem_bytes = 0;
+    uint64_t data_bytes = 0;
+    uint64_t swap_bytes = 0;
 };
+
+struct mapping_memory_snapshot {
+    uint64_t rss_bytes = 0;
+    uint64_t pss_bytes = 0;
+    uint64_t private_clean_bytes = 0;
+    uint64_t private_dirty_bytes = 0;
+    uint64_t shared_clean_bytes = 0;
+    uint64_t shared_dirty_bytes = 0;
+    uint64_t anonymous_bytes = 0;
+    uint64_t swap_bytes = 0;
+};
+
+using process_mapping_snapshot =
+    std::map<std::string, mapping_memory_snapshot>;
 
 static uint64_t read_proc_status_bytes(const char * field) {
     std::ifstream status("/proc/self/status");
@@ -814,11 +880,174 @@ static process_memory_snapshot process_memory() {
     return {
         read_proc_status_bytes("VmRSS:"),
         read_proc_status_bytes("VmHWM:"),
+        read_proc_status_bytes("RssAnon:"),
+        read_proc_status_bytes("RssFile:"),
+        read_proc_status_bytes("RssShmem:"),
+        read_proc_status_bytes("VmData:"),
+        read_proc_status_bytes("VmSwap:"),
     };
 }
 
 static double bytes_to_mib(uint64_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+static bool warmup_memory_profile_enabled() {
+    const char * value = std::getenv("LLAMA_PD_WARMUP_MEMORY_PROFILE");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+static std::string trim_left(std::string value) {
+    const size_t first = value.find_first_not_of(" \t");
+    return first == std::string::npos ? std::string() : value.substr(first);
+}
+
+static process_mapping_snapshot process_mappings() {
+    std::ifstream smaps("/proc/self/smaps");
+    process_mapping_snapshot result;
+    std::string current_mapping;
+    std::string line;
+    while (std::getline(smaps, line)) {
+        const size_t dash = line.find('-');
+        const bool mapping_header =
+            dash != std::string::npos && dash > 0 && dash < 32 &&
+            std::all_of(line.begin(), line.begin() + dash, [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            });
+        if (mapping_header) {
+            std::istringstream header(line);
+            std::string address;
+            std::string permissions;
+            std::string offset;
+            std::string device;
+            std::string inode;
+            header >> address >> permissions >> offset >> device >> inode;
+            std::getline(header, current_mapping);
+            current_mapping = trim_left(std::move(current_mapping));
+            if (current_mapping.empty()) {
+                current_mapping = "[anonymous]";
+            }
+            continue;
+        }
+        if (current_mapping.empty()) {
+            continue;
+        }
+        const auto read_kib = [&](const char * field, uint64_t * destination) {
+            if (line.rfind(field, 0) != 0) {
+                return false;
+            }
+            std::istringstream value(line.substr(std::strlen(field)));
+            uint64_t kib = 0;
+            value >> kib;
+            *destination += kib * 1024;
+            return true;
+        };
+        mapping_memory_snapshot & memory = result[current_mapping];
+        if (read_kib("Rss:", &memory.rss_bytes) ||
+                read_kib("Pss:", &memory.pss_bytes) ||
+                read_kib("Private_Clean:", &memory.private_clean_bytes) ||
+                read_kib("Private_Dirty:", &memory.private_dirty_bytes) ||
+                read_kib("Shared_Clean:", &memory.shared_clean_bytes) ||
+                read_kib("Shared_Dirty:", &memory.shared_dirty_bytes) ||
+                read_kib("Anonymous:", &memory.anonymous_bytes) ||
+                read_kib("Swap:", &memory.swap_bytes)) {
+            continue;
+        }
+    }
+    return result;
+}
+
+static int64_t mapping_delta(
+        uint64_t after,
+        uint64_t before) {
+    return after >= before
+        ? static_cast<int64_t>(after - before)
+        : -static_cast<int64_t>(before - after);
+}
+
+static double signed_bytes_to_mib(int64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+static void log_mapping_delta(
+        const char * phase,
+        const process_mapping_snapshot & before,
+        const process_mapping_snapshot & after) {
+    struct mapping_delta_entry {
+        std::string name;
+        int64_t rss_bytes = 0;
+        int64_t pss_bytes = 0;
+        int64_t private_dirty_bytes = 0;
+        int64_t anonymous_bytes = 0;
+        int64_t swap_bytes = 0;
+    };
+    std::vector<mapping_delta_entry> deltas;
+    deltas.reserve(before.size() + after.size());
+    std::unordered_set<std::string> names;
+    for (const auto & entry : before) {
+        names.insert(entry.first);
+    }
+    for (const auto & entry : after) {
+        names.insert(entry.first);
+    }
+    const mapping_memory_snapshot empty;
+    for (const std::string & name : names) {
+        const auto before_it = before.find(name);
+        const auto after_it = after.find(name);
+        const mapping_memory_snapshot & lhs =
+            before_it == before.end() ? empty : before_it->second;
+        const mapping_memory_snapshot & rhs =
+            after_it == after.end() ? empty : after_it->second;
+        mapping_delta_entry delta {
+            name,
+            mapping_delta(rhs.rss_bytes, lhs.rss_bytes),
+            mapping_delta(rhs.pss_bytes, lhs.pss_bytes),
+            mapping_delta(rhs.private_dirty_bytes, lhs.private_dirty_bytes),
+            mapping_delta(rhs.anonymous_bytes, lhs.anonymous_bytes),
+            mapping_delta(rhs.swap_bytes, lhs.swap_bytes),
+        };
+        if (delta.rss_bytes != 0 || delta.swap_bytes != 0) {
+            deltas.push_back(std::move(delta));
+        }
+    }
+    std::sort(
+        deltas.begin(), deltas.end(),
+        [](const mapping_delta_entry & lhs, const mapping_delta_entry & rhs) {
+            return std::llabs(lhs.rss_bytes) > std::llabs(rhs.rss_bytes);
+        });
+    const size_t count = std::min<size_t>(deltas.size(), 16);
+    for (size_t i = 0; i < count; ++i) {
+        const auto & delta = deltas[i];
+        LOG_INF(
+            "PD %s mapping delta: rank=%zu rss_mib=%+.2f pss_mib=%+.2f "
+            "private_dirty_mib=%+.2f anonymous_mib=%+.2f swap_mib=%+.2f "
+            "mapping=%s\n",
+            phase,
+            i,
+            signed_bytes_to_mib(delta.rss_bytes),
+            signed_bytes_to_mib(delta.pss_bytes),
+            signed_bytes_to_mib(delta.private_dirty_bytes),
+            signed_bytes_to_mib(delta.anonymous_bytes),
+            signed_bytes_to_mib(delta.swap_bytes),
+            delta.name.c_str());
+    }
+}
+
+static void log_warmup_memory_stage(
+        const char * stage,
+        const process_memory_snapshot & memory) {
+    LOG_INF(
+        "PD warmup memory: stage=%s rss_mib=%.2f hwm_mib=%.2f "
+        "rss_anon_mib=%.2f rss_file_mib=%.2f rss_shmem_mib=%.2f "
+        "vm_data_mib=%.2f swap_mib=%.2f\n",
+        stage,
+        bytes_to_mib(memory.rss_bytes),
+        bytes_to_mib(memory.hwm_bytes),
+        bytes_to_mib(memory.rss_anon_bytes),
+        bytes_to_mib(memory.rss_file_bytes),
+        bytes_to_mib(memory.rss_shmem_bytes),
+        bytes_to_mib(memory.data_bytes),
+        bytes_to_mib(memory.swap_bytes));
 }
 
 struct pd_handoff {
@@ -827,6 +1056,8 @@ struct pd_handoff {
     llama_token first_token = -1;
     bool first_token_is_prompt_tail = false;
     std::vector<uint16_t> kv_fp16;
+    const uint16_t * kv_fp16_view = nullptr;
+    size_t kv_fp16_view_size = 0;
     std::vector<uint8_t> kv_qnn_u8;
     std::shared_ptr<void> memory_mapping;
     const uint8_t * kv_qnn_u8_view = nullptr;
@@ -844,6 +1075,14 @@ struct pd_handoff {
 
     size_t qnn_u8_size() const {
         return kv_qnn_u8_view != nullptr ? kv_qnn_u8_view_size : kv_qnn_u8.size();
+    }
+
+    const uint16_t * fp16_data() const {
+        return kv_fp16_view != nullptr ? kv_fp16_view : kv_fp16.data();
+    }
+
+    size_t fp16_size() const {
+        return kv_fp16_view != nullptr ? kv_fp16_view_size : kv_fp16.size();
     }
 };
 
@@ -1224,12 +1463,15 @@ pd_handoff load_pd_handoff(
     out.metadata_read_ms = elapsed_ms(metadata_read_start);
 
     const auto kv_read_start = steady_clock::now();
-    if (load_fp16_kv) {
-        out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
-    }
     const std::string qnn_u8_kv_file = out.manifest.value("qnn_u8_kv_file", "");
     if (load_qnn_u8_kv && !qnn_u8_kv_file.empty()) {
         out.kv_qnn_u8 = read_binary_vector<uint8_t>(import_dir + "/" + qnn_u8_kv_file);
+    }
+    // Prefer the backend-native QNN U8 handoff when present. Otherwise retain
+    // canonical FP16 so a non-QNN Prefill backend can be bridged into the same
+    // profiled Decode domains without carrying both copies at peak memory.
+    if (load_fp16_kv && (!load_qnn_u8_kv || out.kv_qnn_u8.empty())) {
+        out.kv_fp16 = read_binary_vector<uint16_t>(import_dir + "/kv.bin");
     }
     out.kv_read_ms = elapsed_ms(kv_read_start);
 
@@ -1257,7 +1499,8 @@ pd_handoff load_pd_handoff(
             << " expected=" << expected_values;
         throw std::runtime_error(oss.str());
     }
-    if (load_qnn_u8_kv && out.kv_qnn_u8.size() != expected_values) {
+    if (load_qnn_u8_kv && !out.kv_qnn_u8.empty() &&
+            out.kv_qnn_u8.size() != expected_values) {
         std::ostringstream oss;
         oss << "QNN U8 kv file element count mismatch: got=" << out.kv_qnn_u8.size()
             << " expected=" << expected_values;
@@ -1269,6 +1512,37 @@ pd_handoff load_pd_handoff(
 
 pd_handoff load_pd_memory_handoff(const pd_args & args) {
     const auto metadata_start = steady_clock::now();
+    const bool split_fp16 = args.prompt_tokens_ptr != nullptr ||
+        args.kv_fp16_ptr != nullptr || args.kv_fp16_values != 0;
+    if (split_fp16) {
+        if (args.prompt_tokens_ptr == nullptr || args.kv_fp16_ptr == nullptr) {
+            throw std::runtime_error("incomplete split FP16 PD memory handoff");
+        }
+        const size_t expected_values =
+            static_cast<size_t>(args.num_layers) * args.num_kv_heads *
+            args.prompt_length * args.head_dim * 2;
+        if (args.kv_fp16_values != expected_values) {
+            throw std::runtime_error("split FP16 PD memory handoff size mismatch");
+        }
+        pd_handoff out;
+        out.prompt_tokens.reserve(static_cast<size_t>(args.prompt_length));
+        for (int32_t i = 0; i < args.prompt_length; ++i) {
+            out.prompt_tokens.push_back(static_cast<llama_token>(
+                args.prompt_tokens_ptr[static_cast<size_t>(i)]));
+        }
+        out.kv_fp16_view = args.kv_fp16_ptr;
+        out.kv_fp16_view_size = args.kv_fp16_values;
+        out.prompt_len = args.prompt_length;
+        out.num_layers = args.num_layers;
+        out.num_kv_heads = args.num_kv_heads;
+        out.head_dim = args.head_dim;
+        out.first_token = args.first_token;
+        out.first_token_is_prompt_tail = args.first_token_is_prompt_tail;
+        out.manifest["original_prompt_length"] =
+            out.prompt_len + (out.first_token_is_prompt_tail ? 1 : 0);
+        out.metadata_read_ms = elapsed_ms(metadata_start);
+        return out;
+    }
     if (args.memory_ptr == nullptr) {
         struct stat info {};
         if (fstat(args.memory_fd, &info) != 0) {
@@ -1425,8 +1699,8 @@ std::vector<uint8_t> build_seq_state_blob(
         handoff.num_kv_heads *
         handoff.prompt_len *
         handoff.head_dim;
-    const uint16_t * k_base = handoff.kv_fp16.data();
-    const uint16_t * v_base = handoff.kv_fp16.data() + per_kind_values;
+    const uint16_t * k_base = handoff.fp16_data();
+    const uint16_t * v_base = handoff.fp16_data() + per_kind_values;
     const uint8_t * k_u8_base = handoff.qnn_u8_data();
     const uint8_t * v_u8_base = handoff.qnn_u8_data() +
         (qnn_u8_layout ? per_kind_values : 0);
@@ -1553,7 +1827,8 @@ std::string describe_top_k(
 native_compare_result run_native_compare(
         const pd_handoff & handoff,
         llama_model * model,
-        const common_params & params) {
+        const common_params & params,
+        pd_disk_embedding * disk_embedding) {
     native_compare_result out;
     llama_context_params ctx_params = common_context_params_to_llama(params);
     std::unique_ptr<llama_context, decltype(&llama_free)> native_ctx(
@@ -1566,11 +1841,27 @@ native_compare_result run_native_compare(
     const int32_t batch_cap = std::max<int32_t>(1, llama_n_batch(native_ctx.get()));
     for (int32_t start = 0; start < handoff.prompt_len; start += batch_cap) {
         const int32_t chunk = std::min(batch_cap, handoff.prompt_len - start);
-        if (llama_decode(
-                native_ctx.get(),
-                llama_batch_get_one(
-                    const_cast<llama_token *>(handoff.prompt_tokens.data() + start),
-                    chunk)) != 0) {
+        if (disk_embedding != nullptr && disk_embedding->is_open()) {
+            for (int32_t index = 0; index < chunk; ++index) {
+                const llama_token token = handoff.prompt_tokens[start + index];
+                llama_batch batch = {
+                    /*.n_tokens =*/ 1,
+                    /*.token    =*/ nullptr,
+                    /*.embd     =*/ disk_embedding->read_row(token),
+                    /*.pos      =*/ nullptr,
+                    /*.n_seq_id =*/ nullptr,
+                    /*.seq_id   =*/ nullptr,
+                    /*.logits   =*/ nullptr,
+                };
+                if (llama_decode(native_ctx.get(), batch) != 0) {
+                    throw std::runtime_error("native comparison embedding prompt decode failed");
+                }
+            }
+        } else if (llama_decode(
+                       native_ctx.get(),
+                       llama_batch_get_one(
+                           const_cast<llama_token *>(handoff.prompt_tokens.data() + start),
+                           chunk)) != 0) {
             throw std::runtime_error("native comparison prompt decode failed");
         }
     }
@@ -1596,7 +1887,22 @@ native_compare_result run_native_compare(
     }
 
     llama_token first = handoff.first_token;
-    if (llama_decode(native_ctx.get(), llama_batch_get_one(&first, 1)) != 0) {
+    int first_result = 0;
+    if (disk_embedding != nullptr && disk_embedding->is_open()) {
+        llama_batch batch = {
+            /*.n_tokens =*/ 1,
+            /*.token    =*/ nullptr,
+            /*.embd     =*/ disk_embedding->read_row(first),
+            /*.pos      =*/ nullptr,
+            /*.n_seq_id =*/ nullptr,
+            /*.seq_id   =*/ nullptr,
+            /*.logits   =*/ nullptr,
+        };
+        first_result = llama_decode(native_ctx.get(), batch);
+    } else {
+        first_result = llama_decode(native_ctx.get(), llama_batch_get_one(&first, 1));
+    }
+    if (first_result != 0) {
         throw std::runtime_error("native comparison first-token decode failed");
     }
 
@@ -1801,7 +2107,8 @@ void log_native_comparison(
         const common_params & params,
         const pd_handoff & handoff,
         const std::vector<uint8_t> & imported_prompt_seq_blob,
-        bool v_trans) {
+        bool v_trans,
+        pd_disk_embedding * disk_embedding) {
     const float * imported_logits = llama_get_logits_ith(imported_ctx, -1);
     if (imported_logits == nullptr) {
         throw std::runtime_error("imported logits are unavailable for comparison");
@@ -1809,7 +2116,7 @@ void log_native_comparison(
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    const native_compare_result native = run_native_compare(handoff, model, params);
+    const native_compare_result native = run_native_compare(handoff, model, params, disk_embedding);
 
     float max_abs_diff = 0.0f;
     double mean_abs_diff = 0.0;
@@ -1876,10 +2183,14 @@ void print_usage(int argc, char ** argv) {
 
 struct llama_pd_inprocess_runtime {
     std::vector<std::string> args;
+    common_params params;
+    std::optional<std::string> deferred_profile_path;
     common_init_result_ptr llama_init;
     pd_disk_embedding disk_embedding;
     pd_persistent_threadpools threadpools;
     bool threadpools_attached = false;
+    bool context_ready = false;
+    bool warmup_complete = false;
     bool has_run = false;
     double initialization_ms = 0.0;
 };
@@ -1900,6 +2211,9 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         const auto & request = *g_inprocess_request;
         pd.memory_ptr = static_cast<const uint8_t *>(request.handoff_data);
         pd.memory_size = request.handoff_size;
+        pd.prompt_tokens_ptr = request.prompt_tokens;
+        pd.kv_fp16_ptr = request.kv_fp16;
+        pd.kv_fp16_values = request.kv_fp16_values;
         pd.prompt_length = request.prompt_length;
         pd.num_layers = request.num_layers;
         pd.num_kv_heads = request.num_kv_heads;
@@ -2048,10 +2362,6 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
                 throw std::runtime_error(
                     "disk embedding dimensions do not match the GGUF model");
             }
-            if (pd.native_compare || pd.native_first_token) {
-                throw std::runtime_error(
-                    "native GGUF prompt diagnostics are disabled with disk embedding");
-            }
         } catch (const std::exception & err) {
             LOG_ERR("failed to initialize PD disk embedding: %s\n", err.what());
             return 1;
@@ -2134,21 +2444,62 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         : steady_clock::now();
     if (g_inprocess_runtime != nullptr) {
         // A reused context keeps model/metadata/KV/scheduler allocation stable.
-        // Clear only per-conversation state before importing the next Prefill KV.
-        llama_memory_clear(llama_get_memory(ctx), true);
+        // Reset KV metadata only. The imported handoff overwrites every valid
+        // prefix entry; clearing the full ctx-sized backing would write about
+        // 1.25 GiB for Qwen3-14B ctx4096 and evict the warmed model pages.
+        llama_memory_clear(llama_get_memory(ctx), false);
         llama_synchronize(ctx);
         llama_init->reset_samplers();
         llama_perf_context_reset(ctx);
     }
     const bool qnn_u8_layout = llama_qnn_u16_activations_enabled();
-    const bool need_fp16_handoff = !qnn_u8_layout;
+    const bool need_fp16_handoff = true;
     pd_handoff handoff;
     try {
-        handoff = (pd.memory_fd >= 0 || pd.memory_ptr != nullptr)
+        handoff = (pd.memory_fd >= 0 || pd.memory_ptr != nullptr ||
+                   pd.prompt_tokens_ptr != nullptr)
             ? load_pd_memory_handoff(pd)
             : load_pd_handoff(
                   pd.import_dir, need_fp16_handoff, qnn_u8_layout);
         validate_pd_handoff(handoff, model, ctx);
+        if (qnn_u8_layout && handoff.qnn_u8_size() == 0) {
+            if (handoff.fp16_size() == 0) {
+                throw std::runtime_error(
+                    "QNN-aligned Decode requires QNN U8 or canonical FP16 KV");
+            }
+            const auto bridge_start = steady_clock::now();
+            handoff.kv_qnn_u8.resize(handoff.fp16_size());
+            llama_qnn_kv_quantize_stats bridge_stats {};
+            std::string bridge_error;
+            if (!llama_qnn_u16_quantize_fp16_kv(
+                    model,
+                    handoff.fp16_data(),
+                    handoff.fp16_size(),
+                    handoff.num_layers,
+                    handoff.num_kv_heads,
+                    handoff.prompt_len,
+                    handoff.head_dim,
+                    handoff.kv_qnn_u8.data(),
+                    &bridge_stats,
+                    &bridge_error)) {
+                throw std::runtime_error(
+                    "FP16 to QNN U8 KV bridge failed: " + bridge_error);
+            }
+            const double zero_pct = bridge_stats.values == 0 ? 0.0 :
+                100.0 * bridge_stats.code_zero / bridge_stats.values;
+            const double max_pct = bridge_stats.values == 0 ? 0.0 :
+                100.0 * bridge_stats.code_255 / bridge_stats.values;
+            LOG_INF(
+                "PD FP16->QNN-U8 KV bridge: values=%zu ms=%.3f "
+                "non_finite=%zu code0=%zu(%.6f%%) code255=%zu(%.6f%%)\n",
+                bridge_stats.values,
+                elapsed_ms(bridge_start),
+                bridge_stats.non_finite,
+                bridge_stats.code_zero,
+                zero_pct,
+                bridge_stats.code_255,
+                max_pct);
+        }
     } catch (const std::exception & err) {
         LOG_ERR("failed to load PD handoff: %s\n", err.what());
         return 1;
@@ -2163,10 +2514,13 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         const bool capture_native_prompt =
             !pd_capture.output_dir.empty() && !pd_capture.completed;
         try {
+            g_pd_capture_state = capture_native_prompt ? &pd_capture : nullptr;
             pd_capture.active = capture_native_prompt;
             const native_compare_result native =
-                run_native_compare(handoff, model, params);
+                run_native_compare(handoff, model, params,
+                    disk_embedding.is_open() ? &disk_embedding : nullptr);
             pd_capture.active = false;
+            g_pd_capture_state = nullptr;
             if (capture_native_prompt) {
                 finish_pd_capture(pd_capture, handoff.prompt_tokens.back());
                 LOG_INF(
@@ -2188,6 +2542,7 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
                 handoff.first_token,
                 native_prompt_top.front().logit);
         } catch (const std::exception & err) {
+            g_pd_capture_state = nullptr;
             pd_capture.active = false;
             LOG_ERR("PD native first-token selection failed: %s\n", err.what());
             return 1;
@@ -2254,7 +2609,7 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         handoff.metadata_read_ms + handoff.kv_read_ms +
         kv_layout_ms + kv_import_ms + kv_validation_ms;
     const size_t handoff_kv_bytes =
-        handoff.kv_fp16.size() * sizeof(uint16_t) +
+        handoff.fp16_size() * sizeof(uint16_t) +
         handoff.qnn_u8_size();
     const size_t imported_seq_blob_size = seq_blob.size();
     LOG_INF(
@@ -2282,6 +2637,8 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     if (!pd.native_compare) {
         handoff.kv_fp16.clear();
         handoff.kv_fp16.shrink_to_fit();
+        handoff.kv_fp16_view = nullptr;
+        handoff.kv_fp16_view_size = 0;
     }
     const process_memory_snapshot memory_after_import = process_memory();
 
@@ -2335,11 +2692,36 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     int32_t generated_tokens = 0;
     const double boundary_ms = elapsed_ms(boundary_start);
     const auto decode_start = steady_clock::now();
+    const bool log_token_timing = std::getenv("LLAMA_PD_TOKEN_TIMING") != nullptr;
+    int32_t decode_call_index = 0;
     const auto decode_one = [&](llama_token token) {
+        const bool probe_this_decode =
+            g_inprocess_request != nullptr &&
+            g_inprocess_request->decode_event_callback != nullptr &&
+            decode_call_index < g_inprocess_request->decode_event_call_limit;
+        if (probe_this_decode) {
+            g_inprocess_request->decode_event_callback(
+                g_inprocess_request->decode_event_opaque,
+                "begin",
+                decode_call_index,
+                token);
+        }
+        const bool profile_token_mappings =
+            decode_call_index == 0 &&
+            std::getenv("LLAMA_PD_TOKEN_MAPPING_PROFILE") != nullptr;
+        const process_mapping_snapshot token_mappings_before =
+            profile_token_mappings
+            ? process_mappings()
+            : process_mapping_snapshot();
+        const auto token_decode_start = steady_clock::now();
         const bool capture_this_decode =
             !pd_capture.output_dir.empty() && !pd_capture.completed;
+        g_pd_capture_state = capture_this_decode ? &pd_capture : nullptr;
         pd_capture.active = capture_this_decode;
         pd_op_profile.begin_decode(token);
+        g_pd_op_profile_state = pd_op_profile.output_path.empty()
+            ? nullptr
+            : &pd_op_profile;
         int result = 0;
         if (disk_embedding.is_open()) {
             try {
@@ -2360,8 +2742,24 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         } else {
             result = llama_decode(ctx, llama_batch_get_one(&token, 1));
         }
+        const double token_decode_ms = elapsed_ms(token_decode_start);
+        if (profile_token_mappings) {
+            log_mapping_delta(
+                "decode-token0",
+                token_mappings_before,
+                process_mappings());
+        }
+        if (probe_this_decode) {
+            g_inprocess_request->decode_event_callback(
+                g_inprocess_request->decode_event_opaque,
+                "end",
+                decode_call_index,
+                token);
+        }
         pd_op_profile.end_decode();
+        g_pd_op_profile_state = nullptr;
         pd_capture.active = false;
+        g_pd_capture_state = nullptr;
         if (capture_this_decode) {
             finish_pd_capture(pd_capture, token);
             LOG_INF(
@@ -2371,6 +2769,15 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
                 pd_capture.requested.size(),
                 pd_capture.error.empty() ? "none" : pd_capture.error.c_str());
         }
+        if (log_token_timing) {
+            LOG_INF(
+                "PD token decode timing: index=%d token=%d ms=%.3f result=%d\n",
+                decode_call_index,
+                token,
+                token_decode_ms,
+                result);
+        }
+        ++decode_call_index;
         return result;
     };
 
@@ -2473,7 +2880,8 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
 
     if (pd.native_compare) {
         try {
-            log_native_comparison(ctx, model, params, handoff, seq_blob, v_trans);
+            log_native_comparison(ctx, model, params, handoff, seq_blob, v_trans,
+                disk_embedding.is_open() ? &disk_embedding : nullptr);
         } catch (const std::exception & err) {
             LOG_ERR("PD native comparison failed: %s\n", err.what());
             return 1;
@@ -2536,7 +2944,7 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     return 0;
 }
 
-llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
+llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create_model_only(
         int argc,
         char ** argv,
         const void * model_data,
@@ -2547,6 +2955,7 @@ llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
     }
 
     const auto init_start = steady_clock::now();
+    const process_memory_snapshot memory_before = process_memory();
     std::unique_ptr<llama_pd_inprocess_runtime> runtime(
         new llama_pd_inprocess_runtime());
     try {
@@ -2565,33 +2974,61 @@ llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
         }
         g_inprocess_preparing = false;
 
-        common_params params;
         common_init();
         if (!common_params_parse(
                 static_cast<int>(forwarded.size()),
                 forwarded.data(),
-                params,
+                runtime->params,
                 LLAMA_EXAMPLE_COMPLETION,
                 print_usage)) {
             throw std::runtime_error(
                 "failed to parse persistent Decode parameters");
         }
-        if (!params.prompt.empty()) {
+        if (!runtime->params.prompt.empty()) {
             throw std::runtime_error(
                 "persistent Decode does not accept a prompt");
         }
 
+        const char * dump_dir = std::getenv("LLAMA_QNN_PD_DUMP_DIR");
+        const char * profile_path = std::getenv("LLAMA_QNN_PD_OP_PROFILE");
+        if ((dump_dir != nullptr && dump_dir[0] != 0) ||
+                (profile_path != nullptr && profile_path[0] != 0)) {
+            runtime->params.cb_eval = pd_resident_eval_callback;
+            runtime->params.cb_eval_user_data = nullptr;
+        }
+
         llama_backend_init();
-        llama_numa_init(params.numa);
-        runtime->llama_init = common_init_from_params_buffer(
-            params, model_data, model_size, false);
+        llama_numa_init(runtime->params.numa);
+        if (const char * path =
+                std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+                path != nullptr && path[0] != 0) {
+            runtime->deferred_profile_path = path;
+            unsetenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+        }
+        try {
+            runtime->llama_init = common_init_from_params_buffer(
+                runtime->params, model_data, model_size, true);
+        } catch (...) {
+            if (runtime->deferred_profile_path.has_value()) {
+                setenv(
+                    "LLAMA_QNN_U16_QPARAMS_MANIFEST",
+                    runtime->deferred_profile_path->c_str(),
+                    1);
+            }
+            throw;
+        }
+        if (runtime->deferred_profile_path.has_value()) {
+            setenv(
+                "LLAMA_QNN_U16_QPARAMS_MANIFEST",
+                runtime->deferred_profile_path->c_str(),
+                1);
+        }
         llama_model * model = runtime->llama_init
             ? runtime->llama_init->model()
             : nullptr;
-        if (model == nullptr || runtime->llama_init->context() == nullptr ||
-            runtime->llama_init->sampler(0) == nullptr) {
+        if (model == nullptr) {
             throw std::runtime_error(
-                "failed to create persistent Decode model/context");
+                "failed to create persistent Decode model");
         }
 
         char external_embedding_kind[32] = {};
@@ -2621,26 +3058,337 @@ llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
         if (initialization_ms != nullptr) {
             *initialization_ms = runtime->initialization_ms;
         }
+        const process_memory_snapshot memory_after = process_memory();
         LOG_INF(
-            "PD persistent in-process runtime ready: model_ptr=%p "
-            "model_bytes=%zu initialization_ms=%.3f threadpool_deferred=1\n",
+            "PD persistent model-only runtime ready: model_ptr=%p "
+            "model_bytes=%zu initialization_ms=%.3f rss_before_mib=%.2f "
+            "rss_after_mib=%.2f rss_delta_mib=%.2f\n",
             model_data,
             model_size,
-            runtime->initialization_ms);
+            runtime->initialization_ms,
+            bytes_to_mib(memory_before.rss_bytes),
+            bytes_to_mib(memory_after.rss_bytes),
+            bytes_to_mib(memory_after.rss_bytes -
+                std::min(memory_after.rss_bytes, memory_before.rss_bytes)));
         return runtime.release();
     } catch (const std::exception & err) {
         g_inprocess_preparing = false;
-        LOG_ERR("failed to create persistent in-process Decode runtime: %s\n",
+        LOG_ERR("failed to create model-only in-process Decode runtime: %s\n",
                 err.what());
         return nullptr;
     }
 }
 
+bool llama_pd_inprocess_runtime_prepare_context(
+        llama_pd_inprocess_runtime * runtime,
+        double * preparation_ms) {
+    if (runtime == nullptr || runtime->llama_init == nullptr ||
+            runtime->llama_init->model() == nullptr) {
+        return false;
+    }
+    if (runtime->context_ready) {
+        if (preparation_ms != nullptr) {
+            *preparation_ms = 0.0;
+        }
+        return true;
+    }
+
+    const auto prepare_start = steady_clock::now();
+    const process_memory_snapshot memory_before = process_memory();
+    const auto metadata_start = steady_clock::now();
+    if (runtime->deferred_profile_path.has_value() &&
+            !llama_qnn_u16_attach_profile_from_environment(
+                runtime->llama_init->model())) {
+        LOG_ERR("failed to attach deferred QNN runtime metadata\n");
+        return false;
+    }
+    const double metadata_ms = elapsed_ms(metadata_start);
+    const process_memory_snapshot memory_after_metadata = process_memory();
+    const char * previous_tg_only = std::getenv("LLAMA_PD_TG_ONLY_RESERVE");
+    const bool had_previous_tg_only = previous_tg_only != nullptr;
+    const std::string previous_tg_only_value = had_previous_tg_only
+        ? previous_tg_only : "";
+    const auto restore_tg_only = [&]() {
+        if (had_previous_tg_only) {
+            setenv("LLAMA_PD_TG_ONLY_RESERVE", previous_tg_only_value.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_PD_TG_ONLY_RESERVE");
+        }
+    };
+    setenv("LLAMA_PD_TG_ONLY_RESERVE", "1", 1);
+    try {
+        const bool initialized =
+            runtime->llama_init->init_context(runtime->params);
+        restore_tg_only();
+        if (!initialized ||
+                runtime->llama_init->context() == nullptr ||
+                runtime->llama_init->sampler(0) == nullptr) {
+            throw std::runtime_error(
+                "failed to create persistent Decode context");
+        }
+        runtime->threadpools.attach(
+            runtime->llama_init->context(), runtime->params);
+        runtime->threadpools_attached = true;
+        runtime->context_ready = true;
+        const llama_memory_breakdown memory_breakdown =
+            llama_get_memory_breakdown(runtime->llama_init->context());
+        size_t context_bytes = 0;
+        size_t compute_bytes = 0;
+        for (const auto & entry : memory_breakdown) {
+            context_bytes += entry.second.context;
+            compute_bytes += entry.second.compute;
+        }
+        LOG_INF(
+            "PD Decode fixed buffers: context_bytes=%zu compute_bytes=%zu "
+            "total_bytes=%zu\n",
+            context_bytes,
+            compute_bytes,
+            context_bytes + compute_bytes);
+        const double elapsed = elapsed_ms(prepare_start);
+        runtime->initialization_ms += elapsed;
+        if (preparation_ms != nullptr) {
+            *preparation_ms = elapsed;
+        }
+        const process_memory_snapshot memory_after = process_memory();
+        LOG_INF(
+            "PD persistent Decode context ready: preparation_ms=%.3f "
+            "metadata_ms=%.3f rss_before_mib=%.2f metadata_rss_mib=%.2f "
+            "rss_after_mib=%.2f rss_delta_mib=%.2f\n",
+            elapsed,
+            metadata_ms,
+            bytes_to_mib(memory_before.rss_bytes),
+            bytes_to_mib(memory_after_metadata.rss_bytes),
+            bytes_to_mib(memory_after.rss_bytes),
+            bytes_to_mib(memory_after.rss_bytes -
+                std::min(memory_after.rss_bytes, memory_before.rss_bytes)));
+        return true;
+    } catch (const std::exception & err) {
+        restore_tg_only();
+        LOG_ERR("failed to prepare persistent in-process Decode context: %s\n",
+                err.what());
+        return false;
+    }
+}
+
+bool llama_pd_inprocess_runtime_warmup(
+        llama_pd_inprocess_runtime * runtime,
+        double * warmup_ms) {
+    if (runtime == nullptr || !runtime->context_ready ||
+            runtime->llama_init == nullptr ||
+            runtime->llama_init->context() == nullptr) {
+        return false;
+    }
+    if (runtime->warmup_complete || !runtime->params.warmup) {
+        runtime->warmup_complete = true;
+        if (warmup_ms != nullptr) {
+            *warmup_ms = 0.0;
+        }
+        return true;
+    }
+
+    const auto warmup_start = steady_clock::now();
+    try {
+        const bool profile_memory = warmup_memory_profile_enabled();
+        const process_memory_snapshot memory_before = process_memory();
+        const process_mapping_snapshot mappings_before =
+            profile_memory ? process_mappings() : process_mapping_snapshot();
+        if (profile_memory) {
+            log_warmup_memory_stage("before_decode", memory_before);
+        }
+        const llama_memory_breakdown breakdown_before =
+            llama_get_memory_breakdown(runtime->llama_init->context());
+        size_t context_before = 0;
+        size_t compute_before = 0;
+        for (const auto & entry : breakdown_before) {
+            context_before += entry.second.context;
+            compute_before += entry.second.compute;
+        }
+        llama_model * model = runtime->llama_init->model();
+        llama_token warmup_token =
+            llama_vocab_bos(llama_model_get_vocab(model));
+        if (warmup_token == LLAMA_TOKEN_NULL) {
+            warmup_token = 0;
+        }
+        int warmup_result = 0;
+        if (runtime->disk_embedding.is_open()) {
+            llama_batch warmup_batch = {
+                /*.n_tokens =*/ 1,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ runtime->disk_embedding.read_row(warmup_token),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+            warmup_result = llama_decode(
+                runtime->llama_init->context(), warmup_batch);
+        } else {
+            warmup_result = llama_decode(
+                runtime->llama_init->context(),
+                llama_batch_get_one(&warmup_token, 1));
+        }
+        if (profile_memory) {
+            log_warmup_memory_stage("after_decode", process_memory());
+        }
+        if (warmup_result != 0) {
+            throw std::runtime_error(
+                "persistent Decode initialization warmup failed");
+        }
+        llama_synchronize(runtime->llama_init->context());
+        if (profile_memory) {
+            log_warmup_memory_stage("after_synchronize", process_memory());
+        }
+        llama_memory_clear(
+            llama_get_memory(runtime->llama_init->context()), false);
+        llama_perf_context_reset(runtime->llama_init->context());
+        runtime->llama_init->reset_samplers();
+        const process_memory_snapshot memory_after = process_memory();
+        if (profile_memory) {
+            log_warmup_memory_stage("after_clear", memory_after);
+            log_mapping_delta(
+                "warmup", mappings_before, process_mappings());
+        }
+        const llama_memory_breakdown breakdown_after =
+            llama_get_memory_breakdown(runtime->llama_init->context());
+        size_t context_after = 0;
+        size_t compute_after = 0;
+        for (const auto & entry : breakdown_after) {
+            context_after += entry.second.context;
+            compute_after += entry.second.compute;
+        }
+        LOG_INF(
+            "PD warmup retained memory: rss_delta_mib=%+.2f "
+            "rss_anon_delta_mib=%+.2f rss_file_delta_mib=%+.2f "
+            "swap_delta_mib=%+.2f context_before=%zu context_after=%zu "
+            "compute_before=%zu compute_after=%zu\n",
+            signed_bytes_to_mib(mapping_delta(
+                memory_after.rss_bytes, memory_before.rss_bytes)),
+            signed_bytes_to_mib(mapping_delta(
+                memory_after.rss_anon_bytes, memory_before.rss_anon_bytes)),
+            signed_bytes_to_mib(mapping_delta(
+                memory_after.rss_file_bytes, memory_before.rss_file_bytes)),
+            signed_bytes_to_mib(mapping_delta(
+                memory_after.swap_bytes, memory_before.swap_bytes)),
+            context_before,
+            context_after,
+            compute_before,
+            compute_after);
+        runtime->warmup_complete = true;
+        const double elapsed = elapsed_ms(warmup_start);
+        runtime->initialization_ms += elapsed;
+        if (warmup_ms != nullptr) {
+            *warmup_ms = elapsed;
+        }
+        LOG_INF(
+            "PD Decode initialization warmup complete: token=%d ms=%.3f\n",
+            warmup_token,
+            elapsed);
+        return true;
+    } catch (const std::exception & err) {
+        LOG_ERR("failed to warm persistent in-process Decode runtime: %s\n",
+                err.what());
+        return false;
+    }
+}
+
+bool llama_pd_inprocess_runtime_profile_backing(
+        llama_pd_inprocess_runtime * runtime,
+        const void ** data,
+        size_t * size,
+        bool * anonymous) {
+    if (runtime == nullptr || runtime->llama_init == nullptr ||
+            runtime->llama_init->model() == nullptr) {
+        return false;
+    }
+    const llama_qnn_quant_profile * profile =
+        runtime->llama_init->model()->get_qnn_u16_profile();
+    return profile != nullptr &&
+        profile->binary_backing_info(data, size, anonymous);
+}
+
+bool llama_pd_inprocess_runtime_profile_stream_prepare(
+        llama_pd_inprocess_runtime * runtime,
+        size_t shard_count) {
+    if (runtime == nullptr || runtime->llama_init == nullptr ||
+            runtime->llama_init->model() == nullptr) {
+        return false;
+    }
+    const llama_qnn_quant_profile * profile =
+        runtime->llama_init->model()->get_qnn_u16_profile();
+    return profile != nullptr && profile->binary_stream_prepare(shard_count);
+}
+
+bool llama_pd_inprocess_runtime_profile_stream_fill(
+        llama_pd_inprocess_runtime * runtime,
+        size_t shard_index,
+        size_t * bytes_loaded) {
+    if (runtime == nullptr || runtime->llama_init == nullptr ||
+            runtime->llama_init->model() == nullptr) {
+        return false;
+    }
+    const llama_qnn_quant_profile * profile =
+        runtime->llama_init->model()->get_qnn_u16_profile();
+    return profile != nullptr &&
+        profile->binary_stream_fill(shard_index, bytes_loaded);
+}
+
+bool llama_pd_inprocess_runtime_profile_stream_finish(
+        llama_pd_inprocess_runtime * runtime) {
+    if (runtime == nullptr || runtime->llama_init == nullptr ||
+            runtime->llama_init->model() == nullptr) {
+        return false;
+    }
+    const llama_qnn_quant_profile * profile =
+        runtime->llama_init->model()->get_qnn_u16_profile();
+    return profile != nullptr && profile->binary_stream_finish();
+}
+
+llama_pd_inprocess_runtime * llama_pd_inprocess_runtime_create(
+        int argc,
+        char ** argv,
+        const void * model_data,
+        size_t model_size,
+        double * initialization_ms) {
+    const auto init_start = steady_clock::now();
+    double model_ms = 0.0;
+    std::unique_ptr<llama_pd_inprocess_runtime> runtime(
+        llama_pd_inprocess_runtime_create_model_only(
+            argc, argv, model_data, model_size, &model_ms));
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    double context_ms = 0.0;
+    double warmup_ms = 0.0;
+    if (!llama_pd_inprocess_runtime_prepare_context(
+            runtime.get(), &context_ms) ||
+        !llama_pd_inprocess_runtime_warmup(
+            runtime.get(), &warmup_ms)) {
+        return nullptr;
+    }
+    runtime->initialization_ms = elapsed_ms(init_start);
+    if (initialization_ms != nullptr) {
+        *initialization_ms = runtime->initialization_ms;
+    }
+    LOG_INF(
+        "PD persistent in-process runtime ready: initialization_ms=%.3f "
+        "model_ms=%.3f context_ms=%.3f warmup_ms=%.3f\n",
+        runtime->initialization_ms,
+        model_ms,
+        context_ms,
+        warmup_ms);
+    return runtime.release();
+}
+
 int llama_pd_inprocess_runtime_run(
         llama_pd_inprocess_runtime * runtime,
         const llama_pd_inprocess_request * request) {
+    const bool packed_handoff = request != nullptr &&
+        request->handoff_data != nullptr && request->handoff_size != 0;
+    const bool split_fp16_handoff = request != nullptr &&
+        request->prompt_tokens != nullptr && request->kv_fp16 != nullptr &&
+        request->kv_fp16_values != 0;
     if (runtime == nullptr || request == nullptr ||
-        request->handoff_data == nullptr || request->handoff_size == 0) {
+        (!packed_handoff && !split_fp16_handoff)) {
         return 1;
     }
     if (request->result != nullptr) {

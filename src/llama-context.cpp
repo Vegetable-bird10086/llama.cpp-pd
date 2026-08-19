@@ -608,9 +608,15 @@ void llama_context::sched_reserve() {
     int n_nodes_tg  = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const char * tg_only_env = std::getenv("LLAMA_PD_TG_ONLY_RESERVE");
+    const bool tg_only_reserve = tg_only_env != nullptr &&
+        std::atoi(tg_only_env) != 0 && n_tokens == 1 && n_seqs == 1;
+    if (tg_only_reserve) {
+        LLAMA_LOG_INFO("%s: PD TG-only reserve enabled\n", __func__);
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
-    {
+    if (!tg_only_reserve) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
@@ -638,10 +644,14 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+        if (tg_only_reserve) {
+            n_splits_pp = n_splits_tg;
+            n_nodes_pp = n_nodes_tg;
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-    {
+    if (!tg_only_reserve) {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());

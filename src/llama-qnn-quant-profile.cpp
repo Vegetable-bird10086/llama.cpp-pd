@@ -19,6 +19,7 @@ using json = nlohmann::json;
 
 constexpr const char * kProfileFormat = "llama-qnn-quant-profile-v2";
 constexpr const char * kU16DataType = "QNN_DATATYPE_UFIXED_POINT_16";
+constexpr const char * kU8DataType = "QNN_DATATYPE_UFIXED_POINT_8";
 
 uint32_t fixed_point_element_bytes(const std::string & data_type) {
     if (data_type == "QNN_DATATYPE_UFIXED_POINT_8" ||
@@ -38,6 +39,122 @@ uint32_t fixed_point_element_bytes(const std::string & data_type) {
 bool is_affine_quantization_encoding(const std::string & encoding) {
     return encoding == "QNN_QUANTIZATION_ENCODING_SCALE_OFFSET" ||
         encoding == "QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET";
+}
+
+[[noreturn]] void fail(const std::string & message);
+
+int64_t floor_shift_right(int64_t value, int32_t shift) {
+    if (shift <= 0 || shift >= 63) {
+        fail("fixed-point shift is outside the supported range");
+    }
+    if (value >= 0) {
+        return value >> shift;
+    }
+    return -(((-value) + (INT64_C(1) << shift) - 1) >> shift);
+}
+
+int16_t checked_i16(int64_t value, const std::string & location) {
+    if (value < INT16_MIN || value > INT16_MAX) {
+        fail(location + " is outside signed halfword range");
+    }
+    return static_cast<int16_t>(value);
+}
+
+llama_qnn_a8_add_subtract_params make_a8_add_subtract_params(
+        const llama_qnn_affine_qparams & lhs,
+        const llama_qnn_affine_qparams & rhs,
+        const llama_qnn_affine_qparams & output,
+        bool subtract,
+        const std::string & location) {
+    const float ratios[2] = {
+        static_cast<float>(lhs.scale) / static_cast<float>(output.scale),
+        static_cast<float>(rhs.scale) / static_cast<float>(output.scale),
+    };
+    const float bound = subtract
+        ? std::max(ratios[0], ratios[1])
+        : ratios[0] + ratios[1];
+    uint32_t fudge_bits = UINT32_C(0x3f800801);
+    float fudge = 0.0f;
+    std::memcpy(&fudge, &fudge_bits, sizeof(fudge));
+    const float adjusted = bound * fudge;
+    uint32_t adjusted_bits = 0;
+    std::memcpy(&adjusted_bits, &adjusted, sizeof(adjusted_bits));
+    const int32_t exponent = static_cast<int32_t>((adjusted_bits >> 23) & 0xffU);
+    const int32_t shift = std::min(132 - exponent, 7);
+    if (!std::isfinite(bound) || bound <= 0.0f || shift < 0 || shift > 7) {
+        fail(location + " cannot use the V75 A8 Add/Subtract leaf");
+    }
+    int64_t coefficients[2] = {
+        static_cast<int64_t>(std::lrintf(std::ldexp(ratios[0], shift + 8))),
+        static_cast<int64_t>(std::lrintf(std::ldexp(ratios[1], shift + 8))),
+    };
+    if (subtract) {
+        coefficients[1] = -coefficients[1];
+    }
+    const int64_t zero_product = coefficients[0] * lhs.zero_point +
+        coefficients[1] * rhs.zero_point;
+    const int64_t correction = floor_shift_right(zero_product + 128, 8);
+    return {
+        { checked_i16(coefficients[0], location + " lhs coefficient"),
+          checked_i16(coefficients[1], location + " rhs coefficient") },
+        checked_i16(
+            (static_cast<int64_t>(output.zero_point) << shift) - correction,
+            location + " bias"),
+        shift,
+        true,
+    };
+}
+
+llama_qnn_a8_multiply_params make_a8_multiply_params(
+        const llama_qnn_affine_qparams & lhs,
+        const llama_qnn_affine_qparams & rhs,
+        const llama_qnn_affine_qparams & output,
+        const std::string & location) {
+    const float ratio =
+        (static_cast<float>(lhs.scale) * static_cast<float>(rhs.scale)) /
+        static_cast<float>(output.scale);
+    int32_t shift = -1;
+    for (int32_t candidate = 0; candidate < 15; ++candidate) {
+        if (std::ldexp(ratio, candidate + 15) <= 32767.0f) {
+            shift = candidate;
+        }
+    }
+    if (!std::isfinite(ratio) || ratio <= 0.0f || shift < 0) {
+        fail(location + " cannot use the V75 A8 Multiply leaf");
+    }
+    const int64_t coefficient = static_cast<int64_t>(
+        std::lrintf(std::ldexp(ratio, shift + 15)));
+    const int64_t corners[4] = {
+        lhs.zero_point * rhs.zero_point,
+        lhs.zero_point * (rhs.zero_point - 255),
+        (lhs.zero_point - 255) * rhs.zero_point,
+        (lhs.zero_point - 255) * (rhs.zero_point - 255),
+    };
+    const auto limits = std::minmax_element(std::begin(corners), std::end(corners));
+    const double center =
+        -static_cast<double>(*limits.first + *limits.second) / 2.0;
+    const int64_t translation =
+        static_cast<int64_t>(std::nearbyint(center / 256.0)) * 256;
+    const int64_t translated_product = translation * coefficient;
+    const int64_t translated_q15 = floor_shift_right(
+        translated_product + (INT64_C(1) << 14), 15);
+    const uint16_t packed_unsigned = static_cast<uint16_t>(
+        ((rhs.zero_point & 0xff) << 8) | (lhs.zero_point & 0xff));
+    int16_t packed_signed = 0;
+    std::memcpy(&packed_signed, &packed_unsigned, sizeof(packed_signed));
+    return {
+        checked_i16(coefficient, location + " coefficient"),
+        packed_signed,
+        checked_i16(-translation, location + " negative translation"),
+        checked_i16(
+            static_cast<int64_t>(lhs.zero_point) * rhs.zero_point + translation,
+            location + " pre-multiply bias"),
+        checked_i16(
+            (static_cast<int64_t>(output.zero_point) << shift) - translated_q15,
+            location + " output bias"),
+        shift,
+        true,
+    };
 }
 
 [[noreturn]] void fail(const std::string & message) {
@@ -141,6 +258,13 @@ struct measured_sigmoid_lut {
     std::vector<uint16_t> codes;
 };
 
+struct measured_a8_reduce_min_lut {
+    llama_qnn_affine_qparams input;
+    llama_qnn_affine_qparams output;
+    std::vector<uint16_t> codes;
+    bool matched = false;
+};
+
 bool same_affine(
         const llama_qnn_affine_qparams & lhs,
         const llama_qnn_affine_qparams & rhs) {
@@ -192,6 +316,49 @@ std::unordered_map<int32_t, measured_sigmoid_lut> parse_measured_sigmoid_luts(
         if (!result.emplace(static_cast<int32_t>(layer_id), std::move(parsed)).second) {
             fail(location + " duplicates a decoder layer");
         }
+    }
+    return result;
+}
+
+std::vector<measured_a8_reduce_min_lut> parse_measured_a8_reduce_min_luts(
+        const json & profile) {
+    std::vector<measured_a8_reduce_min_lut> result;
+    const auto entries = profile.find("qnn_v75_a8_reduce_min_luts");
+    if (entries == profile.end()) {
+        return result;
+    }
+    if (!entries->is_array()) {
+        fail("qnn_v75_a8_reduce_min_luts must be an array");
+    }
+    for (size_t entry_index = 0; entry_index < entries->size(); ++entry_index) {
+        const auto & entry = (*entries)[entry_index];
+        const std::string location =
+            "qnn_v75_a8_reduce_min_luts[" + std::to_string(entry_index) + "]";
+        if (entry.value("source", "") !=
+                "qnn-htp-v75-exhaustive-u8-reduce-min-sweep" ||
+            entry.value("code_count", 0) != 256 ||
+            entry.value("code_storage", "") != "uint8") {
+            fail(location + " has an unsupported source or storage contract");
+        }
+        const auto bytes = decode_base64(
+            entry.at("codes_base64").get<std::string>(),
+            location + ".codes_base64");
+        if (bytes.size() != 256) {
+            fail(location + " decoded LUT has the wrong size");
+        }
+        measured_a8_reduce_min_lut parsed;
+        parsed.input = parse_affine(
+            entry.at("input_scale_offset"), location + ".input");
+        parsed.output = parse_affine(
+            entry.at("output_scale_offset"), location + ".output");
+        parsed.codes.assign(bytes.begin(), bytes.end());
+        for (const auto & existing : result) {
+            if (same_affine(existing.input, parsed.input) &&
+                same_affine(existing.output, parsed.output)) {
+                fail(location + " duplicates an input/output qparam pair");
+            }
+        }
+        result.push_back(std::move(parsed));
     }
     return result;
 }
@@ -550,6 +717,14 @@ const llama_qnn_operation * llama_qnn_quant_profile::find_producer(
         ? nullptr : &operations.at(found->second);
 }
 
+const llama_qnn_operation * llama_qnn_quant_profile::find_convert_consumer(
+        const int32_t shard_index, const std::string & tensor_name) const {
+    const auto found = operation_convert_input_shard_index.find(
+        sharded_tensor_key(shard_index, tensor_name));
+    return found == operation_convert_input_shard_index.end()
+        ? nullptr : &operations.at(found->second);
+}
+
 const llama_qnn_operation * llama_qnn_quant_profile::find_operation_by_fx(
         const int32_t layer_id, const std::string & fx_node_name) const {
     const auto found = operation_fx_index.find(operation_fx_key(layer_id, fx_node_name));
@@ -690,6 +865,8 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
     result->source_group_size = static_cast<int32_t>(source_group_size);
     auto measured_sigmoid_luts = parse_measured_sigmoid_luts(
         profile, result->num_decoder_layers);
+    auto measured_a8_reduce_min_luts =
+        parse_measured_a8_reduce_min_luts(profile);
     std::unordered_set<std::string> ambiguous_names;
     std::unordered_set<std::string> ambiguous_aux_names;
     for (size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
@@ -708,9 +885,25 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
         if (!tensors.is_object() || !index.is_object()) {
             fail("shard " + std::to_string(shard_index) + " lacks U16 tensor metadata");
         }
+        std::string activation_data_type;
+        if (!index.empty()) {
+            activation_data_type = index.begin().value().value("data_type", "");
+        }
+        if (activation_data_type != kU16DataType &&
+            activation_data_type != kU8DataType) {
+            fail("shard " + std::to_string(shard_index) +
+                " has an unsupported unsigned activation type");
+        }
+        const int32_t activation_bits = activation_data_type == kU8DataType ? 8 : 16;
+        if (shard_index == 0) {
+            result->activation_bits = activation_bits;
+            result->activation_code_max = activation_bits == 8 ? UINT8_MAX : UINT16_MAX;
+        } else if (result->activation_bits != activation_bits) {
+            fail("QNN shards disagree on activation width");
+        }
         std::unordered_set<std::string> expected_names;
         for (auto iterator = tensors.begin(); iterator != tensors.end(); ++iterator) {
-            if (iterator.value().value("data_type", "") == kU16DataType) {
+            if (iterator.value().value("data_type", "") == activation_data_type) {
                 expected_names.insert(iterator.key());
             }
         }
@@ -752,9 +945,10 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
             }
             if (tensor.contains("static_payload")) {
                 const auto & payload = tensor.at("static_payload");
+                const uint32_t element_bytes = fixed_point_element_bytes(parsed.data_type);
                 if (!payload.is_object() ||
                     payload.value("storage", "") != "embedded_exact_bytes" ||
-                    payload.value("element_bytes", 0) != static_cast<int>(sizeof(uint16_t)) ||
+                    payload.value("element_bytes", 0) != static_cast<int>(element_bytes) ||
                     !payload.contains("data_le_base64") ||
                     !payload.contains("data_bytes") ||
                     !payload.contains("sha256")) {
@@ -768,10 +962,11 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                     }
                     elements *= static_cast<size_t>(dimension);
                 }
-                if (elements > std::numeric_limits<size_t>::max() / sizeof(uint16_t)) {
+                if (element_bytes == 0 ||
+                    elements > std::numeric_limits<size_t>::max() / element_bytes) {
                     fail("U16 tensor " + name + " static data byte size overflows");
                 }
-                const size_t expected_bytes = elements * sizeof(uint16_t);
+                const size_t expected_bytes = elements * element_bytes;
                 const uint64_t declared_bytes = payload.at("data_bytes").get<uint64_t>();
                 if (declared_bytes != expected_bytes) {
                     fail("U16 tensor " + name + " static data size disagrees with dimensions");
@@ -784,9 +979,10 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                 }
                 parsed.static_data.resize(elements);
                 for (size_t element = 0; element < elements; ++element) {
-                    parsed.static_data[element] =
-                        static_cast<uint16_t>(decoded[element * 2]) |
-                        static_cast<uint16_t>(decoded[element * 2 + 1] << 8);
+                    parsed.static_data[element] = element_bytes == 1
+                        ? static_cast<uint16_t>(decoded[element])
+                        : static_cast<uint16_t>(decoded[element * 2]) |
+                            static_cast<uint16_t>(decoded[element * 2 + 1] << 8);
                 }
                 parsed.static_data_sha256 = payload.at("sha256").get<std::string>();
                 if (parsed.static_data_sha256.size() != 64) {
@@ -881,7 +1077,7 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                     fail("shard " + std::to_string(shard_index) +
                         " has inconsistent quantized tensor identity " + name);
                 }
-                if (data_type == kU16DataType) {
+                if (data_type == activation_data_type) {
                     if (result->find_u16_tensor(parsed_shard_index, name) == nullptr) {
                         fail("quantized tensor index references an unknown U16 tensor " + name);
                     }
@@ -1109,6 +1305,26 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                                 std::to_string(input_position));
                     }
                 }
+                if (result->activation_bits == 8 && is_add_or_subtract &&
+                    parsed_operation.inputs.size() >= 2) {
+                    const auto * lhs = result->find_u16_tensor(
+                        parsed_shard_index, parsed_operation.inputs[0]);
+                    const auto * rhs = result->find_u16_tensor(
+                        parsed_shard_index, parsed_operation.inputs[1]);
+                    if (lhs != nullptr && rhs != nullptr &&
+                        lhs->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
+                        rhs->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
+                        lhs->qparams.scale_offsets.size() == 1 &&
+                        rhs->qparams.scale_offsets.size() == 1) {
+                        parsed_operation.a8_add_subtract =
+                            make_a8_add_subtract_params(
+                                lhs->qparams.scale_offsets.front(),
+                                rhs->qparams.scale_offsets.front(),
+                                output_affine,
+                                parsed_operation.type_name == "ElementWiseSubtract",
+                                "operation " + parsed_operation.name);
+                    }
+                }
                 if (parsed_operation.type_name == "ElementWiseMultiply" &&
                     parsed_operation.inputs.size() >= 2) {
                     const auto * lhs = result->find_u16_tensor(
@@ -1130,6 +1346,71 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                             rhs->qparams.scale_offsets.front(),
                             output_affine,
                             "operation " + parsed_operation.name);
+                        if (result->activation_bits == 8) {
+                            parsed_operation.a8_multiply = make_a8_multiply_params(
+                                lhs->qparams.scale_offsets.front(),
+                                rhs->qparams.scale_offsets.front(),
+                                output_affine,
+                                "operation " + parsed_operation.name);
+                            if (operation.contains("qnn_v75_a8_multiply")) {
+                                const auto & exact = operation.at("qnn_v75_a8_multiply");
+                                if (!exact.is_object()) {
+                                    fail("operation " + parsed_operation.name +
+                                        " has malformed qnn_v75_a8_multiply metadata");
+                                }
+                                llama_qnn_a8_multiply_params bound;
+                                bound.q15_coefficient = checked_i16(
+                                    exact.at("q15_coefficient").get<int64_t>(),
+                                    "operation " + parsed_operation.name +
+                                        " exact multiply coefficient");
+                                bound.packed_zero_points = checked_i16(
+                                    exact.at("packed_zero_points").get<int64_t>(),
+                                    "operation " + parsed_operation.name +
+                                        " exact multiply packed zero points");
+                                bound.negative_translation = checked_i16(
+                                    exact.at("negative_translation").get<int64_t>(),
+                                    "operation " + parsed_operation.name +
+                                        " exact multiply negative translation");
+                                bound.pre_multiply_bias = checked_i16(
+                                    exact.at("pre_multiply_bias").get<int64_t>(),
+                                    "operation " + parsed_operation.name +
+                                        " exact multiply pre-bias");
+                                bound.output_bias = checked_i16(
+                                    exact.at("output_bias").get<int64_t>(),
+                                    "operation " + parsed_operation.name +
+                                        " exact multiply output bias");
+                                bound.shift = exact.at("shift").get<int32_t>();
+                                bound.valid = true;
+
+                                const auto & derived = parsed_operation.a8_multiply;
+                                const int64_t translation = -static_cast<int64_t>(
+                                    bound.negative_translation);
+                                const int64_t translated_q15 = floor_shift_right(
+                                    translation * bound.q15_coefficient +
+                                        (INT64_C(1) << 14),
+                                    15);
+                                const int64_t expected_pre_bias =
+                                    static_cast<int64_t>(
+                                        lhs->qparams.scale_offsets.front().zero_point) *
+                                        rhs->qparams.scale_offsets.front().zero_point +
+                                    translation;
+                                const int64_t expected_output_bias =
+                                    (static_cast<int64_t>(output_affine.zero_point) <<
+                                        bound.shift) -
+                                    translated_q15;
+                                if (bound.q15_coefficient != derived.q15_coefficient ||
+                                    bound.packed_zero_points != derived.packed_zero_points ||
+                                    bound.shift != derived.shift ||
+                                    bound.pre_multiply_bias != expected_pre_bias ||
+                                    std::abs(
+                                        static_cast<int64_t>(bound.output_bias) -
+                                        expected_output_bias) > 1) {
+                                    fail("operation " + parsed_operation.name +
+                                        " has inconsistent exact V75 A8 Multiply metadata");
+                                }
+                                parsed_operation.a8_multiply = bound;
+                            }
+                        }
                     }
                 }
                 if (parsed_operation.type_name == "MatMul" &&
@@ -1189,21 +1470,31 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                         measured_sigmoid_luts.erase(measured);
                     } else {
                         parsed_operation.unary_lut.resize(
-                            static_cast<size_t>(UINT16_MAX) + 1);
-                        for (uint32_t code = 0; code <= UINT16_MAX; ++code) {
+                            static_cast<size_t>(result->activation_code_max) + 1);
+                        for (uint32_t code = 0;
+                             code <= result->activation_code_max; ++code) {
                             const double input_value =
                                 (static_cast<int64_t>(code) - input_affine.zero_point) *
                                 static_cast<double>(input_affine.scale);
                             const double sigmoid = input_value >= 0.0
                                 ? 1.0 / (1.0 + std::exp(-input_value))
                                 : std::exp(input_value) / (1.0 + std::exp(input_value));
-                            const double output_range =
-                                1.0 / static_cast<double>(output_affine.scale) - 1.0;
-                            const int64_t output_code =
-                                static_cast<int64_t>(std::floor(sigmoid * output_range)) +
-                                output_affine.zero_point;
+                            // The native A8 HTP Sigmoid was exhaustively swept for
+                            // every Qwen3-4B layer (all 256 input codes).  It uses
+                            // nearest affine quantization with the declared output
+                            // scale.  Keep the historical A16 fallback unchanged;
+                            // production A16 profiles normally supply measured LUTs.
+                            const int64_t output_code = result->activation_bits == 8
+                                ? static_cast<int64_t>(std::llround(
+                                      sigmoid / static_cast<double>(output_affine.scale))) +
+                                    output_affine.zero_point
+                                : static_cast<int64_t>(std::floor(
+                                      sigmoid *
+                                      (1.0 / static_cast<double>(output_affine.scale) - 1.0))) +
+                                    output_affine.zero_point;
                             parsed_operation.unary_lut[code] = static_cast<uint16_t>(
-                                std::clamp<int64_t>(output_code, 0, UINT16_MAX));
+                                std::clamp<int64_t>(
+                                    output_code, 0, result->activation_code_max));
                         }
                     }
                 }
@@ -1240,6 +1531,24 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                         parsed_operation.unary_input_to_output_q20 = scale_ratio_q20(
                             input->qparams.scale_offsets.front(), output_affine,
                             "operation " + parsed_operation.name);
+                        if (result->activation_bits == 8 &&
+                            !measured_a8_reduce_min_luts.empty()) {
+                            const auto measured = std::find_if(
+                                measured_a8_reduce_min_luts.begin(),
+                                measured_a8_reduce_min_luts.end(),
+                                [&](const measured_a8_reduce_min_lut & value) {
+                                    return same_affine(
+                                               value.input,
+                                               input->qparams.scale_offsets.front()) &&
+                                        same_affine(value.output, output_affine);
+                                });
+                            if (measured == measured_a8_reduce_min_luts.end()) {
+                                fail("measured A8 ReduceMin LUT does not match operation " +
+                                    parsed_operation.name);
+                            }
+                            parsed_operation.unary_lut = measured->codes;
+                            measured->matched = true;
+                        }
                     }
                 }
                 if (parsed_operation.type_name == "ElementWiseDivide" &&
@@ -1306,17 +1615,31 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                 parsed_operation.outputs.size() == 1) {
                 const auto * input = result->find_u16_tensor(
                     parsed_shard_index, parsed_operation.inputs.front());
-                const auto * output = result->find_aux_tensor(
-                    parsed_shard_index, parsed_operation.outputs.front());
-                if (input != nullptr && output != nullptr &&
-                    output->data_type == "QNN_DATATYPE_UFIXED_POINT_8" &&
+                const auto * output_u8 = result->activation_bits == 8
+                    ? result->find_u16_tensor(
+                        parsed_shard_index, parsed_operation.outputs.front())
+                    : nullptr;
+                const auto * output_aux = output_u8 == nullptr
+                    ? result->find_aux_tensor(
+                        parsed_shard_index, parsed_operation.outputs.front())
+                    : nullptr;
+                const llama_qnn_tensor_qparams * output_qparams = output_u8 != nullptr
+                    ? &output_u8->qparams
+                    : output_aux != nullptr ? &output_aux->qparams : nullptr;
+                const std::string * output_data_type = output_u8 != nullptr
+                    ? &output_u8->data_type
+                    : output_aux != nullptr ? &output_aux->data_type : nullptr;
+                if (input != nullptr && output_qparams != nullptr &&
+                    output_data_type != nullptr &&
+                    (*output_data_type == "QNN_DATATYPE_UFIXED_POINT_8" ||
+                     *output_data_type == "QNN_DATATYPE_SFIXED_POINT_8") &&
                     input->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
-                    output->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
+                    output_qparams->encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
                     input->qparams.scale_offsets.size() == 1 &&
-                    output->qparams.scale_offsets.size() == 1) {
+                    output_qparams->scale_offsets.size() == 1) {
                     parsed_operation.unary_input_to_output_q31 = scale_ratio_q31(
                         input->qparams.scale_offsets.front(),
-                        output->qparams.scale_offsets.front(),
+                        output_qparams->scale_offsets.front(),
                         "operation " + parsed_operation.name);
                 }
             }
@@ -1334,6 +1657,15 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
                     fail("multiple QNN producers for tensor in shard " +
                         std::to_string(shard_index) + ": " + output_name);
                 }
+            }
+            if (parsed_operation.type_name == "Convert" &&
+                    parsed_operation.inputs.size() == 1) {
+                // Preserve the old scan's first-match behavior if a source has
+                // more than one Convert consumer.
+                result->operation_convert_input_shard_index.emplace(
+                    sharded_tensor_key(
+                        parsed_shard_index, parsed_operation.inputs.front()),
+                    parsed_operation_index);
             }
             if (parsed_operation.decoder_binding.layer_ids.size() == 1) {
                 const int32_t operation_layer_id =
@@ -1442,12 +1774,15 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
         }
     }
     if (result->u16_tensors.empty()) {
-        fail("profile contains no QNN U16 tensors");
+        fail("profile contains no QNN unsigned activation tensors");
     }
     const size_t expected_linear_qparams =
         static_cast<size_t>(result->num_decoder_layers) * 7;
     if (result->linear_qparams.size() != expected_linear_qparams) {
-        fail("profile does not contain exactly seven GPTQ linear qparam pairs per decoder layer");
+        fail(
+            "profile does not contain exactly seven GPTQ linear qparam pairs per decoder layer: got " +
+            std::to_string(result->linear_qparams.size()) + ", expected " +
+            std::to_string(expected_linear_qparams));
     }
     static constexpr std::array<std::string_view, 7> required_projections = {
         "self_attn.q_proj",
@@ -1484,6 +1819,12 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
     if (!measured_sigmoid_luts.empty()) {
         fail("one or more measured Sigmoid LUTs did not match a profile operation");
     }
+    if (std::any_of(
+            measured_a8_reduce_min_luts.begin(),
+            measured_a8_reduce_min_luts.end(),
+            [](const measured_a8_reduce_min_lut & value) { return !value.matched; })) {
+        fail("one or more measured A8 ReduceMin LUTs did not match a profile operation");
+    }
     const auto bias_entries = profile.find("decoder_linear_output_bias_q7");
     if (bias_entries != profile.end()) {
         if (!bias_entries->is_array()) {
@@ -1513,7 +1854,10 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
 }
 
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_environment() {
-    const char * manifest_path = std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+    const char * manifest_path = std::getenv("LLAMA_QNN_U8_QPARAMS_MANIFEST");
+    if (manifest_path == nullptr || manifest_path[0] == '\0') {
+        manifest_path = std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+    }
     if (manifest_path == nullptr || manifest_path[0] == '\0') {
         return nullptr;
     }

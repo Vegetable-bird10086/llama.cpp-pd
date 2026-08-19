@@ -631,6 +631,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(int16_t),
         .is_quantized             = false,
     },
+    [GGML_TYPE_U8] = {
+        .type_name                = "u8",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+    },
     [GGML_TYPE_U16] = {
         .type_name                = "u16",
         .blck_size                = 1,

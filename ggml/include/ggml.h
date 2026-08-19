@@ -433,6 +433,7 @@ extern "C" {
         // Runtime-only unsigned activation storage for the opt-in QNN-aligned
         // decode path. Keep it after all on-disk GGUF types so its value is
         // never serialized as a model tensor type.
+        GGML_TYPE_U8        = 43,
         GGML_TYPE_GPTQ2_64  = 44, // GPTQ 2-bit asymmetric, group_size=64
         GGML_TYPE_GPTQ2_128 = 45, // GPTQ 2-bit asymmetric, group_size=128
         GGML_TYPE_U16       = 46,

@@ -243,6 +243,7 @@ bool write_capture(ggml_tensor * tensor, const std::string & name, capture_state
     switch (tensor->type) {
         case GGML_TYPE_F32: suffix = ".f32.bin"; break;
         case GGML_TYPE_U16: suffix = ".u16.bin"; break;
+        case GGML_TYPE_U8:  suffix = ".u8.bin";  break;
         case GGML_TYPE_I8:  suffix = ".u8.bin";  break;
         default:
             state.error = "unsupported target tensor type: " + name +

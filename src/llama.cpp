@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -60,8 +61,12 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
         return;
     }
     const auto layout = model.gguf_kv.find("general.gptq2_32.layout");
+    const bool weights_i8mm_native_source =
+        layout != model.gguf_kv.end() && layout->second == "i8mm_native_v1";
     const bool weights_gs32_source =
-        layout != model.gguf_kv.end() && layout->second == "gs32_source_v1";
+        layout != model.gguf_kv.end() &&
+        (layout->second == "gs32_source_v1" ||
+         weights_i8mm_native_source);
     const auto lm_head_layout_it =
         model.gguf_kv.find("general.q8_0_lm_head.layout");
     const std::string expected_lm_head_layout =
@@ -93,7 +98,9 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
              profile.lm_head_layout != expected_lm_head_layout)) {
             GGML_ABORT("kernel-ready QNN metadata disagrees with lm_head");
         }
-        for (const llama_qnn_linear_qparams & qparams : profile.linear_qparams) {
+        for (llama_qnn_linear_qparams & qparams : profile.linear_qparams) {
+            qparams.weights_i8mm_native_source =
+                weights_i8mm_native_source;
             const ggml_tensor * weights = llama_qnn_linear_weight(model, qparams);
             GGML_ASSERT(weights != nullptr && weights->type == GGML_TYPE_GPTQ2_32);
             GGML_ASSERT(weights->ne[1] % 8 == 0);
@@ -124,6 +131,11 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
                 weights->name, ggml_type_name(weights->type));
         }
         qparams.weights_gs32_source = weights_gs32_source;
+        qparams.weights_i8mm_native_source = weights_i8mm_native_source;
+        if (weights_i8mm_native_source) {
+            GGML_ABORT(
+                "i8mm_native_v1 requires a kernel-ready QNN quant profile");
+        }
         if (weights_gs32_source) {
             GGML_ASSERT(weights->type == GGML_TYPE_GPTQ2_32);
             GGML_ASSERT(weights->ne[1] % 64 == 0);
@@ -247,6 +259,219 @@ bool llama_qnn_u16_attach_profile_from_environment(llama_model * model) {
         model->qnn_u16_profile->u16_tensor_count(),
         model->qnn_u16_profile->linear_qparams_count(),
         model->qnn_u16_profile->operation_count());
+    return true;
+}
+
+namespace {
+
+static std::string llama_qnn_indexed_fx_name(const char * stem, int32_t index) {
+    std::string result(stem);
+    if (index > 0) {
+        result += "_" + std::to_string(index);
+    }
+    return result;
+}
+
+static std::string llama_qnn_indexed_head_fx_name(
+        const char * stem, int32_t index, int32_t head) {
+    return llama_qnn_indexed_fx_name(stem, index) +
+        "_h_" + std::to_string(head);
+}
+
+static const llama_qnn_operation * llama_qnn_find_kv_convert(
+        const llama_qnn_quant_profile & profile,
+        int32_t layer,
+        int32_t head,
+        bool key) {
+    const std::string producer_fx = llama_qnn_indexed_head_fx_name(
+        key ? "aten_matmul_default" : "aten_convolution_default",
+        key ? 4 * layer + 1 : 7 * layer + 2,
+        head);
+    const llama_qnn_operation * producer =
+        profile.find_operation_by_fx(layer, producer_fx);
+    if (producer == nullptr && !key && profile.activation_bits == 8) {
+        // A8 final shards may retain V as one fused projection rather than
+        // exposing one Conv2d node per KV head.
+        for (const llama_qnn_operation & candidate : profile.operations) {
+            if (candidate.shard_index == layer / 2 &&
+                    candidate.type_name == "Conv2d" &&
+                    candidate.decoder_binding.layer_ids.size() == 1 &&
+                    candidate.decoder_binding.layer_ids[0] == layer &&
+                    candidate.decoder_binding.projection == "self_attn.v_proj") {
+                producer = &candidate;
+                break;
+            }
+        }
+    }
+    if (producer == nullptr ||
+            producer->type_name != (key ? "MatMul" : "Conv2d") ||
+            producer->outputs.size() != 1) {
+        return nullptr;
+    }
+    for (const llama_qnn_operation & operation : profile.operations) {
+        if (operation.shard_index == layer / 2 &&
+                operation.type_name == "Convert" &&
+                operation.inputs.size() == 1 &&
+                operation.inputs[0] == producer->outputs[0]) {
+            return &operation;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+bool llama_qnn_u16_quantize_fp16_kv(
+        const llama_model * model,
+        const uint16_t * fp16_kv,
+        size_t fp16_values,
+        int32_t num_layers,
+        int32_t num_kv_heads,
+        int32_t prompt_length,
+        int32_t head_dim,
+        uint8_t * qnn_u8_kv,
+        llama_qnn_kv_quantize_stats * stats,
+        std::string * error) {
+    auto fail = [error](const std::string & message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (model == nullptr || model->qnn_u16_profile == nullptr) {
+        return fail("QNN quantization profile is not attached");
+    }
+    if (fp16_kv == nullptr || qnn_u8_kv == nullptr ||
+            num_layers <= 0 || num_kv_heads <= 0 ||
+            prompt_length <= 0 || head_dim <= 0) {
+        return fail("invalid FP16 KV bridge arguments");
+    }
+    const size_t per_kind = static_cast<size_t>(num_layers) *
+        num_kv_heads * prompt_length * head_dim;
+    if (fp16_values != per_kind * 2) {
+        return fail("FP16 KV bridge element count mismatch");
+    }
+    const llama_qnn_quant_profile & profile = *model->qnn_u16_profile;
+    if (profile.num_decoder_layers != num_layers) {
+        return fail("QNN profile layer count does not match the handoff");
+    }
+
+    llama_qnn_kv_quantize_stats local_stats {};
+    for (int32_t kind = 0; kind < 2; ++kind) {
+        const bool key = kind == 0;
+        const size_t kind_base = static_cast<size_t>(kind) * per_kind;
+        for (int32_t layer = 0; layer < num_layers; ++layer) {
+            for (int32_t head = 0; head < num_kv_heads; ++head) {
+                const llama_qnn_operation * convert =
+                    llama_qnn_find_kv_convert(profile, layer, head, key);
+                if (convert == nullptr) {
+                    return fail("missing QNN KV Convert for layer " +
+                        std::to_string(layer) + " head " +
+                        std::to_string(head) + (key ? " K" : " V"));
+                }
+                const llama_qnn_aux_quantized_tensor * output =
+                    profile.find_aux_operand(*convert, "output", 0);
+                if (output == nullptr ||
+                        output->data_type != "QNN_DATATYPE_UFIXED_POINT_8" ||
+                        output->qparams.encoding !=
+                            LLAMA_QNN_QUANTIZATION_SCALE_OFFSET ||
+                        output->qparams.scale_offsets.size() != 1) {
+                    return fail("invalid QNN U8 KV output qparams for layer " +
+                        std::to_string(layer) + " head " +
+                        std::to_string(head));
+                }
+                const llama_qnn_affine_qparams & qp =
+                    output->qparams.scale_offsets[0];
+                if (!(qp.scale > 0.0f) || !std::isfinite(qp.scale)) {
+                    return fail("invalid QNN U8 KV scale");
+                }
+                const size_t row_base = kind_base +
+                    (static_cast<size_t>(layer) * num_kv_heads + head) *
+                    prompt_length * head_dim;
+                const llama_qnn_affine_qparams * rotate_qp = nullptr;
+                const int16_t * rotate_weights = nullptr;
+                if (key) {
+                    const std::string rotate_fx =
+                        llama_qnn_indexed_head_fx_name(
+                            "aten_matmul_default", 4 * layer + 1, head);
+                    const llama_qnn_operation * rotate =
+                        profile.find_operation_by_fx(layer, rotate_fx);
+                    const llama_qnn_aux_quantized_tensor * weights =
+                        rotate != nullptr
+                            ? profile.find_aux_operand(*rotate, "input", 1)
+                            : nullptr;
+                    if (rotate == nullptr || rotate->type_name != "MatMul" ||
+                            weights == nullptr ||
+                            weights->data_type !=
+                                "QNN_DATATYPE_SFIXED_POINT_16" ||
+                            weights->dimensions.size() != 2 ||
+                            weights->dimensions[0] != head_dim ||
+                            weights->dimensions[1] != head_dim ||
+                            weights->qparams.scale_offsets.size() != 1 ||
+                            weights->static_data.size() !=
+                                static_cast<size_t>(head_dim) * head_dim *
+                                    sizeof(int16_t)) {
+                        return fail("invalid QNN K rotation for layer " +
+                            std::to_string(layer) + " head " +
+                            std::to_string(head));
+                    }
+                    rotate_qp = &weights->qparams.scale_offsets[0];
+                    rotate_weights = reinterpret_cast<const int16_t *>(
+                        weights->static_data.data());
+                }
+                std::vector<float> rotated(static_cast<size_t>(head_dim));
+                for (int32_t token = 0; token < prompt_length; ++token) {
+                    const size_t token_base = row_base +
+                        static_cast<size_t>(token) * head_dim;
+                    if (key) {
+                        for (int32_t column = 0; column < head_dim; ++column) {
+                            double sum = 0.0;
+                            for (int32_t index = 0; index < head_dim; ++index) {
+                                const float input = ggml_fp16_to_fp32(
+                                    static_cast<ggml_fp16_t>(
+                                        fp16_kv[token_base + index]));
+                                const int16_t weight_code =
+                                    rotate_weights[index * head_dim + column];
+                                const double weight =
+                                    (static_cast<int32_t>(weight_code) +
+                                        rotate_qp->offset) *
+                                    static_cast<double>(rotate_qp->scale);
+                                sum += static_cast<double>(input) * weight;
+                            }
+                            rotated[static_cast<size_t>(column)] =
+                                static_cast<float>(sum);
+                        }
+                    }
+                    for (int32_t index = 0; index < head_dim; ++index) {
+                        const float real = key
+                            ? rotated[static_cast<size_t>(index)]
+                            : ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(
+                                fp16_kv[token_base + index]));
+                    int64_t code = qp.zero_point;
+                    if (std::isfinite(real)) {
+                        // QNN affine convention: real=(code+offset)*scale.
+                        // nearbyint follows the default ties-to-even mode used
+                        // by the exporter/runtime quantize boundary.
+                        code = static_cast<int64_t>(
+                            std::nearbyint(static_cast<double>(real) / qp.scale)) -
+                            qp.offset;
+                    } else {
+                        ++local_stats.non_finite;
+                    }
+                    code = std::clamp<int64_t>(code, 0, UINT8_MAX);
+                        qnn_u8_kv[token_base + index] =
+                            static_cast<uint8_t>(code);
+                    local_stats.code_zero += code == 0;
+                    local_stats.code_255 += code == UINT8_MAX;
+                    ++local_stats.values;
+                    }
+                }
+            }
+        }
+    }
+    if (stats != nullptr) {
+        *stats = local_stats;
+    }
     return true;
 }
 

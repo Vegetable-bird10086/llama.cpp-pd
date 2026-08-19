@@ -217,7 +217,6 @@ class Qwen3Model(Qwen2Model):
         super().set_gguf_parameters()
         if (
             self._gptq2_32_gs32_source
-            and self.hparams.get("tie_word_embeddings", False)
         ):
             self.gguf_writer.add_string(
                 "general.external_token_embedding", "semb_v1"
@@ -254,11 +253,11 @@ class Qwen3Model(Qwen2Model):
 
         if (
             self._gptq2_32_gs32_source
-            and self.hparams.get("tie_word_embeddings", False)
             and name.endswith("embed_tokens.weight")
         ):
-            output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
-            yield output_name, data_torch
+            if self.hparams.get("tie_word_embeddings", False):
+                output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
+                yield output_name, data_torch
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
@@ -267,12 +266,10 @@ class Qwen3Model(Qwen2Model):
         output_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.OUTPUT] + ".weight"
         if (
             self._gptq2_32_gs32_source
-            and self.hparams.get("tie_word_embeddings", False)
             and new_name == output_name
         ):
-            # The tied token table is external for input lookup. Keep a
-            # separately selectable LM head for Decode logits. Q8_0 is the
-            # compact default; F16/BF16 are available for fidelity testing.
+            # The token table is external for input lookup. Keep a separately
+            # selectable LM head for Decode logits.
             return self._gptq2_32_gs32_lm_head_type
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 

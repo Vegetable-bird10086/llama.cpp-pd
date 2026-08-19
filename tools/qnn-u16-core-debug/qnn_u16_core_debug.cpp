@@ -83,6 +83,33 @@ void repack_lm_head_q8_0(
     }
 }
 
+void repack_q4_0_inter8(
+        const block_q4_0 * source,
+        block_q4_0x4 * destination,
+        int64_t rows,
+        int64_t columns) {
+    const int64_t blocks = columns / QK4_0;
+    for (int64_t row = 0; row < rows; row += 4) {
+        for (int64_t block = 0; block < blocks; ++block) {
+            block_q4_0x4 & output = *destination++;
+            for (int lane = 0; lane < 4; ++lane) {
+                output.d[lane] = source[(row + lane) * blocks + block].d;
+            }
+            for (int chunk = 0; chunk < QK4_0 / 2 / 8; ++chunk) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    const uint8_t * input =
+                        source[(row + lane) * blocks + block].qs + chunk * 8;
+                    uint8_t * packed = reinterpret_cast<uint8_t *>(output.qs) +
+                        (chunk * 4 + lane) * 8;
+                    for (int byte = 0; byte < 8; ++byte) {
+                        packed[byte] = input[byte] ^ 0x88;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void repack_lm_head_q6_k(
         const block_q6_K * source,
         block_q6_Kx8 * destination,
@@ -128,11 +155,15 @@ void repack_lm_head_q6_k(
     }
 }
 
-int run_lm_head_gemv_test(ggml_type weight_type, int n_threads, int64_t rows) {
-    constexpr int64_t columns = 2048;
+int run_lm_head_gemv_test(
+        ggml_type weight_type,
+        int n_threads,
+        int64_t rows,
+        int64_t columns) {
     constexpr int iterations = 4;
     if ((weight_type != GGML_TYPE_Q8_0 && weight_type != GGML_TYPE_Q6_K) ||
-        n_threads <= 0 || rows <= 0 || rows % 8 != 0) {
+        n_threads <= 0 || rows <= 0 || rows % 8 != 0 ||
+        columns <= 0 || columns % 256 != 0) {
         return 2;
     }
 
@@ -235,6 +266,12 @@ int run_lm_head_gemv_test(ggml_type weight_type, int n_threads, int64_t rows) {
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_threadpool_params threadpool_params =
         ggml_threadpool_params_default(n_threads);
+    if (n_threads == 6) {
+        for (int cpu = 2; cpu <= 7; ++cpu) {
+            threadpool_params.cpumask[cpu] = true;
+        }
+        threadpool_params.strict_cpu = true;
+    }
     ggml_threadpool * threadpool = ggml_threadpool_new(&threadpool_params);
     if (threadpool == nullptr) {
         ggml_backend_free(backend);
@@ -3694,6 +3731,67 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                     static_cast<size_t>(row) * metadata_row_stride + block];
         }
     }
+    constexpr int activation_u8_zero_point = 137;
+    std::vector<uint8_t> activations_u8(input_size);
+    std::vector<int64_t> u8_reference(output_size);
+    std::vector<int64_t> u8_row8(output_size);
+    std::vector<int64_t> u8_row16(output_size);
+    for (int column = 0; column < input_size; ++column) {
+        activations_u8[column] = static_cast<uint8_t>(
+            (column * 73 + (column / 32) * 29 + 17) & 0xff);
+    }
+    for (int row = 0; row < output_size; ++row) {
+        int64_t dot = 0;
+        for (int block = 0; block < blocks; ++block) {
+            const uint8_t prepared =
+                metadata[static_cast<size_t>(row) * metadata_row_stride + block];
+            const int32_t weight_zero_point = (prepared >> 5) & 0x3;
+            const uint8_t * packed =
+                weights.data() + static_cast<size_t>(row) * weight_row_stride +
+                static_cast<size_t>(block) * 12;
+            int32_t block_dot = 0;
+            for (int column = 0; column < 32; ++column) {
+                const int32_t activation =
+                    activations_u8[block * 32 + column] - activation_u8_zero_point;
+                const int32_t code =
+                    (packed[column / 4] >> ((column & 3) * 2)) & 0x3;
+                block_dot += activation * (code - weight_zero_point);
+            }
+            dot += (int64_t) block_dot * (prepared & 0x1f);
+        }
+        u8_reference[row] = dot;
+    }
+    for (int row = 0; row < output_size; row += 8) {
+        ggml_gptq2_32_gs32_u8_centered_dot_8rows(
+            input_size, u8_row8.data() + row, gs32_weights.data(), row,
+            activations_u8.data(),
+            tiled_metadata.data() + static_cast<size_t>(row) * metadata_row_stride,
+            prepared_weight_sums.data() + row, activation_u8_zero_point);
+    }
+    for (int row = 0; row < output_size; row += 16) {
+        ggml_gptq2_32_gs32_u8_centered_dot_16rows(
+            input_size, u8_row16.data() + row, gs32_weights.data(), row,
+            activations_u8.data(),
+            tiled_metadata.data() + static_cast<size_t>(row) * metadata_row_stride,
+            prepared_weight_sums.data() + row, activation_u8_zero_point);
+    }
+    const bool u8_centered_exact =
+        u8_reference == u8_row8 && u8_reference == u8_row16;
+    size_t u8_centered_mismatches = 0;
+    size_t u8_centered_first_mismatch = output_size;
+    int64_t u8_centered_max_error = 0;
+    for (size_t row = 0; row < u8_reference.size(); ++row) {
+        const int64_t error = u8_row8[row] - u8_reference[row];
+        if (error != 0) {
+            if (u8_centered_first_mismatch == u8_reference.size()) {
+                u8_centered_first_mismatch = row;
+            }
+            ++u8_centered_mismatches;
+            const int64_t absolute_error = error >= 0 ? error : -error;
+            u8_centered_max_error = std::max(
+                u8_centered_max_error, absolute_error);
+        }
+    }
     int activation_range = 1;
     for (int block = 0; block < blocks; ++block) {
         int32_t sum = 0;
@@ -3794,6 +3892,28 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
                 prepared_weight_sums.data() + row,
                 activation_zero_point, output_zero_point,
                 fractional_constant, 0, 0);
+        }
+    };
+    const auto run_gs32_u8_8rows = [&]() {
+        for (int row = 0; row < output_size; row += 8) {
+            ggml_gptq2_32_gs32_u8_centered_dot_8rows(
+                input_size, u8_row8.data() + row, gs32_weights.data(), row,
+                activations_u8.data(),
+                tiled_metadata.data() +
+                    static_cast<size_t>(row) * metadata_row_stride,
+                prepared_weight_sums.data() + row,
+                activation_u8_zero_point);
+        }
+    };
+    const auto run_gs32_u8_16rows = [&]() {
+        for (int row = 0; row < output_size; row += 16) {
+            ggml_gptq2_32_gs32_u8_centered_dot_16rows(
+                input_size, u8_row16.data() + row, gs32_weights.data(), row,
+                activations_u8.data(),
+                tiled_metadata.data() +
+                    static_cast<size_t>(row) * metadata_row_stride,
+                prepared_weight_sums.data() + row,
+                activation_u8_zero_point);
         }
     };
     const auto run_16rows = [&]() {
@@ -3979,6 +4099,8 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         run_16rows();
         run_f32();
         run_q2_k();
+        run_gs32_u8_8rows();
+        run_gs32_u8_16rows();
     }
     uint64_t checksum = 0;
     constexpr int prepare_iterations = 10000;
@@ -4023,6 +4145,20 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         checksum += gs32_row16_outputs[iteration % output_size];
     }
     const auto gs32_row16_end = std::chrono::steady_clock::now();
+    const auto gs32_u8_row8_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_gs32_u8_8rows();
+        checksum += static_cast<uint64_t>(
+            u8_row8[iteration % output_size] + INT64_C(1) * INT32_MAX);
+    }
+    const auto gs32_u8_row8_end = std::chrono::steady_clock::now();
+    const auto gs32_u8_row16_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_gs32_u8_16rows();
+        checksum += static_cast<uint64_t>(
+            u8_row16[iteration % output_size] + INT64_C(1) * INT32_MAX);
+    }
+    const auto gs32_u8_row16_end = std::chrono::steady_clock::now();
     const auto row16_start = std::chrono::steady_clock::now();
     for (int iteration = 0; iteration < iterations; ++iteration) {
         run_16rows();
@@ -4078,7 +4214,7 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         scalar_outputs == row8_outputs &&
         scalar_outputs == row16_outputs &&
         scalar_outputs == gs32_row16_outputs;
-    const bool exact = fast_exact && i8_exact && wide_exact;
+    const bool exact = fast_exact && i8_exact && wide_exact && u8_centered_exact;
     const double scalar_ms = std::chrono::duration<double, std::milli>(
         scalar_end - scalar_start).count() / iterations;
     const double row4_ms = std::chrono::duration<double, std::milli>(
@@ -4089,6 +4225,10 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         gs32_row8_end - gs32_row8_start).count() / iterations;
     const double gs32_row16_ms = std::chrono::duration<double, std::milli>(
         gs32_row16_end - gs32_row16_start).count() / iterations;
+    const double gs32_u8_row8_ms = std::chrono::duration<double, std::milli>(
+        gs32_u8_row8_end - gs32_u8_row8_start).count() / iterations;
+    const double gs32_u8_row16_ms = std::chrono::duration<double, std::milli>(
+        gs32_u8_row16_end - gs32_u8_row16_start).count() / iterations;
     const double gs32_wide_ms =
         (gs32_wide_times_ms[0] + gs32_wide_times_ms[1] +
          gs32_wide_times_ms[2] + gs32_wide_times_ms[3]) / iterations;
@@ -4104,9 +4244,14 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         prepare_end - prepare_start).count() / prepare_iterations;
     std::printf(
         "qnn-gptq2-u16-gemv-4row-test: input=%d output=%d exact=%d "
-        "fast_exact=%d i8_exact=%d wide_exact=%d gs32_dotprod=%d "
+        "fast_exact=%d i8_exact=%d wide_exact=%d u8_centered_exact=%d "
+        "u8_mismatches=%zu u8_max_error=%lld u8_first=%zu "
+        "u8_first_ref=%lld u8_first_actual=%lld "
+        "gs32_dotprod=%d "
         "scalar_ms=%.6f row4_ms=%.6f row8_ms=%.6f row16_ms=%.6f "
-        "gs32_row8_ms=%.6f gs32_row16_ms=%.6f gs32_16_vs_8_speedup=%.3f "
+        "gs32_row8_ms=%.6f gs32_row16_ms=%.6f gs32_u8_row8_ms=%.6f "
+        "gs32_u8_row16_ms=%.6f u8_accum_vs_a16_kernel_speedup=%.3f "
+        "u8_16_vs_8_speedup=%.3f gs32_16_vs_8_speedup=%.3f "
         "gs32_vs_row_major=%.3f "
         "gs32_wide_times_ms=%.6f,%.6f,%.6f,%.6f gs32_wide_ms=%.6f "
         "row8_vs_row4_speedup=%.3f row16_vs_row8_speedup=%.3f "
@@ -4118,9 +4263,20 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         "activation_dequant_buffers=0 packed_int4_buffers=0\n",
         input_size, output_size, exact ? 1 : 0,
         fast_exact ? 1 : 0, i8_exact ? 1 : 0, wide_exact ? 1 : 0,
+        u8_centered_exact ? 1 : 0,
+        u8_centered_mismatches,
+        static_cast<long long>(u8_centered_max_error),
+        u8_centered_first_mismatch,
+        static_cast<long long>(u8_centered_first_mismatch < u8_reference.size()
+            ? u8_reference[u8_centered_first_mismatch] : 0),
+        static_cast<long long>(u8_centered_first_mismatch < u8_row8.size()
+            ? u8_row8[u8_centered_first_mismatch] : 0),
         ggml_gptq2_32_gs32_dotprod_enabled(),
         scalar_ms, row4_ms, row8_ms, row16_ms,
-        gs32_row8_ms, gs32_row16_ms, gs32_row8_ms / gs32_row16_ms,
+        gs32_row8_ms, gs32_row16_ms, gs32_u8_row8_ms, gs32_u8_row16_ms,
+        gs32_row16_ms / gs32_u8_row16_ms,
+        gs32_u8_row8_ms / gs32_u8_row16_ms,
+        gs32_row8_ms / gs32_row16_ms,
         row8_ms / gs32_row8_ms,
         gs32_wide_times_ms[0], gs32_wide_times_ms[1],
         gs32_wide_times_ms[2], gs32_wide_times_ms[3], gs32_wide_ms,
@@ -4134,6 +4290,238 @@ int run_gptq2_u16_gemv_4row_test(int multithread_test_threads = 0) {
         8.0 * sizeof(block_q2_K) / QK_K,
         static_cast<unsigned long long>(checksum));
     return exact ? 0 : 10;
+}
+
+
+int run_gptq2_s8_groupwise_test(
+        int input_size = 9728,
+        int output_size = 2560,
+        int iterations = 12) {
+    if (input_size <= 0 || input_size % 32 != 0 ||
+        output_size <= 0 || output_size % 64 != 0 || iterations <= 0) {
+        std::fprintf(stderr, "invalid S8 groupwise geometry\n");
+        return 21;
+    }
+    const int blocks = input_size / 32;
+
+    std::vector<uint8_t> gs32_weights(
+        static_cast<size_t>(output_size) * blocks * 12);
+    std::vector<uint8_t> native_i8mm_weights(
+        static_cast<size_t>(output_size) * blocks * 8);
+    std::vector<uint8_t> prepared_codes(
+        static_cast<size_t>(output_size) * blocks);
+    std::vector<int8_t> activations(input_size);
+    std::vector<int32_t> block_multipliers(blocks);
+    std::vector<int64_t> reference(output_size);
+    std::vector<int64_t> actual(output_size);
+
+    std::vector<block_q4_0> q4_source(
+        static_cast<size_t>(output_size) * blocks);
+    std::vector<block_q4_0x4> q4_repacked(
+        static_cast<size_t>(output_size / 4) * blocks);
+    std::vector<float> q4_activation_float(input_size);
+    std::vector<block_q8_0> q4_activation(blocks);
+    std::vector<float> q4_output(output_size);
+    for (int column = 0; column < input_size; ++column) {
+        q4_activation_float[column] =
+            static_cast<float>((column * 37 + 11) % 251 - 125) / 64.0f;
+    }
+    quantize_row_q8_0(
+        q4_activation_float.data(), q4_activation.data(), input_size);
+    for (int row = 0; row < output_size; ++row) {
+        for (int block = 0; block < blocks; ++block) {
+            block_q4_0 & value = q4_source[
+                static_cast<size_t>(row) * blocks + block];
+            value.d = ggml_fp32_to_fp16(
+                0.001f * static_cast<float>(1 + (row + block) % 31));
+            for (int byte = 0; byte < QK4_0 / 2; ++byte) {
+                value.qs[byte] = static_cast<uint8_t>(
+                    row * 13 + block * 7 + byte * 17);
+            }
+        }
+    }
+    repack_q4_0_inter8(
+        q4_source.data(), q4_repacked.data(), output_size, input_size);
+
+    for (int column = 0; column < input_size; ++column) {
+        activations[column] = static_cast<int8_t>(
+            (column * 73 + (column / 32) * 29 + 17) % 255 - 127);
+    }
+    for (int block = 0; block < blocks; ++block) {
+        block_multipliers[block] = 1024 + (block * 811) % 7169;
+    }
+
+    for (int row = 0; row < output_size; ++row) {
+        const size_t row_block = static_cast<size_t>(row) / 64;
+        const size_t row_outer = (static_cast<size_t>(row) % 64) / 32;
+        const size_t row_middle = (static_cast<size_t>(row) % 32) / 8;
+        const size_t row_inner = static_cast<size_t>(row) % 8;
+        const size_t tile = static_cast<size_t>(row) / 8;
+        const size_t lane = static_cast<size_t>(row) % 8;
+        for (int block = 0; block < blocks; ++block) {
+            uint8_t * source_group = gs32_weights.data() +
+                row_block * static_cast<size_t>(blocks) * 768 +
+                static_cast<size_t>(block) * 768;
+            for (size_t pair = 0; pair < 4; ++pair) {
+                const size_t destination =
+                    ((((row_outer * 4 + pair) * 4 + row_middle) * 8 +
+                        row_inner) * 2);
+                for (size_t packed_index = 0; packed_index < 2;
+                     ++packed_index) {
+                    uint8_t packed = 0;
+                    for (int digit = 0; digit < 4; ++digit) {
+                        const int column = block * 32 +
+                            static_cast<int>(pair) * 8 +
+                            static_cast<int>(packed_index) * 4 + digit;
+                        const uint8_t code = static_cast<uint8_t>(
+                            (row * 13 + column * 7 + block * 3) & 0x3);
+                        packed |= static_cast<uint8_t>(code << (digit * 2));
+                    }
+                    source_group[destination + packed_index] = packed;
+                }
+            }
+            uint8_t * native_row = native_i8mm_weights.data() +
+                ((static_cast<size_t>(row) / 16 * blocks + block) * 128) +
+                ((static_cast<size_t>(row) % 16) / 2) * 16 +
+                (static_cast<size_t>(row) & 1) * 8;
+            for (int k = 0; k < 8; ++k) {
+                uint8_t packed = 0;
+                for (int digit = 0; digit < 4; ++digit) {
+                    const int column = block * 32 + digit * 8 + k;
+                    const uint8_t code = static_cast<uint8_t>(
+                        (row * 13 + column * 7 + block * 3) & 0x3);
+                    packed |= static_cast<uint8_t>(code << (digit * 2));
+                }
+                native_row[k] = packed;
+            }
+            const uint8_t zero_point =
+                static_cast<uint8_t>((row + block) & 0x3);
+            const uint8_t scale =
+                static_cast<uint8_t>(1 + (row * 5 + block * 3) % 31);
+            prepared_codes[
+                (tile * static_cast<size_t>(blocks) + block) * 8 + lane] =
+                static_cast<uint8_t>((zero_point << 5) | scale);
+
+            int32_t block_dot = 0;
+            for (int column_offset = 0; column_offset < 32;
+                 ++column_offset) {
+                const int column = block * 32 + column_offset;
+                const int32_t code =
+                    (row * 13 + column * 7 + block * 3) & 0x3;
+                block_dot += activations[column] * (code - zero_point);
+            }
+            reference[row] += static_cast<int64_t>(block_dot) * scale *
+                block_multipliers[block];
+        }
+    }
+
+    const auto run = [&]() {
+        for (int row = 0; row < output_size; row += 16) {
+            ggml_gptq2_32_gs32_s8_groupwise_dot_16rows(
+                input_size, actual.data() + row, gs32_weights.data(), row,
+                activations.data(),
+                prepared_codes.data() + static_cast<size_t>(row) * blocks,
+                block_multipliers.data());
+        }
+    };
+
+
+    std::vector<int64_t> native_actual(output_size);
+    const auto run_native_i8mm = [&]() {
+        for (int row = 0; row < output_size; row += 16) {
+            ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
+                input_size, native_actual.data() + row,
+                native_i8mm_weights.data(), row, activations.data(),
+                prepared_codes.data() + static_cast<size_t>(row) * blocks,
+                block_multipliers.data());
+        }
+    };
+    run_native_i8mm();
+    size_t native_mismatches = 0;
+    int64_t native_max_error = 0;
+    for (size_t row = 0; row < native_actual.size(); ++row) {
+        const int64_t error = native_actual[row] - reference[row];
+        if (error != 0) {
+            ++native_mismatches;
+            native_max_error = std::max(
+                native_max_error, error >= 0 ? error : -error);
+        }
+    }
+    uint64_t native_checksum = 0;
+    const auto native_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_native_i8mm();
+        native_checksum += static_cast<uint64_t>(
+            native_actual[iteration % output_size] + INT64_C(1) * INT32_MAX);
+    }
+    const double native_elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - native_start).count() / iterations;
+
+    const auto run_q4 = [&]() {
+        ggml_gemv_q4_0_4x8_q8_0(
+            input_size, q4_output.data(), 0, q4_repacked.data(),
+            q4_activation.data(), 1, output_size);
+    };
+    run_q4();
+    uint64_t q4_checksum = 0;
+    const auto q4_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run_q4();
+        uint32_t bits;
+        std::memcpy(&bits, &q4_output[iteration % output_size], sizeof(bits));
+        q4_checksum += bits;
+    }
+    const double q4_elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - q4_start).count() / iterations;
+
+    run();
+    size_t mismatches = 0;
+    size_t first_mismatch = actual.size();
+    int64_t max_error = 0;
+    for (size_t row = 0; row < actual.size(); ++row) {
+        const int64_t error = actual[row] - reference[row];
+        if (error != 0) {
+            if (first_mismatch == actual.size()) {
+                first_mismatch = row;
+            }
+            ++mismatches;
+            max_error = std::max(max_error, error >= 0 ? error : -error);
+        }
+    }
+
+    uint64_t checksum = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        run();
+        checksum += static_cast<uint64_t>(
+            actual[iteration % output_size] + INT64_C(1) * INT32_MAX);
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count() / iterations;
+    std::printf(
+        "qnn-gptq2-s8-groupwise-test: input=%d output=%d iterations=%d "
+        "exact=%d mismatches=%zu max_error=%lld first=%zu "
+        "first_ref=%lld first_actual=%lld dotprod=%d i8mm_dotprod=%d "
+        "average_ms=%.6f checksum=%llu native_i8mm_exact=%d "
+        "native_i8mm_mismatches=%zu native_i8mm_max_error=%lld "
+        "native_i8mm_ms=%.6f native_i8mm_checksum=%llu "
+        "q4_0_4x8_ms=%.6f q4_0_checksum=%llu\n",
+        input_size, output_size, iterations, mismatches == 0 ? 1 : 0,
+        mismatches, static_cast<long long>(max_error), first_mismatch,
+        static_cast<long long>(first_mismatch < reference.size()
+            ? reference[first_mismatch] : 0),
+        static_cast<long long>(first_mismatch < actual.size()
+            ? actual[first_mismatch] : 0),
+        ggml_gptq2_32_gs32_dotprod_enabled(),
+        ggml_gptq2_32_gs32_i8mm_dotprod_enabled(), elapsed_ms,
+        static_cast<unsigned long long>(checksum),
+        native_mismatches == 0 ? 1 : 0, native_mismatches,
+        static_cast<long long>(native_max_error), native_elapsed_ms,
+        static_cast<unsigned long long>(native_checksum), q4_elapsed_ms,
+        static_cast<unsigned long long>(q4_checksum));
+    return mismatches == 0 && native_mismatches == 0 ? 0 : 22;
 }
 
 int run_self_test(kernel_backend backend) {
@@ -6075,6 +6463,46 @@ int run_profile_rms_vector_test(
     }
 
     const size_t width = operation_width(*profile, *operation);
+    if (profile->activation_bits == 8) {
+        const std::vector<uint8_t> input = read_binary_vector<uint8_t>(input_path);
+        const std::vector<uint8_t> expected = read_binary_vector<uint8_t>(expected_path);
+        if (input.empty() || input.size() != expected.size() ||
+            input.size() % width != 0) {
+            throw std::runtime_error("A8 RMSNorm vector dimensions do not match");
+        }
+        const auto & input_q = operation_affine(*profile, *operation, "input", 0);
+        const auto & weight_q = operation_affine(*profile, *operation, "input", 1);
+        const auto & output_q = operation_affine(*profile, *operation, "output", 0);
+        const llama_qnn_u16_tensor * weight =
+            profile->find_u16_operand(*operation, "input", 1);
+        if (weight == nullptr || weight->static_data.size() != width) {
+            throw std::runtime_error("A8 RMSNorm weight payload is incomplete");
+        }
+        std::vector<uint8_t> actual(input.size());
+        const double epsilon_in_codes =
+            static_cast<double>(static_cast<float>(operation->rms_epsilon)) /
+            (static_cast<double>(input_q.scale) * static_cast<double>(input_q.scale));
+        const double weight_to_output =
+            static_cast<double>(weight_q.scale) / static_cast<double>(output_q.scale);
+        const size_t token_count = input.size() / width;
+        for (size_t token = 0; token < token_count; ++token) {
+            ggml_vec_rms_norm_affine_u8_qnn_fixed(
+                static_cast<int>(width), actual.data() + token * width,
+                input.data() + token * width, input_q.zero_point,
+                weight->static_data.data(), weight_q.zero_point,
+                epsilon_in_codes, weight_to_output, output_q.zero_point);
+        }
+        code_error_stats stats;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            stats.add(actual[index], expected[index]);
+        }
+        std::printf(
+            "qnn-profile-rms-vector-test: layer=%d fx=%s tokens=%zu width=%zu "
+            "exact=%zu within1=%zu mae=%.6f bias=%.6f max=%u status=pass\n",
+            layer_id, fx_name, token_count, width, stats.exact, stats.within_one,
+            stats.mean_delta(), stats.mean_signed_delta(), stats.max_delta);
+        return 0;
+    }
     const std::vector<uint16_t> input = read_binary_vector<uint16_t>(input_path);
     const std::vector<uint16_t> expected =
         read_binary_vector<uint16_t>(expected_path);
@@ -6134,6 +6562,49 @@ int run_profile_rms_vector_test(
         stats.mean_signed_delta(), stats.max_delta,
         max_error_index, max_error_actual, max_error_expected);
     return 0;
+}
+
+int run_profile_quantize_vector_test(
+        const char * profile_path,
+        const char * input_path,
+        const char * expected_path) {
+    const auto profile = llama_qnn_quant_profile_load_file(profile_path);
+    if (profile->activation_bits != 8) {
+        throw std::runtime_error("quantize vector test requires an A8 profile");
+    }
+    const llama_qnn_operation * operation = nullptr;
+    for (const auto & candidate : profile->operations) {
+        if (candidate.shard_index == 0 && candidate.type_name == "Quantize") {
+            if (operation != nullptr) {
+                throw std::runtime_error("runtime profile has multiple shard-0 Quantize operations");
+            }
+            operation = &candidate;
+        }
+    }
+    if (operation == nullptr) {
+        throw std::runtime_error("runtime profile has no shard-0 Quantize operation");
+    }
+    const auto & output_q = operation_affine(*profile, *operation, "output", 0);
+    const std::vector<float> input = read_binary_vector<float>(input_path);
+    const std::vector<uint8_t> expected = read_binary_vector<uint8_t>(expected_path);
+    if (input.empty() || input.size() != expected.size()) {
+        throw std::runtime_error("A8 Quantize vector dimensions do not match");
+    }
+    std::vector<uint8_t> actual(input.size());
+    ggml_quantize_f32_u8_qnn_v75(
+        static_cast<int>(input.size()), actual.data(), input.data(),
+        output_q.scale, output_q.zero_point);
+    code_error_stats stats;
+    for (size_t index = 0; index < actual.size(); ++index) {
+        stats.add(actual[index], expected[index]);
+    }
+    std::printf(
+        "qnn-profile-quantize-vector-test: values=%zu exact=%zu within1=%zu "
+        "mae=%.9f bias=%.9f max=%u status=%s\n",
+        input.size(), stats.exact, stats.within_one,
+        stats.mean_delta(), stats.mean_signed_delta(), stats.max_delta,
+        stats.exact == input.size() ? "pass" : "mismatch");
+    return stats.exact == input.size() ? 0 : 1;
 }
 
 int run_profile_qk_rotate_vector_test(
@@ -6353,6 +6824,69 @@ int run_profile_softmax_vector_test_with_profile(
         operation->softmax_exp2_lut_q31.size() != 257) {
         throw std::runtime_error(
             "runtime profile has incomplete Softmax integer parameters");
+    }
+
+    if (profile.activation_bits == 8) {
+        const std::vector<uint8_t> input = read_binary_vector<uint8_t>(input_path);
+        const std::vector<uint8_t> expected = read_binary_vector<uint8_t>(expected_path);
+        const size_t width = operation_width(profile, *operation);
+        if (input.empty() || input.size() != expected.size() || input.size() % width != 0) {
+            throw std::runtime_error("A8 Softmax vector dimensions do not match");
+        }
+        const auto & output_q = operation_affine(profile, *operation, "output", 0);
+        std::vector<uint8_t> actual(input.size());
+        const size_t row_count = input.size() / width;
+        for (size_t row = 0; row < row_count; ++row) {
+            ggml_vec_softmax_u8_qnn_fixed(
+                static_cast<int>(width), actual.data() + row * width,
+                input.data() + row * width, operation->softmax_scale_over_ln2_q24,
+                operation->softmax_unit_code, output_q.zero_point,
+                operation->softmax_exp2_lut_q31.data());
+        }
+        code_error_stats stats;
+        size_t max_error_index = 0;
+        uint32_t max_error_delta = 0;
+        uint32_t larger_than_one = 0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            stats.add(actual[index], expected[index]);
+            const uint32_t delta = actual[index] > expected[index]
+                ? actual[index] - expected[index]
+                : expected[index] - actual[index];
+            if (delta > max_error_delta) {
+                max_error_delta = delta;
+                max_error_index = index;
+            }
+            larger_than_one += delta > 1;
+        }
+        const size_t max_error_row = max_error_index / width;
+        const size_t max_error_column = max_error_index % width;
+        const auto input_begin = input.begin() + max_error_row * width;
+        const auto actual_begin = actual.begin() + max_error_row * width;
+        const auto expected_begin = expected.begin() + max_error_row * width;
+        const uint8_t row_input_min = *std::min_element(input_begin, input_begin + width);
+        const uint8_t row_input_max = *std::max_element(input_begin, input_begin + width);
+        const uint64_t actual_row_sum = std::accumulate(
+            actual_begin, actual_begin + width, uint64_t{0});
+        const uint64_t expected_row_sum = std::accumulate(
+            expected_begin, expected_begin + width, uint64_t{0});
+        std::printf(
+            "qnn-profile-softmax-vector-test: activation_bits=8 layer=%d fx=%s "
+            "rows=%zu width=%zu exact=%zu within1=%zu mae=%.6f bias=%.6f "
+            "max=%u status=pass\n",
+            layer_id, fx_name, row_count, width, stats.exact, stats.within_one,
+            stats.mean_delta(), stats.mean_signed_delta(), stats.max_delta);
+        std::printf(
+            "qnn-profile-softmax-vector-detail: max_index=%zu row=%zu column=%zu "
+            "input=%u actual=%u expected=%u input_min=%u input_max=%u "
+            "actual_row_sum=%llu expected_row_sum=%llu larger_than_one=%u\n",
+            max_error_index, max_error_row, max_error_column,
+            static_cast<unsigned>(input[max_error_index]),
+            static_cast<unsigned>(actual[max_error_index]),
+            static_cast<unsigned>(expected[max_error_index]),
+            static_cast<unsigned>(row_input_min), static_cast<unsigned>(row_input_max),
+            static_cast<unsigned long long>(actual_row_sum),
+            static_cast<unsigned long long>(expected_row_sum), larger_than_one);
+        return 0;
     }
 
     const std::vector<uint16_t> input =
@@ -6883,13 +7417,14 @@ int run_profile_ffn_fused_test(
 int run_profile_attention_fused_test(
         const char * profile_path,
         int32_t layer_id,
-        int32_t n_kv) {
-    constexpr int32_t n_head = 16;
-    constexpr int32_t n_head_kv = 8;
+        int32_t n_kv,
+        int32_t n_head,
+        int32_t n_head_kv) {
     constexpr int32_t head_dimension = 128;
     constexpr int timed_iterations = 4;
-    if (n_kv <= 0) {
-        throw std::runtime_error("fused attention n_kv must be positive");
+    if (n_kv <= 0 || n_head <= 0 || n_head_kv <= 0 ||
+        n_head % n_head_kv != 0) {
+        throw std::runtime_error("invalid fused attention geometry");
     }
     const auto profile = llama_qnn_quant_profile_load_file(profile_path);
     const auto fx_name = [](const char * stem, int32_t index, int32_t head) {
@@ -6964,56 +7499,13 @@ int run_profile_attention_fused_test(
     }
 
     std::vector<llama_qnn_u16_attention_head_ops> operations(n_head);
-    std::vector<const llama_qnn_operation *> norm_operations(n_head);
-    std::vector<const llama_qnn_operation *> rotate_operations(n_head);
-    std::vector<llama_qnn_u16_rope_head_ops> rope_operations(n_head);
     std::vector<ggml_tensor *> reference_query(n_head);
-    const llama_qnn_u16_tensor * cos_table =
-        profile->find_u16_tensor("b__frozen_param311@0");
-    const llama_qnn_u16_tensor * sin_table =
-        profile->find_u16_tensor("b__frozen_param312@0");
-    if (cos_table == nullptr || sin_table == nullptr) {
-        ggml_free(ctx);
-        throw std::runtime_error("profile is missing RoPE tables");
-    }
     for (int32_t head = 0; head < n_head; ++head) {
-        norm_operations[head] = require_op(
-            "aten_rms_norm_default", 4 * layer_id + 1, head, "RmsNorm");
-        rotate_operations[head] = require_op(
-            "aten_matmul_default", 4 * layer_id, head, "MatMul");
-        auto & rope = rope_operations[head];
-        for (int index = 0; index < 4; ++index) {
-            rope.multiply[index] = require_op(
-                "aten_mul_tensor", 10 * layer_id + 1 + index,
-                head, "ElementWiseMultiply");
-        }
-        for (int index = 0; index < 2; ++index) {
-            rope.slices[index] = require_op(
-                "aten_slice_copy_tensor", 4 * layer_id + index,
-                head, "StridedSlice");
-        }
-        rope.subtract = require_op(
-            "aten_sub_tensor", 2 * layer_id, head, "ElementWiseSubtract");
-        rope.add = require_op(
-            "aten_add_tensor", 5 * layer_id, head, "ElementWiseAdd");
-        rope.cos_table = cos_table;
-        rope.sin_table = sin_table;
-        ggml_tensor * query_head = ggml_view_2d(
+        reference_query[head] = ggml_view_2d(
             ctx, query, head_dimension, 1, query->nb[2],
             static_cast<size_t>(head) * query->nb[1]);
-        query_head = llama_qnn_u16_rms_norm(
-            ctx, query_head, profile.get(), norm_operations[head]);
-        query_head = llama_qnn_u16_rope(
-            ctx, query_head, positions, profile.get(), layer_id, head, false);
-        reference_query[head] = llama_qnn_u16_qk_rotate(
-            ctx, query_head, profile.get(), layer_id, head, false);
     }
-    ggml_tensor * fused_query = llama_qnn_u16_rms_norm_heads(
-        ctx, query, profile.get(), norm_operations.data(), n_head);
-    fused_query = llama_qnn_u16_rope_heads(
-        ctx, fused_query, positions, profile.get(), rope_operations.data(), n_head);
-    fused_query = llama_qnn_u16_qk_rotate_heads(
-        ctx, fused_query, profile.get(), rotate_operations.data(), n_head);
+    ggml_tensor * fused_query = query;
 
     std::vector<ggml_tensor *> reference;
     reference.reserve(n_head);
@@ -7111,7 +7603,7 @@ void print_usage(const char * program) {
         "--backend=scalar|neon|compare\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gptq2-gemv-mt-test [threads]\n"
-        "       %s --lm-head-gemv-test <q8_0|q6_k> [threads] [rows]\n"
+        "       %s --lm-head-gemv-test <q8_0|q6_k> [threads] [rows] [columns]\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --graph-test\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --gguf-test <model.gguf> "
         "[--tensor=<GPTQ2_{32,64,128} tensor>]\n"
@@ -7127,6 +7619,8 @@ void print_usage(const char * program) {
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-rms-vector-test "
         "<runtime-profile.json> <layer> <fx-node> "
         "<input.u16.bin> <expected.u16.bin>\n"
+        "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-quantize-vector-test "
+        "<runtime-profile.json> <input.f32.bin> <expected.u8.bin>\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-qk-rotate-vector-test "
         "<runtime-profile.json> <layer> <fx-node> "
         "<input.u16.bin> <expected.u16.bin>\n"
@@ -7140,7 +7634,7 @@ void print_usage(const char * program) {
         "<runtime-profile.json> <layer> <fx-node> <instances> "
         "<probabilities.u16.bin> <values.u8.bin> <expected.u16.bin>\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-attention-fused-test "
-        "<runtime-profile.bin> <layer> <n-kv>\n"
+        "<runtime-profile.bin> <layer> <n-kv> [n-head n-head-kv]\n"
         "       GGML_QNN_U16_ACTIVATIONS=1 %s --profile-ffn-vector-test "
         "<runtime-profile.json> <layer> <gate.u16.bin> <up.u16.bin> "
         "<sigmoid.u16.bin> <silu.u16.bin> <product.u16.bin>\n"
@@ -7164,12 +7658,140 @@ void print_usage(const char * program) {
         program,
         program,
         program,
+        program,
         program);
 }
 
 } // namespace
 
+namespace {
+
+std::string kv_abi_fx_name(const char * stem, int32_t index) {
+    std::string result(stem);
+    if (index > 0) {
+        result += "_" + std::to_string(index);
+    }
+    return result;
+}
+
+std::string kv_abi_head_fx_name(const char * stem, int32_t index, int32_t head) {
+    return kv_abi_fx_name(stem, index) + "_h_" + std::to_string(head);
+}
+
+const llama_qnn_operation * kv_abi_convert(
+        const llama_qnn_quant_profile & profile,
+        int32_t layer,
+        int32_t head,
+        bool key) {
+    const llama_qnn_operation * producer = profile.find_operation_by_fx(
+        layer,
+        kv_abi_head_fx_name(
+            key ? "aten_matmul_default" : "aten_convolution_default",
+            key ? 4 * layer + 1 : 7 * layer + 2,
+            head));
+    if (producer == nullptr || producer->outputs.size() != 1) {
+        return nullptr;
+    }
+    for (const llama_qnn_operation & operation : profile.operations) {
+        if (operation.shard_index == layer / 2 &&
+                operation.type_name == "Convert" &&
+                operation.inputs.size() == 1 &&
+                operation.inputs[0] == producer->outputs[0]) {
+            return &operation;
+        }
+    }
+    return nullptr;
+}
+
+int export_qnn_kv_abi(const std::string & profile_path, const std::string & output_path) {
+    const auto profile = llama_qnn_quant_profile_load_file(profile_path);
+    if (profile == nullptr || profile->activation_bits != 16 ||
+            profile->num_decoder_layers <= 0) {
+        throw std::runtime_error("KV ABI export requires an A16 QNN profile");
+    }
+    constexpr int32_t n_head_kv = 8;
+    constexpr int32_t head_dim = 128;
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("unable to open KV ABI output");
+    }
+    const char magic[8] = {'Q', 'N', 'N', 'K', 'V', 'A', 'B', 'I'};
+    const uint32_t version = 1;
+    const uint32_t layers = static_cast<uint32_t>(profile->num_decoder_layers);
+    const uint32_t heads = n_head_kv;
+    const uint32_t dimension = head_dim;
+    output.write(magic, sizeof(magic));
+    output.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    output.write(reinterpret_cast<const char *>(&layers), sizeof(layers));
+    output.write(reinterpret_cast<const char *>(&heads), sizeof(heads));
+    output.write(reinterpret_cast<const char *>(&dimension), sizeof(dimension));
+
+    for (int32_t layer = 0; layer < profile->num_decoder_layers; ++layer) {
+        const auto * rotate = profile->find_operation_by_fx(
+            layer,
+            kv_abi_head_fx_name("aten_matmul_default", 4 * layer + 1, 0));
+        const auto * weights = rotate == nullptr ? nullptr :
+            profile->find_aux_operand(*rotate, "input", 1);
+        if (weights == nullptr ||
+                weights->data_type != "QNN_DATATYPE_SFIXED_POINT_16" ||
+                weights->dimensions != std::vector<int64_t>({head_dim, head_dim}) ||
+                weights->qparams.scale_offsets.size() != 1 ||
+                weights->static_data.size() !=
+                    static_cast<size_t>(head_dim * head_dim * sizeof(int16_t))) {
+            throw std::runtime_error("invalid K rotation at layer " + std::to_string(layer));
+        }
+        const auto * matrix = reinterpret_cast<const int16_t *>(
+            weights->static_data.data());
+        const float rotation_unit =
+            static_cast<float>(INT16_MAX) * weights->qparams.scale_offsets[0].scale;
+        output.write(
+            reinterpret_cast<const char *>(&rotation_unit), sizeof(rotation_unit));
+        for (int32_t index = 0; index < head_dim * head_dim; ++index) {
+            if (matrix[index] != INT16_MAX && matrix[index] != -INT16_MAX) {
+                throw std::runtime_error("K rotation is not a signed Hadamard matrix");
+            }
+            const int8_t sign = matrix[index] > 0 ? 1 : -1;
+            output.write(reinterpret_cast<const char *>(&sign), sizeof(sign));
+        }
+        for (int32_t kind = 0; kind < 2; ++kind) {
+            for (int32_t head = 0; head < n_head_kv; ++head) {
+                const auto * convert = kv_abi_convert(*profile, layer, head, kind == 0);
+                const auto * tensor = convert == nullptr ? nullptr :
+                    profile->find_aux_operand(*convert, "output", 0);
+                if (tensor == nullptr ||
+                        tensor->data_type != "QNN_DATATYPE_UFIXED_POINT_8" ||
+                        tensor->qparams.scale_offsets.size() != 1) {
+                    throw std::runtime_error("invalid KV qparams at layer " +
+                        std::to_string(layer) + " head " + std::to_string(head));
+                }
+                const auto & qp = tensor->qparams.scale_offsets[0];
+                output.write(reinterpret_cast<const char *>(&qp.scale), sizeof(qp.scale));
+                output.write(reinterpret_cast<const char *>(&qp.offset), sizeof(qp.offset));
+            }
+        }
+    }
+    output.flush();
+    if (!output) {
+        throw std::runtime_error("failed to write KV ABI output");
+    }
+    std::printf(
+        "qnn-kv-abi-export: layers=%u heads=%u dim=%u bytes=%lld output=%s\n",
+        layers, heads, dimension,
+        static_cast<long long>(output.tellp()), output_path.c_str());
+    return 0;
+}
+
+} // namespace
+
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--profile-kv-abi-export") {
+        try {
+            return export_qnn_kv_abi(argv[2], argv[3]);
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "qnn-kv-abi-export failed: %s\n", error.what());
+            return 31;
+        }
+    }
     if (argc >= 2 && argc <= 3 &&
         std::string_view(argv[1]) == "--gptq2-gemv-mt-test") {
         if (!u16_activations_enabled()) {
@@ -7186,7 +7808,7 @@ int main(int argc, char ** argv) {
         const int threads = argc == 3 ? std::stoi(argv[2]) : 6;
         return run_gptq2_u16_gemv_4row_test(threads);
     }
-    if (argc >= 3 && argc <= 5 &&
+    if (argc >= 3 && argc <= 6 &&
         std::string_view(argv[1]) == "--lm-head-gemv-test") {
         const std::string_view type(argv[2]);
         const ggml_type weight_type =
@@ -7194,13 +7816,16 @@ int main(int argc, char ** argv) {
             type == "q6_k" ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
         const int threads = argc >= 4 ? std::stoi(argv[3]) : 1;
         const int64_t rows = argc >= 5 ? std::stoll(argv[4]) : 151936;
-        return run_lm_head_gemv_test(weight_type, threads, rows);
+        const int64_t columns = argc >= 6 ? std::stoll(argv[5]) : 2048;
+        return run_lm_head_gemv_test(weight_type, threads, rows, columns);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--profile-runtime-test") {
         try {
             const auto profile = llama_qnn_quant_profile_load_file(argv[2]);
             size_t u16_operand_count = 0;
             size_t aux_operand_count = 0;
+            size_t reduce_min_operation_count = 0;
+            size_t reduce_min_lut_count = 0;
             for (const auto & operation : profile->operations) {
                 if (profile->find_operation(operation.shard_index, operation.name) != &operation) {
                     throw std::runtime_error("operation shard/name lookup mismatch");
@@ -7227,40 +7852,115 @@ int main(int argc, char ** argv) {
                     }
                     ++aux_operand_count;
                 }
+                if (operation.type_name == "ReduceMin") {
+                    ++reduce_min_operation_count;
+                }
+                if (operation.type_name == "ReduceMin" && !operation.unary_lut.empty()) {
+                    if (profile->activation_bits != 8 || operation.unary_lut.size() != 256) {
+                        throw std::runtime_error("invalid A8 ReduceMin LUT");
+                    }
+                    for (const uint16_t value : operation.unary_lut) {
+                        if (value > 255) {
+                            throw std::runtime_error("A8 ReduceMin LUT contains a non-U8 value");
+                        }
+                    }
+                    ++reduce_min_lut_count;
+                }
             }
-            const auto * qk_rotation =
-                profile->find_aux_tensor(0, "b__frozen_param313@0");
-            const auto * kv_input = profile->find_aux_tensor(0, "args_0_h_0@0");
+            if (reduce_min_lut_count != 0 &&
+                reduce_min_lut_count != reduce_min_operation_count) {
+                throw std::runtime_error("A8 ReduceMin LUT coverage is incomplete");
+            }
+            size_t tensor_scale_offset_bytes = 0;
+            size_t tensor_block_scale_bytes = 0;
+            for (const auto & tensor : profile->u16_tensors) {
+                tensor_scale_offset_bytes +=
+                    tensor.qparams.scale_offsets.size() *
+                    sizeof(llama_qnn_affine_qparams);
+                tensor_block_scale_bytes += tensor.qparams.block_scale_codes.size();
+            }
+            for (const auto & tensor : profile->aux_quantized_tensors) {
+                tensor_scale_offset_bytes +=
+                    tensor.qparams.scale_offsets.size() *
+                    sizeof(llama_qnn_affine_qparams);
+                tensor_block_scale_bytes += tensor.qparams.block_scale_codes.size();
+            }
+            size_t linear_channel_scale_bytes = 0;
+            size_t linear_block_scale_bytes = 0;
+            size_t linear_prepared_sum_bytes = 0;
+            for (const auto & linear : profile->linear_qparams) {
+                linear_channel_scale_bytes +=
+                    linear.qnn_channel_scale_to_output_q31.size() *
+                    sizeof(int64_t);
+                linear_block_scale_bytes +=
+                    linear.qnn_weight_block_scale_codes.size();
+                linear_prepared_sum_bytes +=
+                    linear.qnn_prepared_weight_sums.size() * sizeof(int64_t);
+            }
+            size_t operation_input_scale_bytes = 0;
+            size_t operation_unary_lut_bytes = 0;
+            size_t operation_softmax_lut_bytes = 0;
+            size_t operation_unary_lut_count = 0;
+            for (const auto & operation : profile->operations) {
+                operation_input_scale_bytes +=
+                    operation.input_to_output_q20.size() * sizeof(int64_t);
+                operation_unary_lut_bytes +=
+                    operation.unary_lut.size() * sizeof(uint16_t);
+                operation_softmax_lut_bytes +=
+                    operation.softmax_exp2_lut_q31.size() * sizeof(uint32_t);
+                operation_unary_lut_count += !operation.unary_lut.empty();
+            }
+            const auto * kv_input_u8 = profile->find_u16_tensor(0, "args_0_h_0@0");
+            const auto * kv_input_aux = profile->find_aux_tensor(0, "args_0_h_0@0");
             const auto * q_rotation_operation =
                 profile->find_operation_by_fx(0, "aten_matmul_default_h_0");
-            if (qk_rotation == nullptr ||
-                qk_rotation->data_type != "QNN_DATATYPE_SFIXED_POINT_16" ||
-                qk_rotation->element_bytes != 2 ||
-                qk_rotation->dimensions != std::vector<int64_t>({128, 128}) ||
-                qk_rotation->static_data.size() != 128U * 128U * sizeof(int16_t) ||
-                qk_rotation->qparams.encoding != LLAMA_QNN_QUANTIZATION_SCALE_OFFSET ||
-                qk_rotation->qparams.scale_offsets.size() != 1 ||
-                qk_rotation->qparams.scale_offsets.front().zero_point != 0) {
+            const auto * qk_rotation_u8 = q_rotation_operation == nullptr ? nullptr :
+                profile->find_u16_operand(*q_rotation_operation, "input", 1);
+            const auto * qk_rotation_s16 = q_rotation_operation == nullptr ? nullptr :
+                profile->find_aux_operand(*q_rotation_operation, "input", 1);
+            const size_t qk_rotation_bytes = profile->activation_bits == 8
+                ? 128U * 128U
+                : 128U * 128U * sizeof(int16_t);
+            if (profile->activation_bits == 8) {
+                if (qk_rotation_u8 == nullptr ||
+                    qk_rotation_u8->data_type != "QNN_DATATYPE_UFIXED_POINT_8" ||
+                    qk_rotation_u8->dimensions != std::vector<int64_t>({128, 128}) ||
+                    qk_rotation_u8->static_data.size() != qk_rotation_bytes ||
+                    qk_rotation_u8->qparams.encoding != LLAMA_QNN_QUANTIZATION_SCALE_OFFSET ||
+                    qk_rotation_u8->qparams.scale_offsets.size() != 1 ||
+                    qk_rotation_u8->qparams.scale_offsets.front().zero_point != 128) {
+                    throw std::runtime_error("layer-0 U8 Q/K rotation tensor is incomplete");
+                }
+            } else if (qk_rotation_s16 == nullptr ||
+                qk_rotation_s16->data_type != "QNN_DATATYPE_SFIXED_POINT_16" ||
+                qk_rotation_s16->element_bytes != 2 ||
+                qk_rotation_s16->dimensions != std::vector<int64_t>({128, 128}) ||
+                qk_rotation_s16->static_data.size() != qk_rotation_bytes ||
+                qk_rotation_s16->qparams.encoding != LLAMA_QNN_QUANTIZATION_SCALE_OFFSET ||
+                qk_rotation_s16->qparams.scale_offsets.size() != 1 ||
+                qk_rotation_s16->qparams.scale_offsets.front().zero_point != 0) {
                 throw std::runtime_error("layer-0 S16 Q/K rotation tensor is incomplete");
             }
-            if (kv_input == nullptr ||
-                kv_input->data_type != "QNN_DATATYPE_UFIXED_POINT_8" ||
-                kv_input->element_bytes != 1 ||
-                kv_input->qparams.encoding != LLAMA_QNN_QUANTIZATION_SCALE_OFFSET ||
-                kv_input->qparams.scale_offsets.size() != 1) {
+            const bool valid_kv_input = profile->activation_bits == 8
+                ? kv_input_u8 != nullptr &&
+                    kv_input_u8->data_type == "QNN_DATATYPE_UFIXED_POINT_8" &&
+                    kv_input_u8->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
+                    kv_input_u8->qparams.scale_offsets.size() == 1
+                : kv_input_aux != nullptr &&
+                    kv_input_aux->data_type == "QNN_DATATYPE_UFIXED_POINT_8" &&
+                    kv_input_aux->element_bytes == 1 &&
+                    kv_input_aux->qparams.encoding == LLAMA_QNN_QUANTIZATION_SCALE_OFFSET &&
+                    kv_input_aux->qparams.scale_offsets.size() == 1;
+            if (!valid_kv_input) {
                 throw std::runtime_error("layer-0 U8 KV tensor qparams are incomplete");
-            }
-            if (q_rotation_operation == nullptr ||
-                profile->find_aux_operand(*q_rotation_operation, "input", 1) !=
-                    qk_rotation) {
-                throw std::runtime_error("layer-0 Q rotation does not bind the S16 matrix");
             }
             std::printf(
                 "qnn-profile-runtime-test: u16_tensors=%zu aux_tensors=%zu "
                 "linear_pairs=%zu operations=%zu u16_operands=%zu "
                 "aux_operands=%zu static_u16_tensors=%zu static_u16_bytes=%zu "
                 "static_aux_tensors=%zu static_aux_bytes=%zu "
-                "qk_rotation_bytes=%zu kv_type=%s source_bits=%d group_size=%d "
+                "reduce_min_ops=%zu reduce_min_luts=%zu qk_rotation_bytes=%zu "
+                "kv_type=%s source_bits=%d group_size=%d "
                 "status=pass profile=%s\n",
                 profile->u16_tensor_count(),
                 profile->aux_quantized_tensor_count(),
@@ -7272,11 +7972,28 @@ int main(int argc, char ** argv) {
                 profile->static_u16_bytes(),
                 profile->static_aux_tensor_count(),
                 profile->static_aux_bytes(),
-                qk_rotation->static_data.size(),
-                kv_input->data_type.c_str(),
+                reduce_min_operation_count,
+                reduce_min_lut_count,
+                qk_rotation_bytes,
+                "QNN_DATATYPE_UFIXED_POINT_8",
                 profile->source_weight_bits,
                 profile->source_group_size,
                 argv[2]);
+            std::printf(
+                "qnn-profile-buffer-bytes: tensor_scale_offsets=%zu "
+                "tensor_block_scales=%zu linear_channel_scales=%zu "
+                "linear_block_scales=%zu linear_prepared_sums=%zu "
+                "operation_input_scales=%zu operation_unary_luts=%zu "
+                "operation_unary_lut_count=%zu operation_softmax_luts=%zu\n",
+                tensor_scale_offset_bytes,
+                tensor_block_scale_bytes,
+                linear_channel_scale_bytes,
+                linear_block_scale_bytes,
+                linear_prepared_sum_bytes,
+                operation_input_scale_bytes,
+                operation_unary_lut_bytes,
+                operation_unary_lut_count,
+                operation_softmax_lut_bytes);
             return 0;
         } catch (const std::exception & error) {
             std::fprintf(stderr, "qnn-profile-runtime-test failed: %s\n", error.what());
@@ -7319,6 +8036,21 @@ int main(int argc, char ** argv) {
         } catch (const std::exception & error) {
             std::fprintf(stderr, "qnn-profile-rms-vector-test failed: %s\n", error.what());
             return 19;
+        }
+    }
+    if (argc == 5 &&
+        std::string_view(argv[1]) == "--profile-quantize-vector-test") {
+        if (!u16_activations_enabled()) {
+            std::fprintf(stderr, "U16 activation core is disabled; set GGML_QNN_U16_ACTIVATIONS=1 explicitly.\n");
+            return 2;
+        }
+        try {
+            return run_profile_quantize_vector_test(argv[2], argv[3], argv[4]);
+        } catch (const std::exception & error) {
+            std::fprintf(
+                stderr, "qnn-profile-quantize-vector-test failed: %s\n",
+                error.what());
+            return 20;
         }
     }
     if (argc == 7 &&
@@ -7385,7 +8117,7 @@ int main(int argc, char ** argv) {
             return 20;
         }
     }
-    if (argc == 5 &&
+    if ((argc == 5 || argc == 7) &&
         std::string_view(argv[1]) == "--profile-attention-fused-test") {
         if (!u16_activations_enabled()) {
             std::fprintf(stderr, "U16 activation core is disabled; set GGML_QNN_U16_ACTIVATIONS=1 explicitly.\n");
@@ -7393,7 +8125,9 @@ int main(int argc, char ** argv) {
         }
         try {
             return run_profile_attention_fused_test(
-                argv[2], std::stoi(argv[3]), std::stoi(argv[4]));
+                argv[2], std::stoi(argv[3]), std::stoi(argv[4]),
+                argc == 7 ? std::stoi(argv[5]) : 32,
+                argc == 7 ? std::stoi(argv[6]) : 8);
         } catch (const std::exception & error) {
             std::fprintf(stderr, "qnn-profile-attention-fused-test failed: %s\n", error.what());
             return 24;
@@ -7471,6 +8205,23 @@ int main(int argc, char ** argv) {
             }
         }
         return run_profile_inspect(argv[2], shard_index);
+    }
+    if (argc == 4 &&
+        std::string_view(argv[1]) == "--gptq2-s8-groupwise-test") {
+        if (!initialize_ggml_cpu_backend()) {
+            std::fprintf(stderr, "failed to initialize GGML CPU backend.\n");
+            return 6;
+        }
+        return run_gptq2_s8_groupwise_test(
+            std::atoi(argv[2]), std::atoi(argv[3]));
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--gptq2-s8-groupwise-test") {
+        if (!initialize_ggml_cpu_backend()) {
+            std::fprintf(stderr, "failed to initialize GGML CPU backend.\n");
+            return 6;
+        }
+        return run_gptq2_s8_groupwise_test();
     }
     if (argc == 2 && std::string_view(argv[1]) == "--gptq2-gemv-test") {
         if (!u16_activations_enabled()) {

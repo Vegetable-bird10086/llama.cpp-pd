@@ -184,6 +184,50 @@ int64_t ggml_gptq2_32_qnn_prepared_weight_sum(
         const void * GGML_RESTRICT packed_weights,
         const uint8_t * GGML_RESTRICT prepared_block_codes);
 
+// Compute the block-scaled centered dot products for one native GS32 tile.
+// Activations remain in their original one-byte affine representation.
+void ggml_gptq2_32_gs32_u8_centered_dot_8rows(
+        int n,
+        int64_t centered_dots[8],
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        const uint8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point);
+
+void ggml_gptq2_32_gs32_u8_centered_dot_16rows(
+        int n,
+        int64_t centered_dots[16],
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        const uint8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        const int64_t * GGML_RESTRICT prepared_weight_sums,
+        int32_t activation_zero_point);
+
+// Dynamic A8 variant with one symmetric activation scale per GS32 block.
+// block_multipliers contains the centered U16 max-absolute code for each
+// block; the returned dots include these multipliers but not the /127 factor.
+void ggml_gptq2_32_gs32_s8_groupwise_dot_16rows(
+        int n,
+        int64_t centered_dots[16],
+        const void * GGML_RESTRICT gs32_weights,
+        int64_t first_row,
+        const int8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        const int32_t * GGML_RESTRICT block_multipliers);
+
+
+void ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
+        int n,
+        int64_t centered_dots[16],
+        const uint8_t * GGML_RESTRICT native_weights,
+        int64_t first_row,
+        const int8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_block_codes,
+        const int32_t * GGML_RESTRICT block_multipliers);
+
 void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_prepared(
         int n,
         uint16_t * GGML_RESTRICT output,
@@ -290,6 +334,7 @@ void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_affine_8rows(
 // group exposes four contiguous 16-byte qcode-pair tiles for the eight rows;
 // no row-major tensor or row window is materialized.
 int ggml_gptq2_32_gs32_dotprod_enabled(void);
+int ggml_gptq2_32_gs32_i8mm_dotprod_enabled(void);
 
 enum ggml_gptq2_u16_activation_range {
     GGML_GPTQ2_U16_ACTIVATION_WIDE = 0,
@@ -646,6 +691,11 @@ void ggml_vec_requant_u16_qnn_fixed(
 
 uint16_t ggml_vec_min_u16_qnn(int n, const uint16_t * input);
 
+void ggml_vec_requant_u16_qnn_q15(
+        int n, uint16_t * output, const uint16_t * input,
+        int32_t input_zero_point, int32_t multiplier_q15,
+        int32_t right_shift, int32_t output_zero_point);
+
 void ggml_vec_select_affine_u16_qnn_fixed(
         int n,
         uint16_t * output,
@@ -674,6 +724,36 @@ void ggml_vec_softmax_u16_qnn_fixed(
         int32_t output_zero_point,
         const uint32_t * GGML_RESTRICT exp2_lut_q31);
 
+void ggml_vec_softmax_u8_qnn_fixed(
+        int n,
+        uint8_t * output,
+        const uint8_t * input,
+        int64_t scale_over_ln2_q24,
+        int64_t output_unit_code,
+        int32_t output_zero_point,
+        const uint32_t * GGML_RESTRICT exp2_lut_q31);
+
+// Byte-domain masked Softmax selected by the V75 fused attention optimizer.
+// Masked lanes are excluded from both the maximum and exponential sum and are
+// written as the output zero point.
+void ggml_vec_softmax_u8_qnn_fixed_masked(
+        int n,
+        uint8_t * output,
+        const uint8_t * input,
+        const uint8_t * mask,
+        int64_t scale_over_ln2_q24,
+        int64_t output_unit_code,
+        int32_t output_zero_point);
+
+// QNN V75 FP32-to-U8 graph-boundary conversion. The scaled value is rounded
+// through binary16 before the final half-away-from-zero integer conversion.
+void ggml_quantize_f32_u8_qnn_v75(
+        int n,
+        uint8_t * GGML_RESTRICT output,
+        const float * GGML_RESTRICT input,
+        float scale,
+        int32_t output_zero_point);
+
 // RMSNorm with an affine U16 weight. The per-element path operates on U16
 // codes and integer products; only the shared inverse RMS is scalar.
 void ggml_vec_rms_norm_affine_u16_qnn(
@@ -701,6 +781,19 @@ void ggml_vec_rms_norm_affine_u16_qnn_fixed(
         int32_t weight_zero_point,
         uint64_t epsilon_in_codes_q16,
         int64_t weight_to_output_q31,
+        int32_t output_zero_point);
+
+// Native one-byte activation variant. Static affine weights remain in the
+// profile's uint16 storage container, but input and output never widen.
+void ggml_vec_rms_norm_affine_u8_qnn_fixed(
+        int n,
+        uint8_t * GGML_RESTRICT output,
+        const uint8_t * GGML_RESTRICT input,
+        int32_t input_zero_point,
+        const uint16_t * GGML_RESTRICT weight,
+        int32_t weight_zero_point,
+        double epsilon_in_codes,
+        double weight_to_output,
         int32_t output_zero_point);
 
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

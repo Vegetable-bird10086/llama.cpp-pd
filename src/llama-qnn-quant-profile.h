@@ -3,10 +3,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+struct llama_qnn_buffer_storage {
+    std::shared_ptr<void> allocation;
+    const uint8_t * data = nullptr;
+    size_t size = 0;
+};
 
 template <typename T>
 class llama_qnn_buffer {
@@ -22,12 +29,26 @@ public:
         storage = std::move(value);
         mapped = nullptr;
         mapped_size = 0;
+        mapped_storage.reset();
+        mapped_offset = 0;
         return *this;
     }
 
     bool empty() const { return size() == 0; }
-    size_t size() const { return mapped != nullptr ? mapped_size : storage.size(); }
-    const T * data() const { return mapped != nullptr ? mapped : storage.data(); }
+    size_t size() const {
+        return mapped != nullptr || mapped_storage != nullptr
+            ? mapped_size
+            : storage.size();
+    }
+    const T * data() const {
+        if (mapped_storage != nullptr) {
+            return mapped_storage->data == nullptr
+                ? nullptr
+                : reinterpret_cast<const T *>(
+                      mapped_storage->data + mapped_offset);
+        }
+        return mapped != nullptr ? mapped : storage.data();
+    }
     T * data() { materialize(); return storage.data(); }
     const T & operator[](size_t index) const { return data()[index]; }
     T & operator[](size_t index) { materialize(); return storage[index]; }
@@ -39,7 +60,13 @@ public:
     iterator end() { materialize(); return storage.data() + storage.size(); }
 
     void reserve(size_t size) { materialize(); storage.reserve(size); }
-    void clear() { storage.clear(); mapped = nullptr; mapped_size = 0; }
+    void clear() {
+        storage.clear();
+        mapped = nullptr;
+        mapped_size = 0;
+        mapped_storage.reset();
+        mapped_offset = 0;
+    }
     void resize(size_t size) { materialize(); storage.resize(size); }
     void resize(size_t size, const T & value) { materialize(); storage.resize(size, value); }
     void push_back(const T & value) { materialize(); storage.push_back(value); }
@@ -51,23 +78,47 @@ public:
         storage.shrink_to_fit();
         mapped = data;
         mapped_size = size;
+        mapped_storage.reset();
+        mapped_offset = 0;
     }
 
-    bool is_mapped() const { return mapped != nullptr; }
+    void set_sharded(
+            std::shared_ptr<llama_qnn_buffer_storage> storage_value,
+            size_t byte_offset,
+            size_t size) {
+        storage.clear();
+        storage.shrink_to_fit();
+        mapped = nullptr;
+        mapped_storage = std::move(storage_value);
+        mapped_offset = byte_offset;
+        mapped_size = size;
+    }
+
+    bool is_mapped() const {
+        return mapped != nullptr || mapped_storage != nullptr;
+    }
 
 private:
     void materialize() {
-        if (mapped == nullptr) {
+        if (mapped == nullptr && mapped_storage == nullptr) {
             return;
         }
-        storage.assign(mapped, mapped + mapped_size);
+        const T * source = data();
+        if (source == nullptr && mapped_size != 0) {
+            throw std::runtime_error("QNN sidecar shard is not resident");
+        }
+        storage.assign(source, source + mapped_size);
         mapped = nullptr;
         mapped_size = 0;
+        mapped_storage.reset();
+        mapped_offset = 0;
     }
 
     std::vector<T> storage;
     const T * mapped = nullptr;
     size_t mapped_size = 0;
+    std::shared_ptr<llama_qnn_buffer_storage> mapped_storage;
+    size_t mapped_offset = 0;
 };
 
 // QNN represents affine quantization as real=(code + offset)*scale.  Keep the
@@ -160,6 +211,9 @@ struct llama_qnn_linear_qparams {
     llama_qnn_buffer<int64_t> qnn_prepared_weight_sums;
     bool qnn_weight_block_codes_prepared = false;
     bool weights_gs32_source = false;
+    // Runtime-only. Derived from GGUF metadata and intentionally omitted from
+    // the profile binary so existing kernel-ready qparam profiles stay valid.
+    bool weights_i8mm_native_source = false;
     int32_t qnn_weight_block_code_layout = 0;
     int32_t output_bias_q7 = 0;
     std::vector<std::string> operation_names;
@@ -177,6 +231,23 @@ struct llama_qnn_operation_aux_operand {
     std::string role;
     int32_t position = -1;
     size_t tensor_index = 0;
+};
+
+struct llama_qnn_a8_add_subtract_params {
+    int16_t coefficients[2] = { 0, 0 };
+    int16_t bias = 0;
+    int32_t shift = 0;
+    bool valid = false;
+};
+
+struct llama_qnn_a8_multiply_params {
+    int16_t q15_coefficient = 0;
+    int16_t packed_zero_points = 0;
+    int16_t negative_translation = 0;
+    int16_t pre_multiply_bias = 0;
+    int16_t output_bias = 0;
+    int32_t shift = 0;
+    bool valid = false;
 };
 
 struct llama_qnn_operation {
@@ -197,6 +268,8 @@ struct llama_qnn_operation {
     int64_t matmul_product_to_output_q31 = 0;
     int64_t unary_input_to_output_q20 = 0;
     int64_t unary_input_to_output_q31 = 0;
+    llama_qnn_a8_add_subtract_params a8_add_subtract;
+    llama_qnn_a8_multiply_params a8_multiply;
     llama_qnn_buffer<uint16_t> unary_lut;
     int64_t softmax_scale_over_ln2_q24 = 0;
     int64_t softmax_unit_code = 0;
@@ -215,6 +288,11 @@ struct llama_qnn_quant_profile {
     int32_t num_decoder_layers = 0;
     int32_t source_weight_bits = 0;
     int32_t source_group_size = 0;
+    // Primary unsigned activation ABI selected by the exported QNN graph.
+    // A8 decode uses one-byte tensors; this metadata must never be interpreted
+    // as permission to store A8 codes in the production U16 activation path.
+    int32_t activation_bits = 16;
+    uint16_t activation_code_max = UINT16_MAX;
     std::string weight_layout;
     std::string lm_head_tensor_name;
     std::string lm_head_type;
@@ -235,6 +313,8 @@ struct llama_qnn_quant_profile {
     const llama_qnn_linear_qparams * find_linear_qparams(int32_t layer_id, const std::string & projection) const;
     const llama_qnn_operation * find_operation(int32_t shard_index, const std::string & name) const;
     const llama_qnn_operation * find_producer(int32_t shard_index, const std::string & tensor_name) const;
+    const llama_qnn_operation * find_convert_consumer(
+        int32_t shard_index, const std::string & tensor_name) const;
     const llama_qnn_operation * find_operation_by_fx(int32_t layer_id, const std::string & fx_node_name) const;
     const llama_qnn_u16_tensor * find_u16_operand(const llama_qnn_operation_u16_operand & operand) const;
     const llama_qnn_u16_tensor * find_u16_operand(
@@ -254,9 +334,17 @@ struct llama_qnn_quant_profile {
     size_t static_u16_bytes() const;
     size_t static_aux_tensor_count() const;
     size_t static_aux_bytes() const;
+    bool binary_backing_info(
+        const void ** data,
+        size_t * size,
+        bool * anonymous) const;
+    bool binary_stream_prepare(size_t shard_count) const;
+    bool binary_stream_fill(size_t shard_index, size_t * bytes_loaded) const;
+    bool binary_stream_finish() const;
 
 private:
     std::shared_ptr<void> binary_mapping;
+    bool binary_mapping_is_sharded = false;
     std::unordered_map<std::string, size_t> u16_tensor_index;
     std::unordered_map<std::string, size_t> u16_tensor_shard_index;
     std::unordered_map<std::string, size_t> u16_tensor_scope_index;
@@ -266,6 +354,7 @@ private:
     std::unordered_map<std::string, size_t> linear_qparams_index;
     std::unordered_map<std::string, size_t> operation_shard_index;
     std::unordered_map<std::string, size_t> operation_output_shard_index;
+    std::unordered_map<std::string, size_t> operation_convert_input_shard_index;
     std::unordered_map<std::string, size_t> operation_fx_index;
 
     friend std::shared_ptr<llama_qnn_quant_profile>
@@ -274,7 +363,8 @@ private:
     llama_qnn_quant_profile_load_binary_file(const std::string & path);
 };
 
-// Returns nullptr when LLAMA_QNN_U16_QPARAMS_MANIFEST is unset.  If it is set,
+// Returns nullptr when both LLAMA_QNN_U8_QPARAMS_MANIFEST and
+// LLAMA_QNN_U16_QPARAMS_MANIFEST are unset. If either is set,
 // parsing and validation failures are fatal to model loading so decode never
 // silently falls back to unrelated qparams.
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_environment();
@@ -288,6 +378,10 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_binary_fil
 void llama_qnn_quant_profile_save_binary_file(
     const llama_qnn_quant_profile & profile,
     const std::string & path);
+void llama_qnn_quant_profile_save_sharded_binary_file(
+    const llama_qnn_quant_profile & profile,
+    const std::string & index_path,
+    size_t shard_count);
 
 struct llama_model;
 void llama_qnn_quant_profile_prepare_kernel_metadata(

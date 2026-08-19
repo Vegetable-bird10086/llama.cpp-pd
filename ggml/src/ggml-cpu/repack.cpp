@@ -14,7 +14,9 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #include "repack.h"
 
@@ -4314,7 +4316,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // 4x chunks per thread
         const int64_t nr0 = ggml_nrows(op->src[0]);
 
-        int     nth_scaled  = nth * 4;
+        int chunks_per_thread = 8;
+        if constexpr (std::is_same<BLOC_TYPE, block_q8_0>::value &&
+                INTER_SIZE == 8 && NB_COLS == 4 &&
+                PARAM_TYPE == GGML_TYPE_Q8_0) {
+            const char * value =
+                std::getenv("GGML_Q8_0_GEMV_CHUNKS_PER_THREAD");
+            if (value != nullptr) {
+                chunks_per_thread =
+                    std::max(1, std::min(16, std::atoi(value)));
+            }
+        }
+        int     nth_scaled  = nth * chunks_per_thread;
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
         int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
 
@@ -4334,7 +4347,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         // Only increase nchunk0 to nth if it won't make chunks too small
-        if (nth == 1 || ((nchunk0 < nth || disable_chunking) && (nr0 + nth - 1) / nth >= min_chunk_size)) {
+        if (nth == 1 || ((nchunk0 < nth || disable_chunking) &&
+                (nr0 + nth - 1) / nth >= min_chunk_size)) {
             nchunk0 = nth;
             dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         }

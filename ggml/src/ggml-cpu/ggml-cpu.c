@@ -425,6 +425,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
+    // U8 activations are produced and consumed by custom A8 graph operations.
+    [GGML_TYPE_U8] = {
+        .from_float               = NULL,
+    },
     // U16 activations are produced and consumed by custom U16 graph
     // operations. Do not provide a generic from_float conversion: that would
     // silently introduce an unparameterized F32 activation path.
@@ -3065,6 +3069,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
     };
 
+
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
 #else
@@ -3101,6 +3106,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
     }
 
 #ifdef GGML_USE_OPENMP

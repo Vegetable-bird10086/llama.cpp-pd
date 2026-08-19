@@ -3,7 +3,9 @@
 #include "llama-kv-cache.h"
 #include "llama-qnn-u16.h"
 
+#include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -30,7 +32,82 @@ const llama_qnn_operation * qnn_require_fx_operation(
         const char * type_name) {
     const llama_qnn_operation * operation =
         profile->find_operation_by_fx(layer, fx_name);
-    GGML_ASSERT(operation != nullptr && operation->type_name == type_name);
+    if (operation == nullptr) {
+        GGML_ABORT("missing QNN operation: layer=%d fx=%s expected_type=%s",
+            layer, fx_name.c_str(), type_name);
+    }
+    if (operation->type_name != type_name) {
+        GGML_ABORT("wrong QNN operation type: layer=%d fx=%s expected=%s actual=%s",
+            layer, fx_name.c_str(), type_name, operation->type_name.c_str());
+    }
+    return operation;
+}
+
+struct qnn_fx_sequence_entry {
+    const char * stem;
+    const char * type_name;
+    int32_t layer;
+    int32_t index;
+    int32_t head;
+    const llama_qnn_operation * operation;
+};
+
+struct qnn_fx_sequence_cache {
+    const llama_qnn_quant_profile * profile = nullptr;
+    std::vector<qnn_fx_sequence_entry> entries;
+    size_t cursor = 0;
+    bool enabled = false;
+};
+
+qnn_fx_sequence_cache & qnn_current_fx_sequence_cache() {
+    thread_local qnn_fx_sequence_cache cache;
+    return cache;
+}
+
+void qnn_reset_fx_sequence_cache(const llama_qnn_quant_profile * profile) {
+    auto & cache = qnn_current_fx_sequence_cache();
+    if (cache.profile != profile) {
+        cache.profile = profile;
+        cache.entries.clear();
+    }
+    cache.cursor = 0;
+    const char * value = std::getenv("GGML_QNN_FX_SEQUENCE_CACHE");
+    cache.enabled = value != nullptr && std::string_view(value) != "0";
+}
+
+const llama_qnn_operation * qnn_require_indexed_fx_operation(
+        const llama_qnn_quant_profile * profile,
+        int32_t layer,
+        const char * stem,
+        int32_t index,
+        int32_t head,
+        const char * type_name) {
+    auto & cache = qnn_current_fx_sequence_cache();
+    if (!cache.enabled || cache.profile != profile) {
+        const std::string fx_name = head < 0
+            ? qnn_indexed_fx_name(stem, index)
+            : qnn_indexed_head_fx_name(stem, index, head);
+        return qnn_require_fx_operation(
+            profile, layer, fx_name, type_name);
+    }
+    const size_t slot = cache.cursor++;
+    if (slot < cache.entries.size()) {
+        const auto & entry = cache.entries[slot];
+        if (entry.stem == stem && entry.type_name == type_name &&
+            entry.layer == layer && entry.index == index &&
+            entry.head == head) {
+            return entry.operation;
+        }
+        cache.entries.resize(slot);
+    }
+    const std::string fx_name = head < 0
+        ? qnn_indexed_fx_name(stem, index)
+        : qnn_indexed_head_fx_name(stem, index, head);
+    const llama_qnn_operation * operation = qnn_require_fx_operation(
+        profile, layer, fx_name, type_name);
+    cache.entries.push_back({
+        stem, type_name, layer, index, head, operation,
+    });
     return operation;
 }
 
@@ -49,23 +126,58 @@ const llama_qnn_operation * qnn_require_kv_convert(
         int32_t layer,
         int32_t head,
         bool key) {
-    const llama_qnn_operation * producer = qnn_require_fx_operation(
-        profile, layer,
-        qnn_indexed_head_fx_name(
-            key ? "aten_matmul_default" : "aten_convolution_default",
-            key ? 4 * layer + 1 : 7 * layer + 2,
-            head),
-        key ? "MatMul" : "Conv2d");
+    const std::string producer_fx = qnn_indexed_head_fx_name(
+        key ? "aten_matmul_default" : "aten_convolution_default",
+        key ? 4 * layer + 1 : 7 * layer + 2,
+        head);
+    const llama_qnn_operation * producer =
+        profile->find_operation_by_fx(layer, producer_fx);
+    if (producer == nullptr && !key && profile->activation_bits == 8) {
+        // A no-output A8 final shard can retain V as one fused projection
+        // instead of eight per-head Conv nodes. Its scalar output Convert is
+        // valid for every reshaped V head and avoids duplicating weight rows.
+        for (const llama_qnn_operation & candidate : profile->operations) {
+            if (candidate.shard_index == layer / 2 &&
+                    candidate.type_name == "Conv2d" &&
+                    candidate.decoder_binding.layer_ids.size() == 1 &&
+                    candidate.decoder_binding.layer_ids[0] == layer &&
+                    candidate.decoder_binding.projection == "self_attn.v_proj") {
+                producer = &candidate;
+                break;
+            }
+        }
+    }
+    if (producer == nullptr || producer->type_name != (key ? "MatMul" : "Conv2d")) {
+        GGML_ABORT("missing QNN KV producer: layer=%d head=%d kind=%s fx=%s",
+            layer, head, key ? "K" : "V", producer_fx.c_str());
+    }
     GGML_ASSERT(producer->outputs.size() == 1);
     const std::string & source_tensor = producer->outputs[0];
     const int32_t shard = layer / 2;
-    for (const llama_qnn_operation & operation : profile->operations) {
-        if (operation.shard_index == shard &&
-                operation.type_name == "Convert" &&
-                operation.inputs.size() == 1 &&
-                operation.inputs[0] == source_tensor) {
-            return &operation;
+    // Keep a same-binary reference path for on-device timing and diagnostics.
+    // The indexed path is the production default.
+    static const bool use_convert_index = []() {
+        const char * value = std::getenv("GGML_QNN_CONVERT_INPUT_INDEX");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    const llama_qnn_operation * convert = nullptr;
+    if (use_convert_index) {
+        convert = profile->find_convert_consumer(shard, source_tensor);
+    } else {
+        for (const llama_qnn_operation & operation : profile->operations) {
+            if (operation.shard_index == shard &&
+                    operation.type_name == "Convert" &&
+                    operation.inputs.size() == 1 &&
+                    operation.inputs[0] == source_tensor) {
+                convert = &operation;
+                break;
+            }
         }
+    }
+    if (convert != nullptr) {
+        GGML_ASSERT(convert->type_name == "Convert" &&
+            convert->inputs.size() == 1 && convert->inputs[0] == source_tensor);
+        return convert;
     }
     GGML_ABORT("missing QNN U8 KV Convert for layer %d head %d (%s)",
         layer, head, key ? "K" : "V");
@@ -163,7 +275,11 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     if (qnn_profile != nullptr && llama_qnn_u16_activations_enabled()) {
         GGML_ASSERT(qnn_profile->num_decoder_layers == n_layer);
         GGML_ASSERT(n_embd_head == 128);
-        GGML_ASSERT(n_head == 16 && n_head_kv == 8);
+        // The QNN attention implementation supports any GQA geometry whose
+        // query-head count is an integer multiple of the KV-head count.  Do
+        // not restrict this path to the 1.7B/4B geometries: Qwen3-14B uses
+        // 40 query heads and 8 KV heads (five queries per KV head).
+        GGML_ASSERT(n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0);
         GGML_ASSERT(loras != nullptr && loras->empty());
         GGML_ASSERT(inp_attn->mctx != nullptr);
         GGML_ASSERT(inp_attn->mctx->type_k() == GGML_TYPE_I8);
@@ -173,11 +289,19 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             0, "quantized_decomposed_quantize_per_tensor_default");
         const llama_qnn_operation * input_scale = qnn_profile->find_operation(
             0, "aten_mul_tensor");
-        GGML_ASSERT(input_quantize != nullptr && input_quantize->type_name == "Quantize");
         GGML_ASSERT(input_scale != nullptr && input_scale->type_name == "ElementWiseMultiply");
 
-        inpL = llama_qnn_quantize_f32_to_u16(
-            ctx0, inpL, qnn_profile, input_quantize);
+        if (input_quantize != nullptr) {
+            GGML_ASSERT(input_quantize->type_name == "Quantize");
+            inpL = llama_qnn_quantize_f32_to_u16(
+                ctx0, inpL, qnn_profile, input_quantize);
+        } else {
+            const llama_qnn_u16_tensor * graph_input =
+                qnn_profile->find_u16_tensor(0, "input_2_hidden_states@0");
+            GGML_ASSERT(graph_input != nullptr);
+            inpL = llama_qnn_quantize_f32_to_u16(
+                ctx0, inpL, qnn_profile, graph_input);
+        }
         inpL = llama_qnn_u16_mul_static(ctx0, inpL, qnn_profile, input_scale);
         cb(inpL, "qnn_u16_input", -1);
         const llama_qnn_u16_tensor * layer_input_qparams =
@@ -188,13 +312,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         const int64_t n_kv = inp_attn->mctx->get_n_kv();
         GGML_ASSERT(n_kv > 0);
 
+        qnn_reset_fx_sequence_cache(qnn_profile);
         const auto fx = [qnn_profile](
                 int32_t layer,
                 const char * stem,
                 int32_t index,
                 const char * type_name) {
-            return qnn_require_fx_operation(
-                qnn_profile, layer, qnn_indexed_fx_name(stem, index), type_name);
+            return qnn_require_indexed_fx_operation(
+                qnn_profile, layer, stem, index, -1, type_name);
         };
         const auto fx_head = [qnn_profile](
                 int32_t layer,
@@ -202,8 +327,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 int32_t index,
                 int32_t head,
                 const char * type_name) {
-            return qnn_require_fx_operation(qnn_profile, layer,
-                qnn_indexed_head_fx_name(stem, index, head), type_name);
+            return qnn_require_indexed_fx_operation(
+                qnn_profile, layer, stem, index, head, type_name);
         };
         for (int32_t il = 0; il < n_layer; ++il) {
             GGML_ASSERT(cvec == nullptr || cvec->tensor_for(il) == nullptr);
@@ -240,10 +365,21 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             std::vector<const llama_qnn_operation *> q_norm_ops(n_head);
             std::vector<const llama_qnn_operation *> q_rotate_ops(n_head);
             std::vector<llama_qnn_u16_rope_head_ops> q_rope_ops(n_head);
+            // Bind the RoPE tables through their Gather consumers.  Frozen
+            // parameter numbering depends on the exported graph shape (for
+            // example, Qwen3-14B no-output uses 433/434 rather than the old
+            // 11 * n_layer + 3/+4 convention).
+            const llama_qnn_operation * cos_gather =
+                qnn_profile->find_operation(0, "aten_index_tensor");
+            const llama_qnn_operation * sin_gather =
+                qnn_profile->find_operation(0, "aten_index_tensor_1");
+            GGML_ASSERT(cos_gather != nullptr && cos_gather->type_name == "Gather");
+            GGML_ASSERT(sin_gather != nullptr && sin_gather->type_name == "Gather");
             const llama_qnn_u16_tensor * cos_table =
-                qnn_profile->find_u16_tensor("b__frozen_param311@0");
+                qnn_profile->find_u16_operand(*cos_gather, "input", 0);
             const llama_qnn_u16_tensor * sin_table =
-                qnn_profile->find_u16_tensor("b__frozen_param312@0");
+                qnn_profile->find_u16_operand(*sin_gather, "input", 0);
+            GGML_ASSERT(cos_table != nullptr && sin_table != nullptr);
             for (int32_t head = 0; head < n_head; ++head) {
                 q_norm_ops[head] = fx_head(
                     il, "aten_rms_norm_default", 4 * il + 1, head, "RmsNorm");
