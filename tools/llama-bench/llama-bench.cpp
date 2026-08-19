@@ -12,6 +12,7 @@
 #include <ctime>
 #include <iterator>
 #include <map>
+#include <stdexcept>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -19,6 +20,10 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "arg.h"
 #include "build-info.h"
@@ -2090,6 +2095,103 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+
+// Diagnostic support for GGUFs exported with general.external_token_embedding.
+// Production PD uses the equivalent reader in pd-cli. This remains opt-in.
+class bench_disk_embedding {
+public:
+    ~bench_disk_embedding() { if (fd_ >= 0) { close(fd_); } }
+
+    bool enabled() {
+        const char * path = std::getenv("LLAMA_BENCH_DISK_EMBEDDING");
+        if (path == nullptr || path[0] == 0) { return false; }
+        if (fd_ < 0) { open_file(path); }
+        return true;
+    }
+    uint32_t embedding_dim() const { return embedding_dim_; }
+    void read_rows(const llama_token * tokens, int32_t count, std::vector<float> & rows) {
+        rows.resize(static_cast<size_t>(count) * embedding_dim_);
+        for (int32_t row = 0; row < count; ++row) {
+            const llama_token token = tokens[row];
+            if (token < 0 || static_cast<uint32_t>(token) >= vocab_size_) {
+                throw std::runtime_error("disk embedding token is out of range");
+            }
+            const uint64_t offset = data_offset_ + static_cast<uint64_t>(token) * row_bytes_;
+            float * output = rows.data() + static_cast<size_t>(row) * embedding_dim_;
+            if (dtype_ == 2) {
+                fp16_row_.resize(embedding_dim_);
+                read_exact(offset, fp16_row_.data(), row_bytes_);
+                ggml_fp16_to_fp32_row(fp16_row_.data(), output, embedding_dim_);
+            } else {
+                read_exact(offset, output, row_bytes_);
+            }
+        }
+    }
+
+private:
+    static uint32_t read_u32(const uint8_t * data) {
+        uint32_t value = 0; std::memcpy(&value, data, sizeof(value)); return value;
+    }
+    static uint64_t read_u64(const uint8_t * data) {
+        uint64_t value = 0; std::memcpy(&value, data, sizeof(value)); return value;
+    }
+    void read_exact(uint64_t offset, void * destination, size_t bytes) const {
+        auto * output = static_cast<uint8_t *>(destination);
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t result = pread(fd_, output + done, bytes - done,
+                                         static_cast<off_t>(offset + done));
+            if (result <= 0) { throw std::runtime_error("disk embedding pread failed"); }
+            done += static_cast<size_t>(result);
+        }
+    }
+    void open_file(const char * path) {
+        fd_ = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) { throw std::runtime_error(std::string("unable to open disk embedding: ") + path); }
+        uint8_t header[20] = {};
+        read_exact(0, header, sizeof(header));
+        if (std::memcmp(header, "SEMB", 4) != 0 || read_u32(header + 4) != 1 || read_u32(header + 8) != 0) {
+            throw std::runtime_error("disk embedding must be an unquantized SEMB v1 file");
+        }
+        dtype_ = read_u32(header + 12);
+        const uint32_t ndim = read_u32(header + 16);
+        if ((dtype_ != 1 && dtype_ != 2) || ndim != 2) {
+            throw std::runtime_error("disk embedding must be a rank-2 FP16 or FP32 tensor");
+        }
+        uint8_t descriptor[16] = {};
+        read_exact(sizeof(header), descriptor, sizeof(descriptor));
+        payload_bytes_ = read_u64(descriptor);
+        vocab_size_ = read_u32(descriptor + 8);
+        embedding_dim_ = read_u32(descriptor + 12);
+        data_offset_ = sizeof(header) + sizeof(descriptor);
+        const size_t element_bytes = dtype_ == 2 ? sizeof(ggml_fp16_t) : sizeof(float);
+        row_bytes_ = static_cast<size_t>(embedding_dim_) * element_bytes;
+        if (vocab_size_ == 0 || embedding_dim_ == 0 || payload_bytes_ != static_cast<uint64_t>(vocab_size_) * row_bytes_) {
+            throw std::runtime_error("disk embedding shape/payload mismatch");
+        }
+        struct stat info {};
+        if (fstat(fd_, &info) != 0 || info.st_size < 0 ||
+            static_cast<uint64_t>(info.st_size) < data_offset_ + payload_bytes_) {
+            throw std::runtime_error("disk embedding file is truncated");
+        }
+    }
+
+    int fd_ = -1;
+    uint32_t dtype_ = 0;
+    uint32_t vocab_size_ = 0;
+    uint32_t embedding_dim_ = 0;
+    uint64_t data_offset_ = 0;
+    uint64_t payload_bytes_ = 0;
+    size_t row_bytes_ = 0;
+    std::vector<ggml_fp16_t> fp16_row_;
+};
+
+static bench_disk_embedding & get_bench_disk_embedding() {
+    static bench_disk_embedding embedding;
+    return embedding;
+}
+
+
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
@@ -2107,7 +2209,18 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        std::vector<float> embeddings;
+        llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+        auto & disk_embedding = get_bench_disk_embedding();
+        if (disk_embedding.enabled()) {
+            if (disk_embedding.embedding_dim() != static_cast<uint32_t>(llama_model_n_embd_inp(model))) {
+                throw std::runtime_error("disk embedding dimension does not match model");
+            }
+            disk_embedding.read_rows(tokens.data(), n_tokens, embeddings);
+            batch.token = nullptr;
+            batch.embd = embeddings.data();
+        }
+        int res = llama_decode(ctx, batch);
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
@@ -2128,8 +2241,19 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
+    std::vector<float> embeddings;
+    auto & disk_embedding = get_bench_disk_embedding();
     for (int i = 0; i < n_gen; i++) {
-        int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        llama_batch batch = llama_batch_get_one(&token, 1);
+        if (disk_embedding.enabled()) {
+            if (disk_embedding.embedding_dim() != static_cast<uint32_t>(llama_model_n_embd_inp(model))) {
+                throw std::runtime_error("disk embedding dimension does not match model");
+            }
+            disk_embedding.read_rows(&token, 1, embeddings);
+            batch.token = nullptr;
+            batch.embd = embeddings.data();
+        }
+        int res = llama_decode(ctx, batch);
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
@@ -2400,6 +2524,10 @@ int llama_bench(int argc, char ** argv) {
                 std::fprintf(stderr, "llama-bench: profile-ready pid=%d\n", getpid());
                 std::fflush(stderr);
                 std::raise(SIGSTOP);
+            }
+
+            if (std::getenv("LLAMA_BENCH_GRAPH_OP_TIMING")) {
+                setenv("GGML_GRAPH_OP_TIMING", "1", 1);
             }
 
             uint64_t t_start = get_time_ns();

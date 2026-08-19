@@ -3308,6 +3308,28 @@ void qnn_dynamic_a8_mul_mat_compute(
         native_i8mm_weights = qnn_gs32_i8mm_sidecar::instance().find(
             qparams, weights->data, columns, rows);
     }
+    {
+        static std::atomic<bool> dispatch_reported{false};
+        if (!dispatch_reported.exchange(true, std::memory_order_relaxed)) {
+            const char * dispatch = qparams->weights_i8mm_native_source
+                ? "I8MM_NATIVE_16ROW_EMBEDDED"
+                : native_i8mm_weights != nullptr
+                    ? "I8MM_NATIVE_16ROW_SIDECAR"
+                    : "GS32_GROUPWISE_FALLBACK";
+            std::fprintf(
+                stderr,
+                "qnn-u16: GPTQ2/A8 dispatch=%s i8mm_dotprod=%d "
+                "embedded_native=%d sidecar_native=%d projection=%s "
+                "columns=%lld rows=%lld\n",
+                dispatch,
+                ggml_gptq2_32_gs32_i8mm_dotprod_enabled(),
+                qparams->weights_i8mm_native_source ? 1 : 0,
+                native_i8mm_weights != nullptr ? 1 : 0,
+                qparams->projection.c_str(),
+                static_cast<long long>(columns),
+                static_cast<long long>(rows));
+        }
+    }
 
     const int64_t row_groups = rows / 16;
     const int64_t group_begin = row_groups * ith / nth;

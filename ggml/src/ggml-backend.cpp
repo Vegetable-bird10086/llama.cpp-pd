@@ -1542,6 +1542,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // Shape-only diagnostic for comparing scheduler topology between runners.
+    // It deliberately performs no per-node timing and is disabled by default.
+    if (getenv("GGML_SCHED_SHAPE_TRACE") != nullptr) {
+        static uint64_t graph_call = 0;
+        int total_nodes = 0;
+        fprintf(stderr, "GGML sched shape: call=%llu splits=%d split_nodes=",
+                (unsigned long long) graph_call++, sched->n_splits);
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            const int n_nodes = splits[split_id].graph.n_nodes;
+            total_nodes += n_nodes;
+            fprintf(stderr, "%s%d", split_id == 0 ? "" : ",", n_nodes);
+        }
+        fprintf(stderr, " total_nodes=%d\n", total_nodes);
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;

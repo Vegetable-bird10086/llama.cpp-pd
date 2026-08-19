@@ -524,6 +524,12 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    uint64_t * op_timing_start;
+    uint64_t * op_timing_end;
+    uint64_t * op_timing_wait;
+    uint64_t   op_timing_freq;
+    int        op_timing_n_nodes;
 };
 
 // Per-thread state
@@ -559,6 +565,26 @@ static inline void ggml_thread_cpu_relax(void) {
 #else
 static inline void ggml_thread_cpu_relax(void) {;}
 #endif
+
+static inline uint64_t ggml_op_timing_clock(void) {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    uint64_t value;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
+    return value;
+#else
+    return (uint64_t) ggml_time_us();
+#endif
+}
+
+static inline uint64_t ggml_op_timing_frequency(void) {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    uint64_t value;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
+    return value;
+#else
+    return 1000000;
+#endif
+}
 
 //
 // NUMA support
@@ -3088,6 +3114,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const int timing_node_n = node_n;
+        const bool timing_enabled = tp->op_timing_start != NULL;
+        const size_t timing_index = (size_t) state->ith * tp->op_timing_n_nodes + timing_node_n;
+        const uint64_t timing_start = timing_enabled ? ggml_op_timing_clock() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3097,6 +3128,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
+        if (timing_enabled) {
+            tp->op_timing_start[timing_index] = timing_start;
+            tp->op_timing_end[timing_index] = ggml_op_timing_clock();
+        }
+
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
@@ -3104,7 +3140,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            const uint64_t wait_start = timing_enabled ? ggml_op_timing_clock() : 0;
             ggml_barrier(state->threadpool);
+            if (timing_enabled) {
+                tp->op_timing_wait[timing_index] = ggml_op_timing_clock() - wait_start;
+            }
         }
 
     }
@@ -3284,6 +3324,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->op_timing_start  = NULL;
+        threadpool->op_timing_end    = NULL;
+        threadpool->op_timing_wait   = NULL;
+        threadpool->op_timing_freq   = 0;
+        threadpool->op_timing_n_nodes = 0;
     }
 
     // Allocate and init workers state
@@ -3339,6 +3384,61 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+static void ggml_graph_op_timing_print(
+        const struct ggml_threadpool * threadpool,
+        const struct ggml_cgraph * cgraph,
+        int n_threads) {
+    const int graph_id = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >>
+        GGML_THREADPOOL_N_THREADS_BITS;
+    const double ticks_to_ms = 1000.0 / (double) threadpool->op_timing_freq;
+
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        uint64_t min_start = UINT64_MAX;
+        uint64_t min_end = UINT64_MAX;
+        uint64_t max_end = 0;
+        uint64_t max_compute = 0;
+        uint64_t sum_compute = 0;
+        uint64_t sum_wait = 0;
+        bool present = false;
+
+        for (int ith = 0; ith < n_threads; ++ith) {
+            const size_t index = (size_t) ith * cgraph->n_nodes + node_n;
+            const uint64_t start = threadpool->op_timing_start[index];
+            const uint64_t end = threadpool->op_timing_end[index];
+            if (start == 0 || end < start) {
+                continue;
+            }
+
+            const uint64_t compute = end - start;
+            present = true;
+            min_start = MIN(min_start, start);
+            min_end = MIN(min_end, end);
+            max_end = MAX(max_end, end);
+            max_compute = MAX(max_compute, compute);
+            sum_compute += compute;
+            sum_wait += threadpool->op_timing_wait[index];
+        }
+
+        if (!present) {
+            continue;
+        }
+
+        const struct ggml_tensor * node = cgraph->nodes[node_n];
+        const uint64_t wall = max_end - min_start;
+        const uint64_t avg_compute = sum_compute / (uint64_t) n_threads;
+        const uint64_t avg_wait = sum_wait / (uint64_t) n_threads;
+        const uint64_t arrival_skew = max_end - min_end;
+
+        fprintf(stderr,
+                "GGML_NODE_TIMING graph=%d node=%d op=%s name=\"%s\" wall_ms=%.6f max_worker_ms=%.6f avg_worker_ms=%.6f avg_wait_ms=%.6f arrival_skew_ms=%.6f\n",
+                graph_id, node_n, ggml_op_name(node->op), node->name,
+                wall * ticks_to_ms, max_compute * ticks_to_ms,
+                avg_compute * ticks_to_ms, avg_wait * ticks_to_ms,
+                arrival_skew * ticks_to_ms);
+    }
+    fflush(stderr);
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3365,6 +3465,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+    }
+
+    const char * op_timing_env = getenv("GGML_GRAPH_OP_TIMING");
+    const bool op_timing_enabled = op_timing_env != NULL && strcmp(op_timing_env, "1") == 0;
+    if (op_timing_enabled) {
+        const size_t count = (size_t) n_threads * cgraph->n_nodes;
+        threadpool->op_timing_start = calloc(count, sizeof(uint64_t));
+        threadpool->op_timing_end = calloc(count, sizeof(uint64_t));
+        threadpool->op_timing_wait = calloc(count, sizeof(uint64_t));
+        GGML_ASSERT(threadpool->op_timing_start != NULL);
+        GGML_ASSERT(threadpool->op_timing_end != NULL);
+        GGML_ASSERT(threadpool->op_timing_wait != NULL);
+        threadpool->op_timing_freq = ggml_op_timing_frequency();
+        threadpool->op_timing_n_nodes = cgraph->n_nodes;
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3406,6 +3520,18 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (op_timing_enabled) {
+        ggml_graph_op_timing_print(threadpool, cgraph, n_threads);
+        free(threadpool->op_timing_start);
+        free(threadpool->op_timing_end);
+        free(threadpool->op_timing_wait);
+        threadpool->op_timing_start = NULL;
+        threadpool->op_timing_end = NULL;
+        threadpool->op_timing_wait = NULL;
+        threadpool->op_timing_freq = 0;
+        threadpool->op_timing_n_nodes = 0;
+    }
 
     enum ggml_status ret = threadpool->ec;
 
