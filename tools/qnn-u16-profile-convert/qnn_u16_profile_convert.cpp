@@ -43,28 +43,29 @@ int main(int argc, char ** argv) {
         }
         llama_qnn_quant_profile_save_sharded_binary_file(
             *profile, argv[3], shard_count);
-        const auto check = llama_qnn_quant_profile_load_file(argv[3]);
-        if (check) {
-            llama_qnn_quant_profile_prepare_kernel_metadata(*model, *check);
-        }
+        const auto transport =
+            llama_qnn_quant_profile_load_binary_transport_file(argv[3]);
         size_t streamed_sidecar_bytes = 0;
+        if (!transport->binary_stream_prepare(shard_count)) {
+            throw std::runtime_error(
+                "cannot prepare transport-only sidecar verification");
+        }
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            size_t loaded = 0;
+            if (!transport->binary_stream_fill(shard, &loaded)) {
+                throw std::runtime_error(
+                    "cannot load transport sidecar shard " +
+                    std::to_string(shard));
+            }
+            streamed_sidecar_bytes += loaded;
+        }
+        if (!transport->binary_stream_finish()) {
+            throw std::runtime_error(
+                "cannot finish transport-only sidecar verification");
+        }
+        const auto check =
+            llama_qnn_quant_profile_load_binary_file(argv[3], transport);
         if (check) {
-            if (!check->binary_stream_prepare(shard_count)) {
-                throw std::runtime_error(
-                    "cannot release sharded sidecar buffers for verification");
-            }
-            for (size_t shard = 0; shard < shard_count; ++shard) {
-                size_t loaded = 0;
-                if (!check->binary_stream_fill(shard, &loaded)) {
-                    throw std::runtime_error(
-                        "cannot reload sidecar shard " + std::to_string(shard));
-                }
-                streamed_sidecar_bytes += loaded;
-            }
-            if (!check->binary_stream_finish()) {
-                throw std::runtime_error(
-                    "cannot finish sharded sidecar reload verification");
-            }
             llama_qnn_quant_profile_prepare_kernel_metadata(*model, *check);
         }
         size_t tiled_linears = 0;

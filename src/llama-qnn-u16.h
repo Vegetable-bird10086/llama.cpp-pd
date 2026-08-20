@@ -34,6 +34,10 @@ bool llama_qnn_u16_activations_enabled();
 // GGUF tensors are resident. This is used by PD Decode to defer the large
 // metadata mapping until Prefill has released its rebuild working set.
 bool llama_qnn_u16_attach_profile_from_environment(llama_model * model);
+bool llama_qnn_u16_attach_profile_from_environment(
+    llama_model * model,
+    const std::shared_ptr<llama_qnn_quant_profile> & transport);
+void llama_qnn_u16_detach_profile(llama_model * model);
 
 // Converts canonical FP16 PD KV ([K,V][layer][head][token][dim]) into the
 // exact per-layer/per-head U8 cache domains declared by the attached QNN

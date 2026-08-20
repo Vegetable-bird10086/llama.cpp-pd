@@ -32,6 +32,7 @@ struct llama_pd_inprocess_request {
         int32_t token) = nullptr;
     void * decode_event_opaque = nullptr;
     int32_t decode_event_call_limit = 0;
+    bool lazy_quant_profile_after_prefill = false;
 };
 
 struct llama_pd_inprocess_result {

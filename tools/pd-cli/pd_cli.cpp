@@ -2185,6 +2185,7 @@ struct llama_pd_inprocess_runtime {
     std::vector<std::string> args;
     common_params params;
     std::optional<std::string> deferred_profile_path;
+    std::shared_ptr<llama_qnn_quant_profile> profile_transport;
     common_init_result_ptr llama_init;
     pd_disk_embedding disk_embedding;
     pd_persistent_threadpools threadpools;
@@ -2369,6 +2370,27 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     }
 
     const auto persistent_boundary_start = steady_clock::now();
+    std::optional<steady_clock::time_point> lazy_decode_start;
+    if (g_inprocess_runtime != nullptr && g_inprocess_request != nullptr &&
+            g_inprocess_request->lazy_quant_profile_after_prefill) {
+        lazy_decode_start = steady_clock::now();
+        const process_memory_snapshot memory_before_lazy = process_memory();
+        double preparation_ms = 0.0;
+        if (!llama_pd_inprocess_runtime_prepare_context(
+                g_inprocess_runtime, &preparation_ms)) {
+            LOG_ERR("failed to lazily prepare QNN Decode metadata/context\n");
+            return 1;
+        }
+        const process_memory_snapshot memory_after_lazy = process_memory();
+        LOG_INF(
+            "PD lazy quant profile prepared after Prefill: ms=%.3f "
+            "rss_before_mib=%.2f rss_after_mib=%.2f rss_delta_mib=%.2f\n",
+            preparation_ms,
+            bytes_to_mib(memory_before_lazy.rss_bytes),
+            bytes_to_mib(memory_after_lazy.rss_bytes),
+            signed_bytes_to_mib(mapping_delta(
+                memory_after_lazy.rss_bytes, memory_before_lazy.rss_bytes)));
+    }
     if (pd.control_fd >= 0) {
         try {
             LOG_INF(
@@ -2690,8 +2712,13 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     const bool infinite = n_remain < 0;
 
     int32_t generated_tokens = 0;
-    const double boundary_ms = elapsed_ms(boundary_start);
-    const auto decode_start = steady_clock::now();
+    const double boundary_ms = lazy_decode_start.has_value()
+        ? std::chrono::duration<double, std::milli>(
+              *lazy_decode_start - boundary_start).count()
+        : elapsed_ms(boundary_start);
+    const auto decode_start = lazy_decode_start.has_value()
+        ? *lazy_decode_start
+        : steady_clock::now();
     const bool log_token_timing = std::getenv("LLAMA_PD_TOKEN_TIMING") != nullptr;
     int32_t decode_call_index = 0;
     const auto decode_one = [&](llama_token token) {
@@ -2713,7 +2740,10 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
             profile_token_mappings
             ? process_mappings()
             : process_mapping_snapshot();
-        const auto token_decode_start = steady_clock::now();
+        const auto token_decode_start =
+            decode_call_index == 0 && lazy_decode_start.has_value()
+            ? *lazy_decode_start
+            : steady_clock::now();
         const bool capture_this_decode =
             !pd_capture.output_dir.empty() && !pd_capture.completed;
         g_pd_capture_state = capture_this_decode ? &pd_capture : nullptr;
@@ -2781,6 +2811,28 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         return result;
     };
 
+    bool lazy_profile_released = false;
+    const auto release_lazy_profile = [&]() {
+        if (!lazy_decode_start.has_value() || lazy_profile_released) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto release_start = steady_clock::now();
+        const process_memory_snapshot memory_before_release = process_memory();
+        llama_qnn_u16_detach_profile(model);
+        g_inprocess_runtime->profile_transport.reset();
+        lazy_profile_released = true;
+        const process_memory_snapshot memory_after_release = process_memory();
+        LOG_INF(
+            "PD lazy quant profile released after generation: ms=%.3f "
+            "rss_before_mib=%.2f rss_after_mib=%.2f rss_delta_mib=%.2f\n",
+            elapsed_ms(release_start),
+            bytes_to_mib(memory_before_release.rss_bytes),
+            bytes_to_mib(memory_after_release.rss_bytes),
+            signed_bytes_to_mib(mapping_delta(
+                memory_after_release.rss_bytes, memory_before_release.rss_bytes)));
+    };
+
     if (!pd.ppl_tokens_path.empty()) {
         std::vector<llama_token> continuation;
         try {
@@ -2837,6 +2889,7 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
             }
             ++scored_tokens;
         }
+        release_lazy_profile();
         const double ppl = std::exp(total_nll / static_cast<double>(scored_tokens));
         const double ppl_ms = elapsed_ms(ppl_start);
         LOG_INF(
@@ -2867,6 +2920,7 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
     }
 
     if (!infinite && n_remain == 0) {
+        release_lazy_profile();
         return 0;
     }
 
@@ -2911,8 +2965,9 @@ static int llama_pd_cli_main_impl(int argc, char ** argv) {
         cur = common_sampler_sample(smpl, ctx, -1);
     }
 
-    LOG("\n");
     const double decode_ms = elapsed_ms(decode_start);
+    release_lazy_profile();
+    LOG("\n");
     if (g_inprocess_request != nullptr &&
         g_inprocess_request->result != nullptr) {
         *g_inprocess_request->result = {
@@ -3096,11 +3151,17 @@ bool llama_pd_inprocess_runtime_prepare_context(
     const auto prepare_start = steady_clock::now();
     const process_memory_snapshot memory_before = process_memory();
     const auto metadata_start = steady_clock::now();
-    if (runtime->deferred_profile_path.has_value() &&
-            !llama_qnn_u16_attach_profile_from_environment(
-                runtime->llama_init->model())) {
-        LOG_ERR("failed to attach deferred QNN runtime metadata\n");
-        return false;
+    if (runtime->deferred_profile_path.has_value()) {
+        const bool attached = runtime->profile_transport != nullptr
+            ? llama_qnn_u16_attach_profile_from_environment(
+                  runtime->llama_init->model(), runtime->profile_transport)
+            : llama_qnn_u16_attach_profile_from_environment(
+                  runtime->llama_init->model());
+        if (!attached) {
+            LOG_ERR("failed to attach deferred QNN runtime metadata\n");
+            return false;
+        }
+        runtime->profile_transport.reset();
     }
     const double metadata_ms = elapsed_ms(metadata_start);
     const process_memory_snapshot memory_after_metadata = process_memory();
@@ -3315,6 +3376,21 @@ bool llama_pd_inprocess_runtime_profile_stream_prepare(
     }
     const llama_qnn_quant_profile * profile =
         runtime->llama_init->model()->get_qnn_u16_profile();
+    if (profile == nullptr && runtime->profile_transport == nullptr) {
+        if (!runtime->deferred_profile_path.has_value()) {
+            return false;
+        }
+        try {
+            runtime->profile_transport =
+                llama_qnn_quant_profile_load_binary_transport_file(
+                    *runtime->deferred_profile_path);
+        } catch (const std::exception & err) {
+            LOG_ERR("failed to prepare deferred QNN sidecar transport: %s\n",
+                    err.what());
+            return false;
+        }
+    }
+    profile = profile != nullptr ? profile : runtime->profile_transport.get();
     return profile != nullptr && profile->binary_stream_prepare(shard_count);
 }
 
@@ -3328,6 +3404,7 @@ bool llama_pd_inprocess_runtime_profile_stream_fill(
     }
     const llama_qnn_quant_profile * profile =
         runtime->llama_init->model()->get_qnn_u16_profile();
+    profile = profile != nullptr ? profile : runtime->profile_transport.get();
     return profile != nullptr &&
         profile->binary_stream_fill(shard_index, bytes_loaded);
 }
@@ -3340,6 +3417,7 @@ bool llama_pd_inprocess_runtime_profile_stream_finish(
     }
     const llama_qnn_quant_profile * profile =
         runtime->llama_init->model()->get_qnn_u16_profile();
+    profile = profile != nullptr ? profile : runtime->profile_transport.get();
     return profile != nullptr && profile->binary_stream_finish();
 }
 

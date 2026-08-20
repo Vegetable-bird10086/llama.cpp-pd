@@ -262,6 +262,37 @@ bool llama_qnn_u16_attach_profile_from_environment(llama_model * model) {
     return true;
 }
 
+bool llama_qnn_u16_attach_profile_from_environment(
+        llama_model * model,
+        const std::shared_ptr<llama_qnn_quant_profile> & transport) {
+    if (model == nullptr) {
+        return false;
+    }
+    if (model->qnn_u16_profile != nullptr) {
+        return true;
+    }
+    auto profile = llama_qnn_quant_profile_load_from_environment(transport);
+    if (profile == nullptr) {
+        return false;
+    }
+    model->qnn_u16_profile = std::move(profile);
+    llama_qnn_quant_profile_prepare_kernel_metadata(
+        *model, *model->qnn_u16_profile);
+    LLAMA_LOG_INFO(
+        "%s: attached transport-backed kernel-ready QNN metadata: tensors=%zu linear_pairs=%zu operations=%zu\n",
+        __func__,
+        model->qnn_u16_profile->u16_tensor_count(),
+        model->qnn_u16_profile->linear_qparams_count(),
+        model->qnn_u16_profile->operation_count());
+    return true;
+}
+
+void llama_qnn_u16_detach_profile(llama_model * model) {
+    if (model != nullptr) {
+        model->qnn_u16_profile.reset();
+    }
+}
+
 namespace {
 
 static std::string llama_qnn_indexed_fx_name(const char * stem, int32_t index) {

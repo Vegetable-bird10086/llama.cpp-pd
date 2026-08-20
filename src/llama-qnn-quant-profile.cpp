@@ -1863,3 +1863,19 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_envir
     }
     return llama_qnn_quant_profile_load_file(manifest_path);
 }
+
+std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_environment(
+        const std::shared_ptr<llama_qnn_quant_profile> & transport) {
+    const char * manifest_path = std::getenv("LLAMA_QNN_U8_QPARAMS_MANIFEST");
+    if (manifest_path == nullptr || manifest_path[0] == '\0') {
+        manifest_path = std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+    }
+    if (manifest_path == nullptr || manifest_path[0] == '\0') {
+        return nullptr;
+    }
+    if (!llama_qnn_quant_profile_is_binary_file(manifest_path)) {
+        throw std::runtime_error(
+            "transport-backed QNN profile loading requires binary V5 metadata");
+    }
+    return llama_qnn_quant_profile_load_binary_file(manifest_path, transport);
+}

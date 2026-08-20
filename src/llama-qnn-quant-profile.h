@@ -361,6 +361,12 @@ private:
     llama_qnn_quant_profile_load_file(const std::string & path);
     friend std::shared_ptr<llama_qnn_quant_profile>
     llama_qnn_quant_profile_load_binary_file(const std::string & path);
+    friend std::shared_ptr<llama_qnn_quant_profile>
+    llama_qnn_quant_profile_load_binary_file(
+        const std::string & path,
+        const std::shared_ptr<llama_qnn_quant_profile> & transport);
+    friend std::shared_ptr<llama_qnn_quant_profile>
+    llama_qnn_quant_profile_load_binary_transport_file(const std::string & path);
 };
 
 // Returns nullptr when both LLAMA_QNN_U8_QPARAMS_MANIFEST and
@@ -368,6 +374,8 @@ private:
 // parsing and validation failures are fatal to model loading so decode never
 // silently falls back to unrelated qparams.
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_environment();
+std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_from_environment(
+    const std::shared_ptr<llama_qnn_quant_profile> & transport);
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const std::string & path);
 
 // The binary profile is the already validated and derived runtime object.  It
@@ -375,6 +383,11 @@ std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_file(const
 // Base64 payloads.
 bool llama_qnn_quant_profile_is_binary_file(const std::string & path);
 std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_binary_file(const std::string & path);
+std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_binary_file(
+    const std::string & path,
+    const std::shared_ptr<llama_qnn_quant_profile> & transport);
+std::shared_ptr<llama_qnn_quant_profile> llama_qnn_quant_profile_load_binary_transport_file(
+    const std::string & path);
 void llama_qnn_quant_profile_save_binary_file(
     const llama_qnn_quant_profile & profile,
     const std::string & path);

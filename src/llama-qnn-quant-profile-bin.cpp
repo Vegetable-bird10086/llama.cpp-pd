@@ -565,7 +565,8 @@ public:
     sharded_file_set(
             std::shared_ptr<mapped_file> index_mapping,
             const std::string & meta_path,
-            const std::vector<std::pair<uint64_t, uint64_t>> & ranges) :
+            const std::vector<std::pair<uint64_t, uint64_t>> & ranges,
+            bool preload = true) :
         index_mapping_(std::move(index_mapping)),
         shared_path_(sidecar_data_path(meta_path)) {
         shared_fd_ = open(shared_path_.c_str(), O_RDONLY | O_CLOEXEC);
@@ -598,7 +599,7 @@ public:
             value.size = static_cast<size_t>(range.second);
             value.range_known = true;
             value.storage = std::make_shared<llama_qnn_buffer_storage>();
-            load_part(value);
+            load_part(value, preload);
             parts.push_back(std::move(value));
         }
     }
@@ -607,6 +608,25 @@ public:
         if (shared_fd_ >= 0) {
             close(shared_fd_);
         }
+    }
+
+    std::shared_ptr<mapped_file> index_mapping() const {
+        return index_mapping_;
+    }
+
+    bool matches_ranges(
+            const std::vector<std::pair<uint64_t, uint64_t>> & ranges) const {
+        if (ranges.size() != parts.size()) {
+            return false;
+        }
+        for (size_t index = 0; index < ranges.size(); ++index) {
+            if (!parts[index].range_known ||
+                    parts[index].file_offset != ranges[index].first ||
+                    parts[index].size != ranges[index].second) {
+                return false;
+            }
+        }
+        return true;
     }
 
     std::vector<std::shared_ptr<llama_qnn_buffer_storage>> storages() const {
@@ -629,8 +649,8 @@ public:
             // repopulates the same malloc buffer with ordinary file read().
             // This avoids both file-backed mmap/page-cache residency and a
             // graph rebuild/rebind at the Prefill -> Decode boundary.
-            if (value.storage->data != nullptr && value.allocation_size != 0 &&
-                    madvise(
+            if (value.ready && value.storage->data != nullptr &&
+                    value.allocation_size != 0 && madvise(
                         const_cast<uint8_t *>(value.storage->data),
                         value.allocation_size,
                         MADV_DONTNEED) != 0) {
@@ -686,7 +706,7 @@ private:
         bool ready = false;
     };
 
-    void load_part(part & value) {
+    void load_part(part & value, bool preload = true) {
         const bool shared = shared_fd_ >= 0;
         const int fd = shared
             ? shared_fd_
@@ -750,6 +770,22 @@ private:
                     value.path + ": " + std::strerror(allocation_error));
             }
         }
+        value.size = size;
+        value.allocation_size = allocation_size;
+        if (!preload) {
+            if (new_allocation) {
+                value.storage->allocation = std::shared_ptr<void>(
+                    allocation,
+                    [](void * pointer) { free(pointer); });
+            }
+            value.storage->data = static_cast<const uint8_t *>(allocation);
+            value.storage->size = size;
+            value.ready = false;
+            if (!shared) {
+                close(fd);
+            }
+            return;
+        }
         size_t offset = 0;
         while (offset < size) {
             const ssize_t count = read(
@@ -779,8 +815,6 @@ private:
         if (!shared) {
             close(fd);
         }
-        value.size = size;
-        value.allocation_size = allocation_size;
         if (new_allocation) {
             value.storage->allocation = std::shared_ptr<void>(
                 allocation,
@@ -1513,8 +1547,77 @@ void llama_qnn_quant_profile_save_sharded_binary_file(
 }
 
 std::shared_ptr<llama_qnn_quant_profile>
-llama_qnn_quant_profile_load_binary_file(const std::string & path) {
+llama_qnn_quant_profile_load_binary_transport_file(const std::string & path) {
     auto mapping = std::make_shared<mapped_file>(path);
+    if (mapping->size < kHeaderBytes ||
+            !std::equal(kMagic.begin(), kMagic.end(), mapping->data)) {
+        binary_fail("magic is invalid");
+    }
+    binary_reader header(
+        mapping->data + kMagic.size(), mapping->size - kMagic.size());
+    const uint32_t version = header.scalar<uint32_t>();
+    if (version != kVersion || header.scalar<uint32_t>() != kEndianTag) {
+        binary_fail("transport-only loading requires a V5 profile");
+    }
+    const uint64_t payload_bytes = header.scalar<uint64_t>();
+    header.scalar<uint64_t>();
+    if (payload_bytes != mapping->size - kHeaderBytes) {
+        binary_fail("payload size disagrees with the file size");
+    }
+    binary_reader reader(
+        mapping->data + kHeaderBytes, static_cast<size_t>(payload_bytes), true);
+    reader.string();
+    reader.scalar<int32_t>();
+    reader.scalar<int32_t>();
+    reader.scalar<int32_t>();
+    reader.scalar<int32_t>();
+    reader.scalar<uint16_t>();
+    reader.string();
+    reader.string();
+    reader.string();
+    reader.string();
+    reader.scalar<int64_t>();
+    reader.scalar<int64_t>();
+    const uint32_t shard_count = reader.scalar<uint32_t>();
+    if (shard_count == 0) {
+        binary_fail("sharded profile has no sidecars");
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.reserve(shard_count);
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        const uint64_t file_offset = reader.scalar<uint64_t>();
+        const uint64_t shard_bytes = reader.scalar<uint64_t>();
+        if (file_offset % 4096 != 0) {
+            binary_fail("sidecar shard file offset is not page aligned");
+        }
+        ranges.emplace_back(file_offset, shard_bytes);
+    }
+    auto result = std::make_shared<llama_qnn_quant_profile>();
+    result->source_path = path;
+    result->binary_mapping = std::make_shared<sharded_file_set>(
+        mapping, path, ranges, false);
+    result->binary_mapping_is_sharded = true;
+    return result;
+}
+
+std::shared_ptr<llama_qnn_quant_profile>
+llama_qnn_quant_profile_load_binary_file(
+        const std::string & path,
+        const std::shared_ptr<llama_qnn_quant_profile> & transport) {
+    std::shared_ptr<sharded_file_set> supplied_transport;
+    std::shared_ptr<mapped_file> mapping;
+    if (transport != nullptr) {
+        if (transport->source_path != path ||
+                !transport->binary_mapping_is_sharded ||
+                transport->binary_mapping == nullptr) {
+            binary_fail("sidecar transport does not match the profile");
+        }
+        supplied_transport = std::static_pointer_cast<sharded_file_set>(
+            transport->binary_mapping);
+        mapping = supplied_transport->index_mapping();
+    } else {
+        mapping = std::make_shared<mapped_file>(path);
+    }
     if (mapping->size < kHeaderBytes ||
         !std::equal(kMagic.begin(), kMagic.end(), mapping->data)) {
         binary_fail("magic is invalid");
@@ -1579,9 +1682,17 @@ llama_qnn_quant_profile_load_binary_file(const std::string & path) {
                 }
                 ranges.emplace_back(file_offset, shard_bytes);
             }
-            sharded_mapping = std::make_shared<sharded_file_set>(
-                mapping, path, ranges);
+            sharded_mapping = supplied_transport != nullptr
+                ? supplied_transport
+                : std::make_shared<sharded_file_set>(mapping, path, ranges);
+            if (supplied_transport != nullptr &&
+                    !supplied_transport->matches_ranges(ranges)) {
+                binary_fail("sidecar transport ranges disagree with metadata");
+            }
         } else {
+            if (supplied_transport != nullptr) {
+                binary_fail("transport-only loading requires a V5 profile");
+            }
             sharded_mapping = std::make_shared<sharded_file_set>(
                 mapping, path, shard_count);
         }
@@ -1693,4 +1804,9 @@ llama_qnn_quant_profile_load_binary_file(const std::string & path) {
         binary_fail("runtime contract is incomplete");
     }
     return result;
+}
+
+std::shared_ptr<llama_qnn_quant_profile>
+llama_qnn_quant_profile_load_binary_file(const std::string & path) {
+    return llama_qnn_quant_profile_load_binary_file(path, nullptr);
 }
