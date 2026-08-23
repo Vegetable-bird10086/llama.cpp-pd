@@ -1493,7 +1493,8 @@ pd_handoff load_pd_handoff(
         out.prompt_len *
         out.head_dim *
         2;
-    if (load_fp16_kv && out.kv_fp16.size() != expected_values) {
+    if (load_fp16_kv && out.kv_qnn_u8.empty() &&
+            out.kv_fp16.size() != expected_values) {
         std::ostringstream oss;
         oss << "kv.bin element count mismatch: got=" << out.kv_fp16.size()
             << " expected=" << expected_values;

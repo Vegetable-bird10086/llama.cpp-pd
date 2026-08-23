@@ -3430,6 +3430,135 @@ void ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
 #endif
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__clang__)
+__attribute__((target("dotprod,i8mm")))
+#endif
+static inline int64_t ggml_gptq2_pc_s8_i8mm_native_dot_8rows(
+        int blocks,
+        int64_t centered_dots[8],
+        const uint8_t * GGML_RESTRICT native_weights,
+        const int8_t * GGML_RESTRICT activations,
+        const int32_t * GGML_RESTRICT block_multipliers,
+        int accumulate_activation_sum) {
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__clang__)
+    int64x2_t accum0 = vdupq_n_s64(0);
+    int64x2_t accum1 = vdupq_n_s64(0);
+    int64x2_t accum2 = vdupq_n_s64(0);
+    int64x2_t accum3 = vdupq_n_s64(0);
+    int64_t weighted_activation_sum = 0;
+#pragma clang loop unroll_count(1)
+    for (int block = 0; block < blocks; ++block) {
+        const int8_t * activation = activations + block * 32;
+        const int8x8_t activation0 = vld1_s8(activation + 0);
+        const int8x8_t activation1 = vld1_s8(activation + 8);
+        const int8x8_t activation2 = vld1_s8(activation + 16);
+        const int8x8_t activation3 = vld1_s8(activation + 24);
+        const int32_t multiplier = block_multipliers[block];
+        if (accumulate_activation_sum) {
+            int16x8_t activation_sum_lanes =
+                vaddl_s8(activation0, activation1);
+            activation_sum_lanes =
+                vaddw_s8(activation_sum_lanes, activation2);
+            activation_sum_lanes =
+                vaddw_s8(activation_sum_lanes, activation3);
+            weighted_activation_sum +=
+                (int64_t) vaddlvq_s16(activation_sum_lanes) * multiplier;
+        }
+        int32x4_t dot03;
+        int32x4_t dot47;
+        ggml_gptq2_32_dot_s8_i8mm_native_gs32_8rows(
+            activation0, activation1, activation2, activation3,
+            native_weights + (size_t) block * 128, &dot03, &dot47);
+        accum0 = vmlal_n_s32(accum0, vget_low_s32(dot03), multiplier);
+        accum1 = vmlal_high_n_s32(accum1, dot03, multiplier);
+        accum2 = vmlal_n_s32(accum2, vget_low_s32(dot47), multiplier);
+        accum3 = vmlal_high_n_s32(accum3, dot47, multiplier);
+    }
+    vst1q_s64(centered_dots + 0, accum0);
+    vst1q_s64(centered_dots + 2, accum1);
+    vst1q_s64(centered_dots + 4, accum2);
+    vst1q_s64(centered_dots + 6, accum3);
+    return weighted_activation_sum;
+#else
+    (void) blocks;
+    (void) centered_dots;
+    (void) native_weights;
+    (void) activations;
+    (void) block_multipliers;
+    (void) accumulate_activation_sum;
+    return 0;
+#endif
+}
+
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__clang__)
+__attribute__((target("dotprod,i8mm")))
+#endif
+void ggml_gptq2_pc_s8_i8mm_native_dot_16rows(
+        int n,
+        int64_t centered_dots[16],
+        const uint8_t * GGML_RESTRICT native_weights,
+        const int8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_channel_codes,
+        const int32_t * GGML_RESTRICT block_multipliers) {
+    GGML_ASSERT(n > 0 && n % 32 == 0);
+    GGML_ASSERT(centered_dots != NULL && native_weights != NULL);
+    GGML_ASSERT(activations != NULL && prepared_channel_codes != NULL);
+    GGML_ASSERT(block_multipliers != NULL);
+    const int blocks = n / 32;
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__clang__)
+    GGML_ASSERT(ggml_gptq2_32_gs32_i8mm_dotprod_enabled());
+    const int64_t weighted_activation_sum =
+        ggml_gptq2_pc_s8_i8mm_native_dot_8rows(
+            blocks, centered_dots, native_weights, activations,
+            block_multipliers, 1);
+    ggml_gptq2_pc_s8_i8mm_native_dot_8rows(
+        blocks, centered_dots + 8, native_weights + 64, activations,
+        block_multipliers, 0);
+    for (int row = 0; row < 16; ++row) {
+        const uint8_t prepared = prepared_channel_codes[row];
+        const int32_t zero_point = (prepared >> 5) & 0x3;
+        const int32_t scale = prepared & 0x1f;
+        centered_dots[row] =
+            (centered_dots[row] - weighted_activation_sum * zero_point) * scale;
+    }
+#else
+    int64_t weighted_activation_sum = 0;
+    for (int row = 0; row < 16; ++row) {
+        centered_dots[row] = 0;
+    }
+    for (int block = 0; block < blocks; ++block) {
+        int32_t activation_sum = 0;
+        for (int column = 0; column < 32; ++column) {
+            activation_sum += activations[block * 32 + column];
+        }
+        const int32_t multiplier = block_multipliers[block];
+        weighted_activation_sum += (int64_t) activation_sum * multiplier;
+        for (int row = 0; row < 16; ++row) {
+            const size_t pair = (size_t) row / 2;
+            const size_t parity = (size_t) row & 1;
+            const uint8_t * packed = native_weights +
+                (size_t) block * 128 + pair * 16 + parity * 8;
+            int32_t raw_dot = 0;
+            for (int digit = 0; digit < 4; ++digit) {
+                for (int k = 0; k < 8; ++k) {
+                    const int32_t code =
+                        (packed[k] >> (digit * 2)) & 0x3;
+                    raw_dot += activations[block * 32 + digit * 8 + k] * code;
+                }
+            }
+            centered_dots[row] += (int64_t) raw_dot * multiplier;
+        }
+    }
+    for (int row = 0; row < 16; ++row) {
+        const uint8_t prepared = prepared_channel_codes[row];
+        const int32_t zero_point = (prepared >> 5) & 0x3;
+        const int32_t scale = prepared & 0x1f;
+        centered_dots[row] =
+            (centered_dots[row] - weighted_activation_sum * zero_point) * scale;
+    }
+#endif
+}
+
 int64_t ggml_gptq2_32_qnn_prepared_weight_sum(
         int n,
         const void * GGML_RESTRICT packed_weights,

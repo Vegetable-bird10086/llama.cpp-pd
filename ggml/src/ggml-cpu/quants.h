@@ -228,6 +228,17 @@ void ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
         const uint8_t * GGML_RESTRICT prepared_block_codes,
         const int32_t * GGML_RESTRICT block_multipliers);
 
+// Dedicated per-channel native-I8MM GEMV. Unlike the GS32 kernel above, the
+// weight zero point and scale are invariant across all 32-element blocks in a
+// row, so they are applied once after the blockwise A8 accumulation.
+void ggml_gptq2_pc_s8_i8mm_native_dot_16rows(
+        int n,
+        int64_t centered_dots[16],
+        const uint8_t * GGML_RESTRICT native_weights,
+        const int8_t * GGML_RESTRICT activations,
+        const uint8_t * GGML_RESTRICT prepared_channel_codes,
+        const int32_t * GGML_RESTRICT block_multipliers);
+
 void ggml_vec_dot_gptq2_32_u16_qnn_blockwise_prepared(
         int n,
         uint16_t * GGML_RESTRICT output,

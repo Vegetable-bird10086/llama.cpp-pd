@@ -443,7 +443,9 @@ class ModelBase:
                 pack_factor = pack_dtype_bits // bits
                 k = qweight.shape[0] * pack_factor
                 m = qweight.shape[1]
-                group_size = quant_config["group_size"]
+                source_groups = int(qzeros.shape[0])
+                assert source_groups > 0 and k % source_groups == 0
+                group_size = k // source_groups
                 shifts = list(range(0, pack_dtype_bits, bits))
 
                 weight = torch.stack(
@@ -459,17 +461,32 @@ class ModelBase:
                 scales = scales.clamp_(1e-4, 1e4)
                 zeros = zeros.round().clamp_(0, maxq)
 
-                assert group_size == 32
-                assert k % group_size == 0
+                if group_size != 32:
+                    assert self._gptq2_32_gs32_source
+                    assert group_size == k, (
+                        "gptq2_32_gs32 supports GS32 or per-channel W2; "
+                        f"got group_size={group_size}, k={k}"
+                    )
+                assert k % 32 == 0
 
                 expected_g_idx = torch.arange(k, dtype=torch.int64) // group_size
                 assert torch.equal(g_idx, expected_g_idx)
 
-                n_groups = k // group_size
-                assert scales.shape == (m, n_groups)
-                assert zeros.shape == (m, n_groups)
+                assert scales.shape == (m, source_groups)
+                assert zeros.shape == (m, source_groups)
 
-                codes = weight.reshape(m, n_groups, group_size).numpy().astype(np.uint8, copy=False)
+                # The runtime GPTQ2_32 tensor ABI is always GS32. A
+                # per-channel EfficientQAT checkpoint has one scale/zero per
+                # output row; repeat that metadata for every physical GS32
+                # group while preserving the original 2-bit codes. This is an
+                # exact representation of the per-channel QAT weight and keeps
+                # the existing QNN/MTK kernels and rebuild layout unchanged.
+                n_groups = k // 32
+                if source_groups == 1:
+                    scales = scales.expand(m, n_groups).contiguous()
+                    zeros = zeros.expand(m, n_groups).contiguous()
+
+                codes = weight.reshape(m, n_groups, 32).numpy().astype(np.uint8, copy=False)
                 packed_codes = (
                     codes[:, :, 0::4]
                     | (codes[:, :, 1::4] << np.uint8(2))

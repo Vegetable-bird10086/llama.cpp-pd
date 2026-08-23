@@ -808,7 +808,10 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
-            case GGML_TYPE_GPTQ2_32: ftype = LLAMA_FTYPE_MOSTLY_GPTQ2_32; break;
+            case GGML_TYPE_GPTQ2_32:
+            case GGML_TYPE_GPTQ2_PC_I8MM:
+                ftype = LLAMA_FTYPE_MOSTLY_GPTQ2_32;
+                break;
             case GGML_TYPE_GPTQ2_64: ftype = LLAMA_FTYPE_MOSTLY_GPTQ2_64; break;
             case GGML_TYPE_GPTQ2_128: ftype = LLAMA_FTYPE_MOSTLY_GPTQ2_128; break;
             default:
@@ -866,7 +869,8 @@ llama_model_loader::llama_model_loader(
     std::string gptq2_32_layout;
     if (get_key("general.gptq2_32.layout", gptq2_32_layout, false)) {
         if (gptq2_32_layout != "gs32_source_v1" &&
-            gptq2_32_layout != "i8mm_native_v1") {
+            gptq2_32_layout != "i8mm_native_v1" &&
+            gptq2_32_layout != "per_channel_i8mm_v1") {
             throw std::runtime_error(format(
                 "unsupported general.gptq2_32.layout: %s",
                 gptq2_32_layout.c_str()));
@@ -1394,15 +1398,39 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
+    int per_channel_sidecars = 0;
+    if (gptq2_32_gs32_source) {
+        for (const auto & item : weights_map) {
+            const std::string & name = item.first;
+            const bool is_scale = name.size() >= 6 &&
+                name.compare(name.size() - 6, 6, ".scale") == 0;
+            const bool is_zero_point = name.size() >= 11 &&
+                name.compare(name.size() - 11, 11, ".zero_point") == 0;
+            const bool is_code_min = name.size() >= 9 &&
+                name.compare(name.size() - 9, 9, ".code_min") == 0;
+            const bool is_code_max = name.size() >= 9 &&
+                name.compare(name.size() - 9, 9, ".code_max") == 0;
+            const bool is_requant_mode = name.size() >= 13 &&
+                name.compare(name.size() - 13, 13, ".requant_mode") == 0;
+            per_channel_sidecars +=
+                is_scale || is_zero_point || is_code_min || is_code_max ||
+                is_requant_mode ? 1 : 0;
+        }
+    }
+    const int accounted_tensors = n_created + per_channel_sidecars;
+    if (accounted_tensors > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
-    if (n_created < n_tensors) {
+    if (accounted_tensors < n_tensors) {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (per_channel_sidecars > 0) {
+        LLAMA_LOG_INFO("%s: kept %d per-channel W2 qparam sidecars file-backed\n",
+                __func__, per_channel_sidecars);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1480,7 +1508,9 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
-    if (check_tensors && !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32) &&
+    if (check_tensors && !(gptq2_32_gs32_source &&
+            (cur->type == GGML_TYPE_GPTQ2_32 ||
+             cur->type == GGML_TYPE_GPTQ2_PC_I8MM)) &&
         !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
     }
@@ -1628,7 +1658,8 @@ bool llama_model_loader::load_all_data(
 
             const bool kernel_ready_layout =
                 (gptq2_32_gs32_source &&
-                 cur->type == GGML_TYPE_GPTQ2_32) ||
+                 (cur->type == GGML_TYPE_GPTQ2_32 ||
+                  cur->type == GGML_TYPE_GPTQ2_PC_I8MM)) ||
                 (q8_0_lm_head_4x8_source &&
                  cur->type == GGML_TYPE_Q8_0 &&
                  strcmp(ggml_get_name(cur), "output.weight") == 0);
@@ -1694,7 +1725,9 @@ bool llama_model_loader::load_all_data(
                     file->read_raw(cur->data, n_size);
                 }
                 if (check_tensors &&
-                    !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32)) {
+                    !(gptq2_32_gs32_source &&
+                      (cur->type == GGML_TYPE_GPTQ2_32 ||
+                       cur->type == GGML_TYPE_GPTQ2_PC_I8MM))) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
@@ -1759,7 +1792,9 @@ bool llama_model_loader::load_all_data(
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors &&
-                        !(gptq2_32_gs32_source && cur->type == GGML_TYPE_GPTQ2_32) &&
+                        !(gptq2_32_gs32_source &&
+                          (cur->type == GGML_TYPE_GPTQ2_32 ||
+                           cur->type == GGML_TYPE_GPTQ2_PC_I8MM)) &&
                         !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }

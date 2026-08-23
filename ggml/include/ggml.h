@@ -437,7 +437,10 @@ extern "C" {
         GGML_TYPE_GPTQ2_64  = 44, // GPTQ 2-bit asymmetric, group_size=64
         GGML_TYPE_GPTQ2_128 = 45, // GPTQ 2-bit asymmetric, group_size=128
         GGML_TYPE_U16       = 46,
-        GGML_TYPE_COUNT     = 47,
+        // On-disk per-channel W2. Codes use the 16-row native-I8MM layout;
+        // scale and zero point are sibling tensors and occur once per row.
+        GGML_TYPE_GPTQ2_PC_I8MM = 47,
+        GGML_TYPE_COUNT     = 48,
     };
 
     // precision

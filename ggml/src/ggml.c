@@ -942,6 +942,16 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_gptq2_128,
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_GPTQ2_PC_I8MM] = {
+        .type_name                = "gptq2_pc_i8mm",
+        .blck_size                = 4,
+        .type_size                = 1,
+        .is_quantized             = true,
+        // This split-qparam format is intentionally consumed only by the
+        // dedicated PD GEMV and PTE-rebuild paths.
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
     [36] = { // GGML_TYPE_IQ4_NL_4_4
         .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
         .blck_size                = 0,

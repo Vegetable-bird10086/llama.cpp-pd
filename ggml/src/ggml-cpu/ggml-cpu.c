@@ -410,6 +410,15 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_GPTQ2_PC_I8MM] = {
+        // The split per-channel qparams are consumed by the PD custom GEMV.
+        // Supplying no generic vec_dot prevents an accidental interpretation
+        // of the qbyte-only payload as legacy inline-metadata GPTQ blocks.
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 16,
+    },
     [GGML_TYPE_GPTQ2_64] = {
         .from_float               = NULL,
         .vec_dot                  = ggml_vec_dot_gptq2_64_f32,

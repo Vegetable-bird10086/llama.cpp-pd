@@ -68,15 +68,17 @@ int main(int argc, char ** argv) {
         if (check) {
             llama_qnn_quant_profile_prepare_kernel_metadata(*model, *check);
         }
-        size_t tiled_linears = 0;
+        size_t kernel_ready_linears = 0;
         size_t mapped_linear_buffers = 0;
         size_t mapped_static_buffers = 0;
         size_t mapped_lut_buffers = 0;
         if (check) {
             for (const auto & linear : check->linear_qparams) {
-                tiled_linears +=
+                kernel_ready_linears +=
                     linear.qnn_weight_block_code_layout ==
-                    LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR;
+                        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR ||
+                    linear.qnn_weight_block_code_layout ==
+                        LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR;
                 mapped_linear_buffers +=
                     linear.qnn_channel_scale_to_output_q31.is_mapped() &&
                     linear.qnn_weight_block_scale_codes.is_mapped() &&
@@ -109,7 +111,7 @@ int main(int argc, char ** argv) {
             check->weight_layout != profile->weight_layout ||
             check->lm_head_type != profile->lm_head_type ||
             check->lm_head_layout != profile->lm_head_layout ||
-            tiled_linears != check->linear_qparams_count() ||
+            kernel_ready_linears != check->linear_qparams_count() ||
             mapped_linear_buffers != check->linear_qparams_count() ||
             mapped_static_buffers !=
                 check->u16_tensor_count() + check->aux_quantized_tensor_count() ||
@@ -123,7 +125,7 @@ int main(int argc, char ** argv) {
             << " aux_tensors=" << check->aux_quantized_tensor_count()
             << " linear_pairs=" << check->linear_qparams_count()
             << " operations=" << check->operation_count()
-            << " tiled_linears=" << tiled_linears
+            << " kernel_ready_linears=" << kernel_ready_linears
             << " mapped_linear_buffers=" << mapped_linear_buffers
             << " mapped_static_buffers=" << mapped_static_buffers
             << " mapped_operation_buffers=" << mapped_lut_buffers

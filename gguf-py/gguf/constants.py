@@ -4416,6 +4416,10 @@ class GGMLQuantizationType(IntEnum):
     GPTQ2_32 = 42
     NVFP4   = 40
     Q1_0    = 41
+    # Packed 2-bit codes with one scale/zero-point pair per output row.
+    # The qcode payload uses the 16-row ARM-I8MM order; qparams are stored as
+    # sibling tensors instead of being repeated in every 32-column group.
+    GPTQ2_PC_I8MM = 47
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4597,6 +4601,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.GPTQ2_32:(32, 12),
+    GGMLQuantizationType.GPTQ2_PC_I8MM:(4, 1),
 }
 
 

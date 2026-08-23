@@ -142,6 +142,7 @@ enum llama_qnn_block_code_layout {
     LLAMA_QNN_BLOCK_CODES_ROW_MAJOR = 0,
     LLAMA_QNN_BLOCK_CODES_PREPARED_ROW_MAJOR = 1,
     LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR = 2,
+    LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR = 3,
 };
 
 struct llama_qnn_tensor_qparams {
@@ -214,6 +215,9 @@ struct llama_qnn_linear_qparams {
     // Runtime-only. Derived from GGUF metadata and intentionally omitted from
     // the profile binary so existing kernel-ready qparam profiles stay valid.
     bool weights_i8mm_native_source = false;
+    // Runtime-only. Distinguishes qbyte-only per-channel storage from the
+    // legacy native layout whose 64-row blocks also contain inline metadata.
+    bool weights_per_channel_i8mm_source = false;
     int32_t qnn_weight_block_code_layout = 0;
     int32_t output_bias_q7 = 0;
     std::vector<std::string> operation_names;

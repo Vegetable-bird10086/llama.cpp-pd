@@ -2655,6 +2655,7 @@ void qnn_u16_mul_mat_compute(
     GGML_ASSERT(qparams != nullptr);
     GGML_ASSERT(input->type == GGML_TYPE_U16 && dst->type == GGML_TYPE_U16);
     GGML_ASSERT(weights->type == GGML_TYPE_GPTQ2_32 ||
+                weights->type == GGML_TYPE_GPTQ2_PC_I8MM ||
                 weights->type == GGML_TYPE_GPTQ2_64 ||
                 weights->type == GGML_TYPE_GPTQ2_128);
     GGML_ASSERT(weights->ne[0] == input->ne[0]);
@@ -2664,6 +2665,10 @@ void qnn_u16_mul_mat_compute(
     GGML_ASSERT(qparams->activation_to_output_q20 > 0);
 
     const int64_t rows = weights->ne[1];
+    const bool compact_per_channel_codes =
+        qparams->weights_per_channel_i8mm_source &&
+        qparams->qnn_weight_block_code_layout ==
+            LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR;
     const bool has_qnn_block_scales =
         !qparams->qnn_weight_block_scale_codes.empty();
     if (has_qnn_block_scales) {
@@ -2672,9 +2677,12 @@ void qnn_u16_mul_mat_compute(
         GGML_ASSERT(qparams->qnn_channel_scale_to_output_q31.size() ==
             static_cast<size_t>(rows));
         GGML_ASSERT(qparams->qnn_weight_block_scale_codes.size() ==
-            static_cast<size_t>(rows * qparams->qnn_weight_blocks_per_row));
+            static_cast<size_t>(compact_per_channel_codes
+                ? rows
+                : rows * qparams->qnn_weight_blocks_per_row));
         if (qparams->qnn_weight_block_codes_prepared &&
-            weights->type == GGML_TYPE_GPTQ2_32) {
+            (weights->type == GGML_TYPE_GPTQ2_32 ||
+             weights->type == GGML_TYPE_GPTQ2_PC_I8MM)) {
             GGML_ASSERT(qparams->qnn_prepared_weight_sums.size() ==
                 static_cast<size_t>(rows));
         }
@@ -2696,7 +2704,8 @@ void qnn_u16_mul_mat_compute(
             std::getenv("GGML_QNN_U16_FFN_NEAREST_REQUANT"),
             qparams->layer_id, qparams->projection);
     const int source_group_size =
-        weights->type == GGML_TYPE_GPTQ2_32 ? 32 :
+        (weights->type == GGML_TYPE_GPTQ2_32 ||
+         weights->type == GGML_TYPE_GPTQ2_PC_I8MM) ? 32 :
         weights->type == GGML_TYPE_GPTQ2_64 ? 64 : 128;
     const int64_t vectors = input->ne[1] * input->ne[2] * input->ne[3];
     const bool use_qwen3_4b_dynamic_a8 =
@@ -2704,14 +2713,21 @@ void qnn_u16_mul_mat_compute(
         has_qnn_block_scales &&
         qparams->qnn_weight_block_codes_prepared &&
         qparams->weights_gs32_source &&
-        weights->type == GGML_TYPE_GPTQ2_32 &&
+        (weights->type == GGML_TYPE_GPTQ2_32 ||
+         weights->type == GGML_TYPE_GPTQ2_PC_I8MM) &&
         rows % 16 == 0 &&
         qparams->qnn_weight_block_code_layout ==
-            LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR &&
+            (compact_per_channel_codes
+                ? LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR
+                : LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR) &&
         qnn_dynamic_a8_gemv_enabled(weights->ne[0], qparams);
     if (use_qwen3_4b_dynamic_a8) {
         qnn_dynamic_a8_mul_mat_compute(dst, ith, nth, runtime);
         return;
+    }
+    if (compact_per_channel_codes) {
+        GGML_ABORT(
+            "compact per-channel QNN weight codes require dynamic A8 GEMV");
     }
     if (has_qnn_block_scales &&
         qparams->qnn_weight_block_codes_prepared &&
@@ -3182,7 +3198,9 @@ void qnn_dynamic_a8_mul_mat_compute(
     GGML_ASSERT(qparams->weights_gs32_source);
     GGML_ASSERT(qparams->qnn_weight_block_codes_prepared);
     GGML_ASSERT(qparams->qnn_weight_block_code_layout ==
-        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR);
+        (qparams->weights_per_channel_i8mm_source
+            ? LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR
+            : LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR));
     GGML_ASSERT(qparams->qnn_weight_blocks_per_row == blocks);
 
     static const bool fast_constant_divide = []() {
@@ -3308,10 +3326,17 @@ void qnn_dynamic_a8_mul_mat_compute(
         native_i8mm_weights = qnn_gs32_i8mm_sidecar::instance().find(
             qparams, weights->data, columns, rows);
     }
+    static const bool use_per_channel_kernel = !is_enabled_value(
+        std::getenv("GGML_QNN_PC_I8MM_GS32_COMPAT"));
     {
         static std::atomic<bool> dispatch_reported{false};
         if (!dispatch_reported.exchange(true, std::memory_order_relaxed)) {
-            const char * dispatch = qparams->weights_i8mm_native_source
+            const char * dispatch = qparams->weights_per_channel_i8mm_source &&
+                    use_per_channel_kernel
+                ? "I8MM_NATIVE_PER_CHANNEL_KERNEL"
+                : qparams->weights_per_channel_i8mm_source
+                ? "I8MM_NATIVE_PER_CHANNEL_GS32_COMPAT"
+                : qparams->weights_i8mm_native_source
                 ? "I8MM_NATIVE_16ROW_EMBEDDED"
                 : native_i8mm_weights != nullptr
                     ? "I8MM_NATIVE_16ROW_SIDECAR"
@@ -3334,22 +3359,57 @@ void qnn_dynamic_a8_mul_mat_compute(
     const int64_t row_groups = rows / 16;
     const int64_t group_begin = row_groups * ith / nth;
     const int64_t group_end = row_groups * (ith + 1) / nth;
+    thread_local std::vector<uint8_t> per_channel_legacy_codes;
     for (int64_t group = group_begin; group < group_end; ++group) {
         const int64_t row = group * 16;
         int64_t centered_dots[16];
-        if (qparams->weights_i8mm_native_source) {
-            const int64_t row_block = row / 64;
-            const int64_t tile_in_block = (row % 64) / 16;
-            const size_t source_block_bytes =
-                static_cast<size_t>(blocks) * 768;
+        if (qparams->weights_per_channel_i8mm_source &&
+            use_per_channel_kernel) {
             const uint8_t * embedded_native_tile =
                 static_cast<const uint8_t *>(weights->data) +
-                static_cast<size_t>(row_block) * source_block_bytes +
-                static_cast<size_t>(tile_in_block) * blocks * 128;
+                static_cast<size_t>(row / 16) * blocks * 128;
+            ggml_gptq2_pc_s8_i8mm_native_dot_16rows(
+                static_cast<int>(columns), centered_dots,
+                embedded_native_tile, dynamic_s8,
+                qparams->qnn_weight_block_scale_codes.data() + row,
+                dynamic_block_max_abs);
+        } else if (qparams->weights_i8mm_native_source) {
+            const uint8_t * embedded_native_tile;
+            if (qparams->weights_per_channel_i8mm_source) {
+                embedded_native_tile =
+                    static_cast<const uint8_t *>(weights->data) +
+                    static_cast<size_t>(row / 16) * blocks * 128;
+            } else {
+                const int64_t row_block = row / 64;
+                const int64_t tile_in_block = (row % 64) / 16;
+                const size_t source_block_bytes =
+                    static_cast<size_t>(blocks) * 768;
+                embedded_native_tile =
+                    static_cast<const uint8_t *>(weights->data) +
+                    static_cast<size_t>(row_block) * source_block_bytes +
+                    static_cast<size_t>(tile_in_block) * blocks * 128;
+            }
+            const uint8_t * prepared_codes =
+                qparams->qnn_weight_block_scale_codes.data() + row * blocks;
+            if (qparams->weights_per_channel_i8mm_source) {
+                per_channel_legacy_codes.resize(
+                    static_cast<size_t>(blocks) * 16);
+                const uint8_t * channel_codes =
+                    qparams->qnn_weight_block_scale_codes.data() + row;
+                for (int64_t block = 0; block < blocks; ++block) {
+                    std::memcpy(
+                        per_channel_legacy_codes.data() + block * 8,
+                        channel_codes, 8);
+                    std::memcpy(
+                        per_channel_legacy_codes.data() + blocks * 8 + block * 8,
+                        channel_codes + 8, 8);
+                }
+                prepared_codes = per_channel_legacy_codes.data();
+            }
             ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
                 static_cast<int>(columns), centered_dots,
                 embedded_native_tile, 0, dynamic_s8,
-                qparams->qnn_weight_block_scale_codes.data() + row * blocks,
+                prepared_codes,
                 dynamic_block_max_abs);
         } else if (native_i8mm_weights != nullptr) {
             ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
@@ -3363,6 +3423,43 @@ void qnn_dynamic_a8_mul_mat_compute(
                 dynamic_s8,
                 qparams->qnn_weight_block_scale_codes.data() + row * blocks,
                 dynamic_block_max_abs);
+        }
+        if (qparams->weights_per_channel_i8mm_source &&
+            use_per_channel_kernel && group == 0 &&
+            is_enabled_value(std::getenv(
+                "GGML_QNN_PC_I8MM_VALIDATE_GS32"))) {
+            int64_t reference_dots[16];
+            const uint8_t * embedded_native_tile =
+                static_cast<const uint8_t *>(weights->data) +
+                static_cast<size_t>(row / 16) * blocks * 128;
+            per_channel_legacy_codes.resize(
+                static_cast<size_t>(blocks) * 16);
+            const uint8_t * channel_codes =
+                qparams->qnn_weight_block_scale_codes.data() + row;
+            for (int64_t block = 0; block < blocks; ++block) {
+                std::memcpy(
+                    per_channel_legacy_codes.data() + block * 8,
+                    channel_codes, 8);
+                std::memcpy(
+                    per_channel_legacy_codes.data() + blocks * 8 + block * 8,
+                    channel_codes + 8, 8);
+            }
+            ggml_gptq2_32_gs32_s8_i8mm_native_dot_16rows(
+                static_cast<int>(columns), reference_dots,
+                embedded_native_tile, 0, dynamic_s8,
+                per_channel_legacy_codes.data(),
+                dynamic_block_max_abs);
+            for (int output_row = 0; output_row < 16; ++output_row) {
+                if (centered_dots[output_row] != reference_dots[output_row]) {
+                    GGML_ABORT(
+                        "per-channel I8MM mismatch in %s layer %d row %d: "
+                        "new=%lld gs32=%lld",
+                        qparams->projection.c_str(), qparams->layer_id,
+                        output_row,
+                        static_cast<long long>(centered_dots[output_row]),
+                        static_cast<long long>(reference_dots[output_row]));
+                }
+            }
         }
         auto * output = static_cast<uint16_t *>(dst->data) + row;
         for (int output_row = 0; output_row < 16; ++output_row) {
@@ -3415,6 +3512,24 @@ void qnn_dynamic_a8_mul_mat_compute(
                         "GGML_QNN_U16_BLOCKWISE_REQUANT")) &&
                     qparams->input.scale / qparams->output.scale >=
                         1.4142135623730951;
+                const uint8_t * a16_codes =
+                    qparams->qnn_weight_block_scale_codes.data();
+                if (qparams->weights_per_channel_i8mm_source) {
+                    per_channel_legacy_codes.resize(
+                        static_cast<size_t>(blocks) * 16);
+                    const uint8_t * channel_codes =
+                        qparams->qnn_weight_block_scale_codes.data();
+                    for (int64_t block = 0; block < blocks; ++block) {
+                        std::memcpy(
+                            per_channel_legacy_codes.data() + block * 8,
+                            channel_codes, 8);
+                        std::memcpy(
+                            per_channel_legacy_codes.data() +
+                                blocks * 8 + block * 8,
+                            channel_codes + 8, 8);
+                    }
+                    a16_codes = per_channel_legacy_codes.data();
+                }
                 ggml_vec_dot_gptq2_32_gs32_u16_qnn_blockwise_affine_16rows(
                     static_cast<int>(columns), a16_reference, weights->data, 0,
                     activation,
@@ -3425,7 +3540,7 @@ void qnn_dynamic_a8_mul_mat_compute(
                     block_sums.data(), activation_range,
                     static_cast<int64_t>(activation_abs_sum) * 7 * 31 <=
                         INT32_MAX,
-                    qparams->qnn_weight_block_scale_codes.data(), 0,
+                    a16_codes, 0,
                     qparams->qnn_channel_scale_to_output_q31.data(),
                     qparams->qnn_prepared_weight_sums.data(),
                     qparams->input.zero_point, qparams->output.zero_point,
@@ -3532,7 +3647,8 @@ ggml_tensor * llama_qnn_u16_mul_mat(
     GGML_ASSERT(weights->ne[0] == input->ne[0]);
     const bool use_a8 = input->type == GGML_TYPE_U8;
     const bool allocate_dynamic_a8_scratch = !use_a8 &&
-        weights->type == GGML_TYPE_GPTQ2_32 &&
+        (weights->type == GGML_TYPE_GPTQ2_32 ||
+         weights->type == GGML_TYPE_GPTQ2_PC_I8MM) &&
         qparams->weights_gs32_source &&
         qparams->qnn_weight_block_codes_prepared &&
         weights->ne[0] % 32 == 0 && weights->ne[1] % 16 == 0 &&

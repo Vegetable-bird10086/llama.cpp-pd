@@ -5750,6 +5750,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
         case GGML_TYPE_GPTQ2_32:
+        case GGML_TYPE_GPTQ2_PC_I8MM:
         case GGML_TYPE_GPTQ2_64:
         case GGML_TYPE_GPTQ2_128:
         case GGML_TYPE_COUNT:

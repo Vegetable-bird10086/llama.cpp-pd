@@ -61,8 +61,13 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
         return;
     }
     const auto layout = model.gguf_kv.find("general.gptq2_32.layout");
+    const bool weights_per_channel_i8mm_source =
+        layout != model.gguf_kv.end() &&
+        layout->second == "per_channel_i8mm_v1";
     const bool weights_i8mm_native_source =
-        layout != model.gguf_kv.end() && layout->second == "i8mm_native_v1";
+        layout != model.gguf_kv.end() &&
+        (layout->second == "i8mm_native_v1" ||
+         weights_per_channel_i8mm_source);
     const bool weights_gs32_source =
         layout != model.gguf_kv.end() &&
         (layout->second == "gs32_source_v1" ||
@@ -77,10 +82,14 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
     size_t scratch_peak = 0;
     const bool already_kernel_ready = std::all_of(
         profile.linear_qparams.begin(), profile.linear_qparams.end(),
-        [](const llama_qnn_linear_qparams & qparams) {
+        [weights_per_channel_i8mm_source](
+                const llama_qnn_linear_qparams & qparams) {
             return qparams.qnn_weight_block_codes_prepared &&
-                qparams.qnn_weight_block_code_layout ==
-                    LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR &&
+                (qparams.qnn_weight_block_code_layout ==
+                    LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR ||
+                 (weights_per_channel_i8mm_source &&
+                  qparams.qnn_weight_block_code_layout ==
+                    LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR)) &&
                 qparams.weights_gs32_source &&
                 !qparams.qnn_prepared_weight_sums.empty();
         });
@@ -101,17 +110,57 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
         for (llama_qnn_linear_qparams & qparams : profile.linear_qparams) {
             qparams.weights_i8mm_native_source =
                 weights_i8mm_native_source;
+            qparams.weights_per_channel_i8mm_source =
+                weights_per_channel_i8mm_source;
             const ggml_tensor * weights = llama_qnn_linear_weight(model, qparams);
-            GGML_ASSERT(weights != nullptr && weights->type == GGML_TYPE_GPTQ2_32);
+            GGML_ASSERT(weights != nullptr &&
+                (weights->type == GGML_TYPE_GPTQ2_32 ||
+                 weights->type == GGML_TYPE_GPTQ2_PC_I8MM));
             GGML_ASSERT(weights->ne[1] % 8 == 0);
             GGML_ASSERT(qparams.qnn_weight_blocks_per_row == weights->ne[0] / 32);
-            GGML_ASSERT(qparams.qnn_weight_block_scale_codes.size() ==
-                static_cast<size_t>(
-                    weights->ne[1] * qparams.qnn_weight_blocks_per_row));
             GGML_ASSERT(qparams.qnn_channel_scale_to_output_q31.size() ==
                 static_cast<size_t>(weights->ne[1]));
             GGML_ASSERT(qparams.qnn_prepared_weight_sums.size() ==
                 static_cast<size_t>(weights->ne[1]));
+            if (weights_per_channel_i8mm_source) {
+                const size_t blocks = static_cast<size_t>(
+                    qparams.qnn_weight_blocks_per_row);
+                if (qparams.qnn_weight_block_code_layout ==
+                        LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR) {
+                    GGML_ASSERT(qparams.qnn_weight_block_scale_codes.size() ==
+                        static_cast<size_t>(weights->ne[1]));
+                } else {
+                    GGML_ASSERT(qparams.qnn_weight_block_code_layout ==
+                        LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR);
+                    GGML_ASSERT(qparams.qnn_weight_block_scale_codes.size() ==
+                        static_cast<size_t>(weights->ne[1]) * blocks);
+                    const llama_qnn_buffer<uint8_t> & block_codes =
+                        qparams.qnn_weight_block_scale_codes;
+                    std::vector<uint8_t> channel_codes(weights->ne[1]);
+                    for (int64_t row = 0; row < weights->ne[1]; ++row) {
+                        const size_t tile = static_cast<size_t>(row) / 8;
+                        const size_t lane = static_cast<size_t>(row) % 8;
+                        const uint8_t channel_code =
+                            block_codes[tile * blocks * 8 + lane];
+                        channel_codes[static_cast<size_t>(row)] = channel_code;
+                        for (size_t block = 1; block < blocks; ++block) {
+                            GGML_ASSERT(block_codes[
+                                (tile * blocks + block) * 8 + lane] ==
+                                channel_code);
+                        }
+                    }
+                    qparams.qnn_weight_block_scale_codes =
+                        std::move(channel_codes);
+                    qparams.qnn_weight_block_code_layout =
+                        LLAMA_QNN_BLOCK_CODES_PER_CHANNEL_ROW_MAJOR;
+                }
+            } else {
+                GGML_ASSERT(qparams.qnn_weight_block_code_layout ==
+                    LLAMA_QNN_BLOCK_CODES_GS32_TILE8_BLOCK_MAJOR);
+                GGML_ASSERT(qparams.qnn_weight_block_scale_codes.size() ==
+                    static_cast<size_t>(
+                        weights->ne[1] * qparams.qnn_weight_blocks_per_row));
+            }
         }
         LLAMA_LOG_INFO(
             "%s: using kernel-ready mmap metadata for %zu linear tensors\n",
@@ -132,6 +181,8 @@ void llama_qnn_quant_profile_prepare_kernel_metadata(
         }
         qparams.weights_gs32_source = weights_gs32_source;
         qparams.weights_i8mm_native_source = weights_i8mm_native_source;
+        qparams.weights_per_channel_i8mm_source =
+            weights_per_channel_i8mm_source;
         if (weights_i8mm_native_source) {
             GGML_ABORT(
                 "i8mm_native_v1 requires a kernel-ready QNN quant profile");
